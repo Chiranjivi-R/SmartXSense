@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+
+# Logs
+*.log
+
+# Uploads
+storage/uploads/
+
+# Generated Reports
+reports/generated_pdf/
+reports/generated_csv/
+
+# ML Artifacts
+ml_engine/artifacts/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
