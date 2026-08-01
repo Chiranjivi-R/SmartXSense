@@ -21,4 +21,5 @@ class Config:
     JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=int(os.getenv("JWT_REFRESH_TOKEN_EXPIRES_DAYS", "30")))
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
     UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", str(Path(__file__).resolve().parents[2] / "storage" / "uploads"))
+    PROCESSED_DATA_FOLDER = os.getenv("PROCESSED_DATA_FOLDER", str(Path(__file__).resolve().parents[2] / "ml_engine" / "data" / "processed"))
     MAX_CONTENT_LENGTH = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))

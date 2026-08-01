@@ -15,6 +15,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
+from ml_engine.preprocessing.schema import DOMAIN_TARGETS, normalise_domain_schema
+
 from ..extensions import db
 from ..models import Dataset, DatasetPreprocessing, DatasetValidation
 
@@ -25,10 +27,6 @@ ALLOWED_MIMETYPES = {
     "xlsx": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
 }
 ALLOWED_DOMAINS = {"retail", "electricity"}
-REQUIRED_COLUMNS = {
-    "retail": {"timestamp", "store_id", "item_id", "sales"},
-    "electricity": {"timestamp", "grid_load_mw"},
-}
 
 
 class DatasetError(Exception):
@@ -52,12 +50,32 @@ def _upload_root() -> Path:
     return Path(current_app.config["UPLOAD_FOLDER"]).resolve()
 
 
+def _processed_root() -> Path:
+    return Path(current_app.config["PROCESSED_DATA_FOLDER"]).resolve()
+
+
 def _is_managed_upload(path: Path) -> bool:
     try:
         path.resolve().relative_to(_upload_root())
         return True
     except ValueError:
         return False
+
+
+def _is_managed_processed(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(_processed_root())
+        return True
+    except ValueError:
+        return False
+
+
+def managed_upload_path(dataset: Dataset) -> Path:
+    """Return a raw upload path only when it remains inside managed storage."""
+    path = Path(dataset.file_path)
+    if not _is_managed_upload(path) or not path.is_file():
+        raise DatasetError("Dataset file is unavailable", 404)
+    return path
 
 
 def _extension(filename: str) -> str:
@@ -165,9 +183,7 @@ def owned_dataset(dataset_id: str, user_id: str) -> Dataset:
 def dataset_detail(dataset: Dataset, preview_rows: int) -> dict:
     if preview_rows < 1 or preview_rows > 100:
         raise DatasetError("Invalid preview_rows parameter", errors={"preview_rows": ["Must be between 1 and 100."]})
-    path = Path(dataset.file_path)
-    if not _is_managed_upload(path) or not path.is_file():
-        raise DatasetError("Dataset file is unavailable", 404)
+    path = managed_upload_path(dataset)
     frame = _read_dataset(path, _extension(dataset.filename), preview_rows=preview_rows)
     return {
         "dataset_id": dataset.dataset_id,
@@ -181,10 +197,12 @@ def dataset_detail(dataset: Dataset, preview_rows: int) -> dict:
 def delete_dataset(dataset: Dataset) -> None:
     """Remove a dataset's owned metadata and managed raw file without arbitrary deletion."""
     raw_path = Path(dataset.file_path)
+    processed_paths: list[Path] = []
     try:
         # These dependent records have no ORM delete cascade in the existing schema.
         preprocessing = list(db.session.scalars(db.select(DatasetPreprocessing).where(DatasetPreprocessing.dataset_id == dataset.dataset_id)))
         for record in preprocessing:
+            processed_paths.append(Path(record.processed_file_path))
             db.session.delete(record)
         for validation in db.session.scalars(db.select(DatasetValidation).where(DatasetValidation.dataset_id == dataset.dataset_id)):
             db.session.delete(validation)
@@ -200,24 +218,29 @@ def delete_dataset(dataset: Dataset) -> None:
         except OSError as exc:
             # The record is already gone; surface a recoverable storage error.
             raise DatasetError("Dataset metadata was deleted but its file could not be removed", 500) from exc
+    for processed_path in processed_paths:
+        if _is_managed_processed(processed_path):
+            try:
+                processed_path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise DatasetError("Dataset metadata was deleted but a processed file could not be removed", 500) from exc
 
 
 def _schema_issues(frame: pd.DataFrame, domain: str, strict_mode: bool) -> list[dict]:
-    columns = {str(column).strip().lower() for column in frame.columns}
+    normalized = normalise_domain_schema(frame, domain)
+    columns = set(normalized.columns)
     issues: list[dict] = []
-    missing = sorted(REQUIRED_COLUMNS[domain] - columns)
+    target = DOMAIN_TARGETS[domain]
+    missing = sorted({"timestamp", target} - columns)
     if missing:
         issues.append({"type": "missing_required_columns", "columns": missing})
     if "timestamp" in columns:
-        source_name = next(str(column) for column in frame.columns if str(column).strip().lower() == "timestamp")
-        if pd.to_datetime(frame[source_name], errors="coerce").isna().all():
-            issues.append({"type": "invalid_timestamp_column", "column": source_name})
-    target = "sales" if domain == "retail" else "grid_load_mw"
+        if pd.to_datetime(normalized["timestamp"], errors="coerce").isna().all():
+            issues.append({"type": "invalid_timestamp_column", "column": "timestamp"})
     if target in columns:
-        source_name = next(str(column) for column in frame.columns if str(column).strip().lower() == target)
-        if pd.to_numeric(frame[source_name], errors="coerce").isna().all():
-            issues.append({"type": "invalid_numeric_column", "column": source_name})
-    if strict_mode and frame.empty:
+        if pd.to_numeric(normalized[target], errors="coerce").isna().all():
+            issues.append({"type": "invalid_numeric_column", "column": target})
+    if strict_mode and normalized.empty:
         issues.append({"type": "empty_dataset"})
     return issues
 

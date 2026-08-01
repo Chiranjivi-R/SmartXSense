@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 
 import pytest
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "backend"))
@@ -26,6 +27,7 @@ def client(tmp_path):
         SQLALCHEMY_TRACK_MODIFICATIONS = False
         CORS_ORIGINS = ["http://localhost:5173"]
         UPLOAD_FOLDER = str(tmp_path / "uploads")
+        PROCESSED_DATA_FOLDER = str(tmp_path / "processed")
         MAX_CONTENT_LENGTH = 1024 * 1024
 
     app = create_app(TestConfig)
@@ -53,6 +55,19 @@ def upload(client, headers, contents, filename, domain, content_type="text/csv")
 
 RETAIL_CSV = b"timestamp,store_id,item_id,sales,promo\n2026-01-01,S01,I01,420,1\n2026-01-02,S01,I01,390,0\n"
 ELECTRICITY_CSV = b"timestamp,grid_load_mw\n2026-01-01T00:00:00Z,2050\n2026-01-01T01:00:00Z,1980\n"
+RETAIL_PREPROCESS_CSV = (
+    b"Date,City,Category,Units_Sold,Base_Price_INR,Holiday_Flag\n"
+    b"2026-07-01,Delhi,Food,120,100,0\n"
+    b"2026-07-01,Delhi,Food,120,100,0\n"
+    b"2026-07-02,Mumbai,Home,invalid,250,1\n"
+    b"2026-07-03,Mumbai,Home,135,250,1\n"
+)
+ELECTRICITY_PREPROCESS_CSV = (
+    b"Year,Date/time,Hourly Demand Met (MW),Region\n"
+    b"2026,07-01 00:00,2050,West\n"
+    b"2026,07-01 00:00,2051,West\n"
+    b"2026,07-01 01:00,1980,West\n"
+)
 
 
 def test_upload_without_jwt(client):
@@ -119,11 +134,47 @@ def test_delete_dataset_removes_owned_upload(client):
     assert test_client.get(f"/api/v1/datasets/{dataset_id}", headers=headers).status_code == 404
 
 
+def test_delete_dataset_removes_processed_output(client):
+    test_client, app = client
+    headers = auth_header(test_client, "delete-processed@example.com")
+    dataset_id = upload(test_client, headers, RETAIL_PREPROCESS_CSV, "retail.csv", "retail").get_json()["data"]["dataset_id"]
+    assert test_client.post(f"/api/v1/datasets/{dataset_id}/preprocess", headers=headers, json={"generate_lags": False}).status_code == 200
+    assert list(Path(app.config["PROCESSED_DATA_FOLDER"]).rglob("*.parquet"))
+    assert test_client.delete(f"/api/v1/datasets/{dataset_id}", headers=headers).status_code == 200
+    assert not list(Path(app.config["PROCESSED_DATA_FOLDER"]).rglob("*.parquet"))
+
+
 def test_valid_dataset_validation(client):
     test_client, _ = client
     headers = auth_header(test_client)
     dataset_id = upload(test_client, headers, RETAIL_CSV, "retail.csv", "retail").get_json()["data"]["dataset_id"]
     response = test_client.post(f"/api/v1/datasets/{dataset_id}/validate", headers=headers, json={"schema_type": "retail_v1", "strict_mode": True})
+    assert response.status_code == 200
+    assert response.get_json()["data"]["is_valid"] is True
+
+
+@pytest.mark.parametrize(
+    ("contents", "filename"),
+    [
+        (b"Date,Product_Name,Units_Sold\n2026-07-01,Product A,120\n", "retail-variant-a.csv"),
+        (b"Invoice_Date,Category,Brand,Units\n2026-07-01,Food,Brand A,120\n", "retail-variant-b.csv"),
+        (RETAIL_CSV, "retail-variant-c.csv"),
+    ],
+)
+def test_validation_accepts_supported_retail_schema_aliases(client, contents, filename):
+    test_client, _ = client
+    headers = auth_header(test_client, f"{filename}@example.com")
+    dataset_id = upload(test_client, headers, contents, filename, "retail").get_json()["data"]["dataset_id"]
+    response = test_client.post(f"/api/v1/datasets/{dataset_id}/validate", headers=headers, json={"schema_type": "retail_v1", "strict_mode": True})
+    assert response.status_code == 200
+    assert response.get_json()["data"]["is_valid"] is True
+
+
+def test_validation_accepts_indian_hourly_electricity_aliases(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "hourly-demand-validation@example.com")
+    dataset_id = upload(test_client, headers, ELECTRICITY_PREPROCESS_CSV, "hourly-demand.csv", "electricity").get_json()["data"]["dataset_id"]
+    response = test_client.post(f"/api/v1/datasets/{dataset_id}/validate", headers=headers, json={"schema_type": "electricity_v1", "strict_mode": True})
     assert response.status_code == 200
     assert response.get_json()["data"]["is_valid"] is True
 
@@ -138,3 +189,63 @@ def test_invalid_dataset_validation_is_persisted(client):
     with test_client.application.app_context():
         from app.models import DatasetValidation
         assert db.session.scalar(db.select(DatasetValidation).where(DatasetValidation.dataset_id == dataset_id)).is_valid is False
+
+
+def test_preprocess_without_jwt_or_access_to_another_users_dataset(client):
+    test_client, _ = client
+    owner_headers = auth_header(test_client, "preprocess-owner@example.com")
+    other_headers = auth_header(test_client, "preprocess-other@example.com")
+    dataset_id = upload(test_client, owner_headers, RETAIL_PREPROCESS_CSV, "retail.csv", "retail").get_json()["data"]["dataset_id"]
+    assert test_client.post(f"/api/v1/datasets/{dataset_id}/preprocess").status_code == 401
+    assert test_client.post(f"/api/v1/datasets/{dataset_id}/preprocess", headers=other_headers).status_code == 404
+
+
+def test_preprocess_retail_normalizes_dates_targets_and_preserves_features(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "retail-preprocess@example.com")
+    dataset_id = upload(test_client, headers, RETAIL_PREPROCESS_CSV, "retail.csv", "retail").get_json()["data"]["dataset_id"]
+    response = test_client.post(f"/api/v1/datasets/{dataset_id}/preprocess", headers=headers, json={"generate_lags": False})
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body["data"]["processed_rows"] == 2
+    assert {"year", "month", "day_of_week", "is_weekend"} <= set(body["data"]["features_generated"])
+    with test_client.application.app_context():
+        from app.models import DatasetPreprocessing
+        record = db.session.get(DatasetPreprocessing, body["data"]["processed_dataset_id"])
+        processed = pd.read_parquet(record.processed_file_path)
+    assert {"timestamp", "sales", "city", "category", "price", "holiday_flag"} <= set(processed.columns)
+    assert processed["sales"].tolist() == [120, 135]
+    assert processed["timestamp"].tolist() == ["2026-07-01T00:00:00Z", "2026-07-03T00:00:00Z"]
+
+
+def test_preprocess_electricity_combines_timestamp_and_removes_duplicate_timestamps(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "electricity-preprocess@example.com")
+    dataset_id = upload(test_client, headers, ELECTRICITY_PREPROCESS_CSV, "demand.csv", "electricity").get_json()["data"]["dataset_id"]
+    response = test_client.post(f"/api/v1/datasets/{dataset_id}/preprocess", headers=headers, json={"generate_lags": False})
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body["data"]["processed_rows"] == 2
+    assert "hour" in body["data"]["features_generated"]
+    with test_client.application.app_context():
+        from app.models import DatasetPreprocessing
+        record = db.session.get(DatasetPreprocessing, body["data"]["processed_dataset_id"])
+        processed = pd.read_parquet(record.processed_file_path)
+    assert processed["demand_mw"].tolist() == [2050, 1980]
+    assert processed["timestamp"].tolist() == ["2026-07-01T00:00:00Z", "2026-07-01T01:00:00Z"]
+
+
+@pytest.mark.parametrize(
+    ("domain", "contents", "filename"),
+    [
+        ("retail", b"Date,City\n2026-07-01,Delhi\n", "invalid-retail.csv"),
+        ("electricity", b"Date/time,Region\n2026-07-01 00:00,West\n", "invalid-electricity.csv"),
+    ],
+)
+def test_preprocess_invalid_domain_schema(client, domain, contents, filename):
+    test_client, _ = client
+    headers = auth_header(test_client, f"invalid-{domain}@example.com")
+    dataset_id = upload(test_client, headers, contents, filename, domain).get_json()["data"]["dataset_id"]
+    response = test_client.post(f"/api/v1/datasets/{dataset_id}/preprocess", headers=headers, json={"generate_lags": False})
+    assert response.status_code == 400
+    assert response.get_json()["status"] == "error"

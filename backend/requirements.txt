@@ -6,3 +6,4 @@ Flask-Cors>=4.0,<5.0
 python-dotenv>=1.0,<2.0
 pandas>=2.2,<3.0
 openpyxl>=3.1,<4.0
+pyarrow>=16.0,<24.0

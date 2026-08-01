@@ -16,6 +16,7 @@ from ...services.dataset_service import (
     upload_response,
     validate_dataset,
 )
+from ...services.preprocessing_service import preprocess_dataset
 from . import datasets_bp
 
 
@@ -93,5 +94,21 @@ def validate(dataset_id: str):
         if not result["is_valid"]:
             return _error_response(DatasetError("Dataset validation failed", 422, {"schema": result["validation_logs"]}))
         return jsonify({"status": "success", "code": 200, "data": result})
+    except DatasetError as error:
+        return _error_response(error)
+
+
+@datasets_bp.post("/<dataset_id>/preprocess")
+@jwt_required()
+def preprocess(dataset_id: str):
+    try:
+        dataset = owned_dataset(dataset_id, _authenticated_user().user_id)
+        _, result = preprocess_dataset(dataset, request.get_json(silent=True))
+        return jsonify({
+            "status": "success",
+            "code": 200,
+            "message": "Preprocessing and feature engineering completed",
+            "data": result,
+        })
     except DatasetError as error:
         return _error_response(error)
