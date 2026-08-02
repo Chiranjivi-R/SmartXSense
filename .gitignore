@@ -35,6 +35,7 @@ reports/generated_csv/
 
 # ML Artifacts
 ml_engine/artifacts/
+ml_engine/data/features/
 
 # IDE
 .vscode/
@@ -43,3 +44,4 @@ ml_engine/artifacts/
 # OS
 .DS_Store
 Thumbs.db
+ml_engine/data/processed/**/*.parquet

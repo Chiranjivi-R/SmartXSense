@@ -24,6 +24,7 @@ ELECTRICITY_ALIASES = {
     "timestamp": {"date_time", "datetime", "date", "time", "datehour", "date_hour"},
     "demand_mw": {
         "hourly_demand_met_mw",
+        "hourly_demand_met_in_mw",
         "hourly_demand_met",
         "demand_met_mw",
         "demand_met",
