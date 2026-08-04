@@ -2,6 +2,7 @@
 
 from .arima import ARIMAForecaster, ARIMAModelError
 from .baseline import BaselineModelError, NaiveForecaster
+from .cnn_lstm import CNNLSTMForecaster, CNNLSTMModelError, DEFAULT_LOOKBACK_CNN_LSTM
 from .lstm import DEFAULT_LOOKBACK, LSTMForecaster, LSTMModelError
 from .random_forest import RandomForestForecaster, RandomForestModelError
 from .sequence_preprocessing import SequencePreprocessingError, SequencePreprocessor
@@ -12,7 +13,10 @@ __all__ = [
     "ARIMAForecaster",
     "ARIMAModelError",
     "BaselineModelError",
+    "CNNLSTMForecaster",
+    "CNNLSTMModelError",
     "DEFAULT_LOOKBACK",
+    "DEFAULT_LOOKBACK_CNN_LSTM",
     "LSTMForecaster",
     "LSTMModelError",
     "NaiveForecaster",

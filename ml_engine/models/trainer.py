@@ -15,6 +15,7 @@ from ml_engine.evaluation.metrics import evaluate_forecast
 
 from .arima import ARIMAForecaster
 from .baseline import NaiveForecaster
+from .cnn_lstm import CNNLSTMForecaster, CNNLSTMModelError, DEFAULT_LOOKBACK_CNN_LSTM
 from .lstm import DEFAULT_LOOKBACK, LSTMForecaster
 from .random_forest import RandomForestForecaster
 from .xgboost_model import XGBoostForecaster
@@ -46,13 +47,16 @@ def run_training_pipeline(
     max_depth: int | None = None,
     learning_rate: float = 0.05,
     random_state: int = 42,
-    # LSTM-specific parameters
+    # Deep-learning shared parameters (LSTM + CNN-LSTM)
     lookback: int | None = None,
     lstm_units: int = 64,
     dropout: float = 0.1,
     epochs: int = 20,
     batch_size: int = 32,
     lstm_learning_rate: float = 0.001,
+    # CNN-LSTM-specific parameters
+    cnn_filters: int = 32,
+    kernel_size: int = 3,
     save_artifact: bool = False,
     artifacts_root: Path | str = Path("ml_engine/artifacts/models"),
 ) -> dict[str, Any]:
@@ -200,19 +204,62 @@ def run_training_pipeline(
         validation_sequences = len(val_pred)
         test_sequences = len(test_pred)
 
+    elif model_key == "cnn_lstm":
+        # Resolve domain-aware default lookback if not specified
+        effective_lookback = lookback if lookback is not None else DEFAULT_LOOKBACK_CNN_LSTM.get(domain, 7)
+        configuration.update({
+            "lookback": effective_lookback,
+            "cnn_filters": cnn_filters,
+            "kernel_size": kernel_size,
+            "lstm_units": lstm_units,
+            "dropout": dropout,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": lstm_learning_rate,
+            "random_seed": random_state,
+        })
+        cnn_lstm_model = CNNLSTMForecaster(
+            lookback=effective_lookback,
+            cnn_filters=cnn_filters,
+            kernel_size=kernel_size,
+            lstm_units=lstm_units,
+            dropout=dropout,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=lstm_learning_rate,
+            random_seed=random_state,
+        )
+        cnn_lstm_model.fit(train_df, target_column=target_column, val_df=val_df)
+        model = cnn_lstm_model
+
+        # Validation predictions: trailing train rows as boundary context
+        val_pred = cnn_lstm_model.predict(val_df, target_column=target_column, history_df=train_df)
+        # Test predictions: train + validation as boundary context
+        combined_train_val_df = pd.concat([train_df, val_df], ignore_index=True)
+        test_pred = cnn_lstm_model.predict(test_df, target_column=target_column, history_df=combined_train_val_df)
+
+        feature_names = cnn_lstm_model.feature_names
+        epochs_trained = cnn_lstm_model.epochs_trained
+
+        # Actual training sequence count from the model (not from val_pred)
+        training_sequences = cnn_lstm_model.n_training_sequences
+        validation_sequences = len(val_pred)
+        test_sequences = len(test_pred)
+
     else:
         raise TrainerError(
-            f"Unsupported model '{model_name}'. Supported models: naive, seasonal_naive, arima, baseline, random_forest, xgboost, lstm"
+            f"Unsupported model '{model_name}'. Supported models: "
+            "naive, seasonal_naive, arima, baseline, random_forest, xgboost, lstm, cnn_lstm"
         )
 
-    # For LSTM, predictions may cover a subset of rows (the aligned rows with full lookback context)
-    # We must align val_pred and test_pred with the corresponding target rows
-    if model_key == "lstm":
-        # val_pred already has its own index; extract matching targets
+    # For deep-learning models (LSTM, CNN-LSTM) predictions are index-aligned
+    # and may cover a subset of rows when boundary history is insufficient.
+    if model_key in ("lstm", "cnn_lstm"):
+        # val_pred / test_pred carry their own aligned index
         val_targets = val_df.loc[val_pred.index, target_column]
         test_targets = test_df.loc[test_pred.index, target_column]
     else:
-        # Non-LSTM models produce predictions aligned to all rows
+        # Statistical/tree models produce predictions aligned to all rows
         if len(val_pred) != len(val_df):
             raise TrainerError(f"Validation prediction length mismatch: got {len(val_pred)}, expected {len(val_df)}")
         if len(test_pred) != len(test_df):
@@ -237,7 +284,7 @@ def run_training_pipeline(
         "test_metrics": test_metrics,
     }
 
-    if model_key == "lstm":
+    if model_key in ("lstm", "cnn_lstm"):
         result["training_sequences"] = training_sequences
         result["validation_sequences"] = validation_sequences
         result["test_sequences"] = test_sequences
@@ -266,7 +313,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train and evaluate forecasting models on Phase 5C feature artifacts.")
     parser.add_argument("--domain", choices=("retail", "electricity"), required=True, help="Dataset domain")
     parser.add_argument("--features-dir", type=Path, required=True, help="Path to Phase 5C feature directory containing train/validation/test parquets")
-    parser.add_argument("--model", choices=("naive", "seasonal_naive", "arima", "baseline", "random_forest", "xgboost", "lstm"), default="naive", help="Model family to train")
+    parser.add_argument("--model", choices=("naive", "seasonal_naive", "arima", "baseline", "random_forest", "xgboost", "lstm", "cnn_lstm"), default="naive", help="Model family to train")
     parser.add_argument("--order", type=int, nargs=3, default=[1, 1, 1], metavar=("P", "D", "Q"), help="ARIMA order (p d q), default: 1 1 1")
     parser.add_argument("--seasonal-period", type=int, default=None, help="Seasonal period for seasonal naive model")
     parser.add_argument("--n-estimators", type=int, default=200, help="Number of trees for Random Forest / XGBoost")
@@ -278,7 +325,9 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.1, help="LSTM dropout rate (default: 0.1)")
     parser.add_argument("--epochs", type=int, default=20, help="LSTM training epochs (default: 20)")
     parser.add_argument("--batch-size", type=int, default=32, help="LSTM batch size (default: 32)")
-    parser.add_argument("--lstm-learning-rate", type=float, default=0.001, help="LSTM learning rate (default: 0.001)")
+    parser.add_argument("--lstm-learning-rate", type=float, default=0.001, help="LSTM/CNN-LSTM learning rate (default: 0.001)")
+    parser.add_argument("--cnn-filters", type=int, default=32, help="CNN-LSTM number of Conv1D filters (default: 32)")
+    parser.add_argument("--kernel-size", type=int, default=3, help="CNN-LSTM Conv1D kernel size (default: 3; must be <= lookback)")
     parser.add_argument("--save-artifact", action="store_true", help="Save model artifact to ml_engine/artifacts/models/")
 
     args = parser.parse_args()
@@ -299,6 +348,8 @@ def main() -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         lstm_learning_rate=args.lstm_learning_rate,
+        cnn_filters=args.cnn_filters,
+        kernel_size=args.kernel_size,
         save_artifact=args.save_artifact,
     )
 
