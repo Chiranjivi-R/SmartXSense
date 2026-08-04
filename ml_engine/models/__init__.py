@@ -2,7 +2,9 @@
 
 from .arima import ARIMAForecaster, ARIMAModelError
 from .baseline import BaselineModelError, NaiveForecaster
+from .lstm import DEFAULT_LOOKBACK, LSTMForecaster, LSTMModelError
 from .random_forest import RandomForestForecaster, RandomForestModelError
+from .sequence_preprocessing import SequencePreprocessingError, SequencePreprocessor
 from .tabular_preprocessing import PreprocessingError, TabularFeatureTransformer
 from .xgboost_model import XGBoostForecaster, XGBoostModelError
 
@@ -10,10 +12,15 @@ __all__ = [
     "ARIMAForecaster",
     "ARIMAModelError",
     "BaselineModelError",
+    "DEFAULT_LOOKBACK",
+    "LSTMForecaster",
+    "LSTMModelError",
     "NaiveForecaster",
     "PreprocessingError",
     "RandomForestForecaster",
     "RandomForestModelError",
+    "SequencePreprocessingError",
+    "SequencePreprocessor",
     "TabularFeatureTransformer",
     "TrainerError",
     "XGBoostForecaster",

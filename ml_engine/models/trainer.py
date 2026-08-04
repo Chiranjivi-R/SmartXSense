@@ -15,6 +15,7 @@ from ml_engine.evaluation.metrics import evaluate_forecast
 
 from .arima import ARIMAForecaster
 from .baseline import NaiveForecaster
+from .lstm import DEFAULT_LOOKBACK, LSTMForecaster
 from .random_forest import RandomForestForecaster
 from .xgboost_model import XGBoostForecaster
 
@@ -45,6 +46,13 @@ def run_training_pipeline(
     max_depth: int | None = None,
     learning_rate: float = 0.05,
     random_state: int = 42,
+    # LSTM-specific parameters
+    lookback: int | None = None,
+    lstm_units: int = 64,
+    dropout: float = 0.1,
+    epochs: int = 20,
+    batch_size: int = 32,
+    lstm_learning_rate: float = 0.001,
     save_artifact: bool = False,
     artifacts_root: Path | str = Path("ml_engine/artifacts/models"),
 ) -> dict[str, Any]:
@@ -81,6 +89,10 @@ def run_training_pipeline(
     configuration: dict[str, Any] = {}
     feature_importances: dict[str, float] | None = None
     feature_names: list[str] = []
+    training_sequences: int | None = None
+    validation_sequences: int | None = None
+    test_sequences: int | None = None
+    epochs_trained: int | None = None
 
     if model_key == "arima":
         if domain == "retail":
@@ -149,19 +161,67 @@ def run_training_pipeline(
         feature_importances = xgb_model.get_feature_importances()
         feature_names = xgb_model.feature_names
 
+    elif model_key == "lstm":
+        # Resolve domain-aware default lookback if not specified
+        effective_lookback = lookback if lookback is not None else DEFAULT_LOOKBACK.get(domain, 7)
+        configuration.update({
+            "lookback": effective_lookback,
+            "lstm_units": lstm_units,
+            "dropout": dropout,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": lstm_learning_rate,
+            "random_seed": random_state,
+        })
+        lstm_model = LSTMForecaster(
+            lookback=effective_lookback,
+            lstm_units=lstm_units,
+            dropout=dropout,
+            epochs=epochs,
+            batch_size=batch_size,
+            learning_rate=lstm_learning_rate,
+            random_seed=random_state,
+        )
+        lstm_model.fit(train_df, target_column=target_column, val_df=val_df)
+        model = lstm_model
+
+        # Validation predictions: use trailing train rows as boundary context
+        val_pred = lstm_model.predict(val_df, target_column=target_column, history_df=train_df)
+        # Test predictions: use train + validation as boundary context
+        combined_train_val_df = pd.concat([train_df, val_df], ignore_index=True)
+        test_pred = lstm_model.predict(test_df, target_column=target_column, history_df=combined_train_val_df)
+
+        feature_names = lstm_model.feature_names
+        epochs_trained = lstm_model.epochs_trained
+
+        # training_sequences comes from the model itself (len(X_train) set during fit)
+        # NOT from val_pred, which would give the wrong count
+        training_sequences = lstm_model.n_training_sequences
+        validation_sequences = len(val_pred)
+        test_sequences = len(test_pred)
+
     else:
         raise TrainerError(
-            f"Unsupported model '{model_name}'. Supported models: naive, seasonal_naive, arima, baseline, random_forest, xgboost"
+            f"Unsupported model '{model_name}'. Supported models: naive, seasonal_naive, arima, baseline, random_forest, xgboost, lstm"
         )
 
-    # Verify predictions alignment
-    if len(val_pred) != len(val_df):
-        raise TrainerError(f"Validation prediction length mismatch: got {len(val_pred)}, expected {len(val_df)}")
-    if len(test_pred) != len(test_df):
-        raise TrainerError(f"Test prediction length mismatch: got {len(test_pred)}, expected {len(test_df)}")
+    # For LSTM, predictions may cover a subset of rows (the aligned rows with full lookback context)
+    # We must align val_pred and test_pred with the corresponding target rows
+    if model_key == "lstm":
+        # val_pred already has its own index; extract matching targets
+        val_targets = val_df.loc[val_pred.index, target_column]
+        test_targets = test_df.loc[test_pred.index, target_column]
+    else:
+        # Non-LSTM models produce predictions aligned to all rows
+        if len(val_pred) != len(val_df):
+            raise TrainerError(f"Validation prediction length mismatch: got {len(val_pred)}, expected {len(val_df)}")
+        if len(test_pred) != len(test_df):
+            raise TrainerError(f"Test prediction length mismatch: got {len(test_pred)}, expected {len(test_df)}")
+        val_targets = val_df[target_column]
+        test_targets = test_df[target_column]
 
-    val_metrics = evaluate_forecast(val_df[target_column], val_pred)
-    test_metrics = evaluate_forecast(test_df[target_column], test_pred)
+    val_metrics = evaluate_forecast(val_targets, val_pred)
+    test_metrics = evaluate_forecast(test_targets, test_pred)
 
     result: dict[str, Any] = {
         "model": model_key,
@@ -176,6 +236,12 @@ def run_training_pipeline(
         "validation_metrics": val_metrics,
         "test_metrics": test_metrics,
     }
+
+    if model_key == "lstm":
+        result["training_sequences"] = training_sequences
+        result["validation_sequences"] = validation_sequences
+        result["test_sequences"] = test_sequences
+        result["epochs_trained"] = epochs_trained
 
     if feature_importances is not None:
         result["feature_importances"] = feature_importances
@@ -200,13 +266,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train and evaluate forecasting models on Phase 5C feature artifacts.")
     parser.add_argument("--domain", choices=("retail", "electricity"), required=True, help="Dataset domain")
     parser.add_argument("--features-dir", type=Path, required=True, help="Path to Phase 5C feature directory containing train/validation/test parquets")
-    parser.add_argument("--model", choices=("naive", "seasonal_naive", "arima", "baseline", "random_forest", "xgboost"), default="naive", help="Model family to train")
+    parser.add_argument("--model", choices=("naive", "seasonal_naive", "arima", "baseline", "random_forest", "xgboost", "lstm"), default="naive", help="Model family to train")
     parser.add_argument("--order", type=int, nargs=3, default=[1, 1, 1], metavar=("P", "D", "Q"), help="ARIMA order (p d q), default: 1 1 1")
     parser.add_argument("--seasonal-period", type=int, default=None, help="Seasonal period for seasonal naive model")
     parser.add_argument("--n-estimators", type=int, default=200, help="Number of trees for Random Forest / XGBoost")
     parser.add_argument("--max-depth", type=int, default=None, help="Maximum tree depth for Random Forest / XGBoost")
     parser.add_argument("--learning-rate", type=float, default=0.05, help="Learning rate for XGBoost")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--lookback", type=int, default=None, help="LSTM lookback window (default: 24 for electricity, 7 for retail)")
+    parser.add_argument("--lstm-units", type=int, default=64, help="LSTM hidden units (default: 64)")
+    parser.add_argument("--dropout", type=float, default=0.1, help="LSTM dropout rate (default: 0.1)")
+    parser.add_argument("--epochs", type=int, default=20, help="LSTM training epochs (default: 20)")
+    parser.add_argument("--batch-size", type=int, default=32, help="LSTM batch size (default: 32)")
+    parser.add_argument("--lstm-learning-rate", type=float, default=0.001, help="LSTM learning rate (default: 0.001)")
     parser.add_argument("--save-artifact", action="store_true", help="Save model artifact to ml_engine/artifacts/models/")
 
     args = parser.parse_args()
@@ -221,6 +293,12 @@ def main() -> None:
         max_depth=args.max_depth,
         learning_rate=args.learning_rate,
         random_state=args.random_state,
+        lookback=args.lookback,
+        lstm_units=args.lstm_units,
+        dropout=args.dropout,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lstm_learning_rate=args.lstm_learning_rate,
         save_artifact=args.save_artifact,
     )
 
