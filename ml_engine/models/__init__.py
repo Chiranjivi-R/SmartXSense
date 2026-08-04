@@ -3,6 +3,7 @@
 from .arima import ARIMAForecaster, ARIMAModelError
 from .baseline import BaselineModelError, NaiveForecaster
 from .cnn_lstm import CNNLSTMForecaster, CNNLSTMModelError, DEFAULT_LOOKBACK_CNN_LSTM
+from .hybrid import DEFAULT_HYBRID_COMPONENTS, SUPPORTED_COMPONENTS, HybridForecaster, HybridModelError
 from .lstm import DEFAULT_LOOKBACK, LSTMForecaster, LSTMModelError
 from .random_forest import RandomForestForecaster, RandomForestModelError
 from .sequence_preprocessing import SequencePreprocessingError, SequencePreprocessor
@@ -15,8 +16,11 @@ __all__ = [
     "BaselineModelError",
     "CNNLSTMForecaster",
     "CNNLSTMModelError",
+    "DEFAULT_HYBRID_COMPONENTS",
     "DEFAULT_LOOKBACK",
     "DEFAULT_LOOKBACK_CNN_LSTM",
+    "HybridForecaster",
+    "HybridModelError",
     "LSTMForecaster",
     "LSTMModelError",
     "NaiveForecaster",
@@ -25,6 +29,7 @@ __all__ = [
     "RandomForestModelError",
     "SequencePreprocessingError",
     "SequencePreprocessor",
+    "SUPPORTED_COMPONENTS",
     "TabularFeatureTransformer",
     "TrainerError",
     "XGBoostForecaster",

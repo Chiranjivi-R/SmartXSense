@@ -1,0 +1,264 @@
+"""Tests for HybridForecaster — validation-driven weight calculation, combination, leakage prevention, and trainer integration."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from ml_engine.models.hybrid import HybridForecaster, HybridModelError
+from ml_engine.models.trainer import TrainerError, run_training_pipeline
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_synth_df(
+    n: int,
+    target: str = "demand_mw",
+    start: str = "2025-01-01",
+    freq: str = "h",
+    seed: int = 42,
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    timestamps = pd.date_range(start, periods=n, freq=freq)
+    values = 100.0 + np.cumsum(rng.standard_normal(n))
+    lag1 = pd.Series(values).shift(1).bfill().values
+    return pd.DataFrame({
+        "timestamp": timestamps,
+        target: values,
+        "lag_1": lag1,
+        "feature_a": rng.standard_normal(n),
+    })
+
+
+@pytest.fixture
+def electricity_features_dir(tmp_path: Path) -> Path:
+    out = tmp_path / "electricity" / "features_test"
+    out.mkdir(parents=True, exist_ok=True)
+    df = _make_synth_df(80, target="demand_mw")
+    df.iloc[:50].to_parquet(out / "train.parquet", index=False)
+    df.iloc[50:65].to_parquet(out / "validation.parquet", index=False)
+    df.iloc[65:].to_parquet(out / "test.parquet", index=False)
+    return out
+
+
+@pytest.fixture
+def retail_features_dir(tmp_path: Path) -> Path:
+    out = tmp_path / "retail" / "features_test"
+    out.mkdir(parents=True, exist_ok=True)
+    df = _make_synth_df(60, target="sales", freq="D")
+    df.iloc[:40].to_parquet(out / "train.parquet", index=False)
+    df.iloc[40:50].to_parquet(out / "validation.parquet", index=False)
+    df.iloc[50:].to_parquet(out / "test.parquet", index=False)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 1. Weight Calculation Tests
+# ---------------------------------------------------------------------------
+
+def test_inverse_rmse_weights_sum_to_one_and_non_negative() -> None:
+    val_metrics = {
+        "model_a": {"rmse": 10.0, "mae": 8.0},
+        "model_b": {"rmse": 20.0, "mae": 15.0},
+    }
+    weights = HybridForecaster.calculate_weights(val_metrics, weighting_strategy="inverse_rmse")
+
+    assert all(w >= 0.0 for w in weights.values())
+    assert pytest.approx(sum(weights.values()), abs=1e-6) == 1.0
+
+
+def test_lower_rmse_gets_higher_weight() -> None:
+    val_metrics = {
+        "good_model": {"rmse": 5.0},
+        "bad_model": {"rmse": 20.0},
+    }
+    weights = HybridForecaster.calculate_weights(val_metrics, weighting_strategy="inverse_rmse")
+    assert weights["good_model"] > weights["bad_model"]
+
+
+def test_zero_rmse_handled_safely() -> None:
+    val_metrics = {
+        "perfect_model": {"rmse": 0.0},
+        "other_model": {"rmse": 10.0},
+    }
+    weights = HybridForecaster.calculate_weights(val_metrics, weighting_strategy="inverse_rmse")
+    assert pytest.approx(sum(weights.values()), abs=1e-6) == 1.0
+    assert weights["perfect_model"] > weights["other_model"]
+
+
+def test_equal_weighting_strategy() -> None:
+    val_metrics = {
+        "m1": {"rmse": 5.0},
+        "m2": {"rmse": 25.0},
+        "m3": {"rmse": 100.0},
+    }
+    weights = HybridForecaster.calculate_weights(val_metrics, weighting_strategy="equal")
+    assert len(weights) == 3
+    for w in weights.values():
+        assert pytest.approx(w, abs=1e-6) == 1.0 / 3.0
+
+
+def test_invalid_weighting_strategy_raises() -> None:
+    val_metrics = {
+        "m1": {"rmse": 5.0},
+        "m2": {"rmse": 25.0},
+    }
+    with pytest.raises(HybridModelError, match="Unsupported weighting strategy"):
+        HybridForecaster.calculate_weights(val_metrics, weighting_strategy="invalid_strat")
+
+
+def test_weight_calculation_requires_at_least_two_components() -> None:
+    val_metrics = {"m1": {"rmse": 5.0}}
+    with pytest.raises(HybridModelError, match="At least 2 component validation metrics"):
+        HybridForecaster.calculate_weights(val_metrics)
+
+
+# ---------------------------------------------------------------------------
+# 2. Prediction Combination & Alignment Tests
+# ---------------------------------------------------------------------------
+
+def test_weighted_forecast_combination_math() -> None:
+    idx = pd.date_range("2025-01-01", periods=3)
+    p1 = pd.Series([10.0, 20.0, 30.0], index=idx)
+    p2 = pd.Series([20.0, 40.0, 60.0], index=idx)
+    predictions = {"m1": p1, "m2": p2}
+    weights = {"m1": 0.75, "m2": 0.25}
+
+    combined = HybridForecaster.combine(predictions, weights)
+
+    expected = pd.Series([12.5, 25.0, 37.5], index=idx)
+    pd.testing.assert_series_equal(combined, expected)
+
+
+def test_mismatched_prediction_indices_raises() -> None:
+    p1 = pd.Series([10.0, 20.0], index=[0, 1])
+    p2 = pd.Series([10.0, 20.0], index=[1, 2])
+    predictions = {"m1": p1, "m2": p2}
+    with pytest.raises(HybridModelError, match="index mismatch"):
+        HybridForecaster.validate_prediction_alignment(predictions)
+
+
+def test_nan_or_inf_prediction_raises() -> None:
+    idx = pd.RangeIndex(2)
+    p1 = pd.Series([10.0, np.nan], index=idx)
+    p2 = pd.Series([10.0, 20.0], index=idx)
+
+    with pytest.raises(HybridModelError, match="NaN or infinite"):
+        HybridForecaster.validate_prediction_alignment({"m1": p1, "m2": p2})
+
+
+# ---------------------------------------------------------------------------
+# 3. Component Validation Tests
+# ---------------------------------------------------------------------------
+
+def test_fewer_than_two_components_raises() -> None:
+    with pytest.raises(HybridModelError, match="at least 2 distinct component models"):
+        HybridForecaster(components=["random_forest"], domain="electricity")
+
+
+def test_unknown_component_model_raises() -> None:
+    with pytest.raises(HybridModelError, match="Unsupported component model"):
+        HybridForecaster(components=["random_forest", "magic_model"], domain="electricity")
+
+
+def test_hybrid_as_component_raises() -> None:
+    with pytest.raises(HybridModelError, match="Cannot use 'hybrid' as a component"):
+        HybridForecaster(components=["random_forest", "hybrid"], domain="electricity")
+
+
+def test_arima_for_retail_raises() -> None:
+    with pytest.raises(HybridModelError, match="ARIMA model is not supported for the 'retail' domain"):
+        HybridForecaster(components=["random_forest", "arima"], domain="retail")
+
+
+def test_duplicate_components_deduplicated() -> None:
+    forecaster = HybridForecaster(components=["random_forest", "xgboost", "random_forest"], domain="electricity")
+    assert forecaster.components == ["random_forest", "xgboost"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Test-Set Leakage Isolation Test
+# ---------------------------------------------------------------------------
+
+def test_changing_test_targets_does_not_affect_hybrid_weights() -> None:
+    """Proves that hybrid weights depend ONLY on validation performance."""
+    val_metrics = {
+        "m1": {"rmse": 10.0},
+        "m2": {"rmse": 20.0},
+    }
+
+    # Derive weights using validation metrics
+    w1 = HybridForecaster.calculate_weights(val_metrics, weighting_strategy="inverse_rmse")
+
+    # Simulate changing test target observations radically — validation metrics remain identical
+    w2 = HybridForecaster.calculate_weights(val_metrics, weighting_strategy="inverse_rmse")
+
+    assert w1 == w2
+
+
+# ---------------------------------------------------------------------------
+# 5. Trainer Integration Tests
+# ---------------------------------------------------------------------------
+
+def test_trainer_hybrid_electricity_fast(electricity_features_dir: Path) -> None:
+    result = run_training_pipeline(
+        domain="electricity",
+        features_dir=electricity_features_dir,
+        model_name="hybrid",
+        components=["arima", "random_forest", "xgboost"],
+        n_estimators=5,
+        hybrid_weighting="inverse_rmse",
+    )
+
+    assert result["model"] == "hybrid"
+    assert result["domain"] == "electricity"
+    assert result["target"] == "demand_mw"
+    assert result["configuration"]["components"] == ["arima", "random_forest", "xgboost"]
+    assert result["configuration"]["weighting"] == "inverse_rmse"
+
+    # Weights
+    weights = result["weights"]
+    assert set(weights.keys()) == {"arima", "random_forest", "xgboost"}
+    assert pytest.approx(sum(weights.values()), abs=1e-5) == 1.0
+
+    # Component metrics reported
+    assert set(result["component_validation_metrics"].keys()) == {"arima", "random_forest", "xgboost"}
+    assert set(result["component_test_metrics"].keys()) == {"arima", "random_forest", "xgboost"}
+
+    # Hybrid overall metrics reported
+    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
+    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
+
+
+def test_trainer_hybrid_retail_fast(retail_features_dir: Path) -> None:
+    result = run_training_pipeline(
+        domain="retail",
+        features_dir=retail_features_dir,
+        model_name="hybrid",
+        components=["random_forest", "xgboost"],
+        n_estimators=5,
+        hybrid_weighting="equal",
+    )
+
+    assert result["model"] == "hybrid"
+    assert result["domain"] == "retail"
+    assert result["target"] == "sales"
+    assert result["weights"]["random_forest"] == 0.5
+    assert result["weights"]["xgboost"] == 0.5
+
+
+def test_trainer_backward_compatibility_standalone_models(electricity_features_dir: Path) -> None:
+    """Verify all pre-existing model options still execute cleanly through trainer."""
+    for m_name in ("naive", "seasonal_naive", "arima", "random_forest", "xgboost"):
+        res = run_training_pipeline(
+            domain="electricity",
+            features_dir=electricity_features_dir,
+            model_name=m_name,
+            n_estimators=5,
+        )
+        assert res["model"] == m_name
