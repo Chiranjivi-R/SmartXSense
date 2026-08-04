@@ -2,13 +2,22 @@
 
 from .arima import ARIMAForecaster, ARIMAModelError
 from .baseline import BaselineModelError, NaiveForecaster
+from .random_forest import RandomForestForecaster, RandomForestModelError
+from .tabular_preprocessing import PreprocessingError, TabularFeatureTransformer
+from .xgboost_model import XGBoostForecaster, XGBoostModelError
 
 __all__ = [
     "ARIMAForecaster",
     "ARIMAModelError",
     "BaselineModelError",
     "NaiveForecaster",
+    "PreprocessingError",
+    "RandomForestForecaster",
+    "RandomForestModelError",
+    "TabularFeatureTransformer",
     "TrainerError",
+    "XGBoostForecaster",
+    "XGBoostModelError",
     "run_training_pipeline",
 ]
 
