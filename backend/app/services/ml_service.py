@@ -31,8 +31,9 @@ class MLError(ValueError):
 
 
 ALLOWED_ROOT_PATHS = (
-    Path(__file__).resolve().parents[3],  # Repository root
-    Path("C:/tmp"),                        # Temporary test directories
+    Path(__file__).resolve().parents[3] / "ml_engine" / "data" / "features",  # Constrained feature artifact root
+    Path(__file__).resolve().parents[3],                                       # Repository root
+    Path("C:/tmp"),                                                            # Temporary test directories
     Path("/tmp"),
 )
 
@@ -102,6 +103,17 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
 
     features_dir = validate_features_directory(payload.get("features_dir"))
 
+    prediction_limit_raw = payload.get("prediction_limit", 100)
+    if isinstance(prediction_limit_raw, bool):
+        raise MLError("Parameter 'prediction_limit' must be an integer between 1 and 1000", code=400)
+    try:
+        prediction_limit = int(prediction_limit_raw)
+    except (ValueError, TypeError) as err:
+        raise MLError("Parameter 'prediction_limit' must be an integer between 1 and 1000", code=400) from err
+
+    if prediction_limit < 1 or prediction_limit > 1000:
+        raise MLError("Parameter 'prediction_limit' must be between 1 and 1000", code=400)
+
     components = payload.get("components")
     hybrid_weighting = payload.get("hybrid_weighting", "inverse_rmse")
     order = tuple(payload.get("order", [1, 1, 1]))
@@ -122,6 +134,7 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
+            prediction_limit=prediction_limit,
         )
         return res
     except TrainerError as err:

@@ -82,6 +82,9 @@ def test_forecast_endpoint_single_model(client, mock_features_dir):
     assert json_data["data"]["model"] == "random_forest"
     assert "validation_metrics" in json_data["data"]
     assert "test_metrics" in json_data["data"]
+    assert "predictions" in json_data["data"]
+    assert isinstance(json_data["data"]["predictions"], list)
+    assert len(json_data["data"]["predictions"]) > 0
 
 
 def test_forecast_endpoint_hybrid(client, mock_features_dir):
@@ -307,3 +310,62 @@ def test_explain_endpoint_lstm_unsupported(client, mock_features_dir):
         },
     )
     assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Prediction structure & prediction_limit tests
+# ---------------------------------------------------------------------------
+
+def test_forecast_endpoint_returns_chart_predictions(client, mock_features_dir):
+    """Forecast response must return predictions array with timestamp, actual, predicted."""
+    response = client.post(
+        "/api/v1/forecasting/train",
+        json={
+            "domain": "electricity",
+            "features_dir": str(mock_features_dir),
+            "model": "random_forest",
+            "n_estimators": 10,
+            "prediction_limit": 5,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()["data"]
+    assert "predictions" in data
+    assert "prediction_count" in data
+    assert "total_test_predictions" in data
+
+    preds = data["predictions"]
+    assert len(preds) == 5
+    assert data["prediction_count"] == 5
+    assert data["total_test_predictions"] == 12  # mock_features_dir test split has 12 rows (60-48)
+
+    for item in preds:
+        assert "timestamp" in item
+        assert "actual" in item
+        assert "predicted" in item
+        assert isinstance(item["timestamp"], str)
+        assert isinstance(item["actual"], (int, float))
+        assert isinstance(item["predicted"], (int, float))
+        assert np.isfinite(item["actual"])
+        assert np.isfinite(item["predicted"])
+
+    # Verify chronological ordering
+    timestamps = [p["timestamp"] for p in preds]
+    assert timestamps == sorted(timestamps)
+
+
+def test_forecast_endpoint_prediction_limit_validation(client, mock_features_dir):
+    """Invalid prediction_limit values (0, negative, >1000, bool, invalid type) return 400."""
+    invalid_limits = [0, -5, 1500, True, "invalid_string"]
+    for val in invalid_limits:
+        res = client.post(
+            "/api/v1/forecasting/train",
+            json={
+                "domain": "electricity",
+                "features_dir": str(mock_features_dir),
+                "model": "random_forest",
+                "prediction_limit": val,
+            },
+        )
+        assert res.status_code == 400, f"Expected 400 for prediction_limit={val}"

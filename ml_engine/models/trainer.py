@@ -10,8 +10,51 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import numpy as np
 
 from ml_engine.evaluation.metrics import evaluate_forecast
+
+
+def format_chart_predictions(
+    test_df: pd.DataFrame,
+    test_pred: pd.Series,
+    target_column: str,
+    prediction_limit: int = 100,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Format test predictions as chart-ready JSON structures with deterministic sampling if needed."""
+    if test_pred is None or len(test_pred) == 0:
+        return [], 0, 0
+
+    aligned_test_df = test_df.loc[test_pred.index]
+    timestamps = aligned_test_df["timestamp"]
+    actuals = aligned_test_df[target_column]
+
+    n_total = len(test_pred)
+
+    if prediction_limit <= 0 or n_total <= prediction_limit:
+        sample_positions = list(range(n_total))
+    else:
+        raw_positions = np.round(np.linspace(0, n_total - 1, num=prediction_limit)).astype(int)
+        sample_positions = list(dict.fromkeys(raw_positions))
+
+    predictions = []
+    for pos in sample_positions:
+        ts_val = timestamps.iloc[pos]
+        if hasattr(ts_val, "isoformat"):
+            ts_str = ts_val.isoformat()
+        else:
+            ts_str = str(ts_val)
+
+        actual_val = float(actuals.iloc[pos])
+        pred_val = float(test_pred.iloc[pos])
+
+        predictions.append({
+            "timestamp": ts_str,
+            "actual": actual_val,
+            "predicted": pred_val,
+        })
+
+    return predictions, len(predictions), n_total
 
 from .arima import ARIMAForecaster
 from .baseline import NaiveForecaster
@@ -253,9 +296,9 @@ def run_training_pipeline(
     # CNN-LSTM-specific parameters
     cnn_filters: int = 32,
     kernel_size: int = 3,
-    # Hybrid-specific parameters
     components: list[str] | None = None,
     hybrid_weighting: str = "inverse_rmse",
+    prediction_limit: int = 100,
     save_artifact: bool = False,
     artifacts_root: Path | str = Path("ml_engine/artifacts/models"),
 ) -> dict[str, Any]:
@@ -355,6 +398,13 @@ def run_training_pipeline(
         val_metrics = evaluate_forecast(val_targets, val_hybrid_pred)
         test_metrics = evaluate_forecast(test_targets, test_hybrid_pred)
 
+        predictions_list, pred_count, total_test_preds = format_chart_predictions(
+            test_df=test_df,
+            test_pred=test_hybrid_pred,
+            target_column=target_column,
+            prediction_limit=prediction_limit,
+        )
+
         result: dict[str, Any] = {
             "model": "hybrid",
             "domain": domain,
@@ -371,6 +421,9 @@ def run_training_pipeline(
             "test_rows": len(test_df),
             "validation_metrics": val_metrics,
             "test_metrics": test_metrics,
+            "predictions": predictions_list,
+            "prediction_count": pred_count,
+            "total_test_predictions": total_test_preds,
         }
 
         if save_artifact:
@@ -432,6 +485,13 @@ def run_training_pipeline(
     val_metrics = evaluate_forecast(val_targets, val_pred)
     test_metrics = evaluate_forecast(test_targets, test_pred)
 
+    predictions_list, pred_count, total_test_preds = format_chart_predictions(
+        test_df=test_df,
+        test_pred=test_pred,
+        target_column=target_column,
+        prediction_limit=prediction_limit,
+    )
+
     result = {
         "model": model_key,
         "domain": domain,
@@ -444,6 +504,9 @@ def run_training_pipeline(
         "test_rows": len(test_df),
         "validation_metrics": val_metrics,
         "test_metrics": test_metrics,
+        "predictions": predictions_list,
+        "prediction_count": pred_count,
+        "total_test_predictions": total_test_preds,
     }
 
     if model_key in ("lstm", "cnn_lstm"):
@@ -497,6 +560,7 @@ def main() -> None:
     parser.add_argument("--kernel-size", type=int, default=3, help="CNN-LSTM Conv1D kernel size (default: 3; must be <= lookback)")
     parser.add_argument("--components", type=str, nargs="+", default=None, help="Component models for hybrid ensemble")
     parser.add_argument("--hybrid-weighting", choices=("inverse_rmse", "equal"), default="inverse_rmse", help="Hybrid weighting strategy")
+    parser.add_argument("--prediction-limit", type=int, default=100, help="Maximum number of test predictions to return for chart plotting")
     parser.add_argument("--save-artifact", action="store_true", help="Save model artifact to ml_engine/artifacts/models/")
 
     args = parser.parse_args()
@@ -521,6 +585,7 @@ def main() -> None:
         kernel_size=args.kernel_size,
         components=args.components,
         hybrid_weighting=args.hybrid_weighting,
+        prediction_limit=args.prediction_limit,
         save_artifact=args.save_artifact,
     )
 
