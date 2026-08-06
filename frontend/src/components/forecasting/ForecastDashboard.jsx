@@ -3,7 +3,7 @@ import {
   LineChart, Line, BarChart, Bar, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from 'recharts';
-import { runForecast, compareModels, explainForecast, DOMAIN_FEATURE_ARTIFACTS } from '../../services/mlApi';
+import { runForecast, compareModels, explainForecast } from '../../services/mlApi';
 
 const COLORS = {
   primary: '#00D4FF',
@@ -30,7 +30,8 @@ const customTooltipStyle = {
   borderRadius: 10,
   color: '#E8F0FF',
   fontSize: 13,
-  padding: '10px 14px',
+  padding: '12px 16px',
+  boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
 };
 
 const formatTimestamp = (ts) => {
@@ -58,40 +59,81 @@ const formatMape = (val) => {
   return `${pct.toFixed(2)}%`;
 };
 
+const formatFeatureName = (name) => {
+  if (!name) return '';
+  const dictionary = {
+    city_tier: 'City Tier',
+    cpi_clothing: 'CPI Clothing',
+    cpi_combined: 'CPI Combined',
+    city: 'City',
+    category: 'Product Category',
+    temperature_c: 'Temperature (°C)',
+    humidity: 'Humidity (%)',
+    demand_mw: 'Demand (MW)',
+    sales: 'Sales Units',
+    rolling_mean_7: 'Rolling Mean (7d)',
+    rolling_mean_30: 'Rolling Mean (30d)',
+    lag_1: 'Lag 1',
+    lag_7: 'Lag 7',
+    day_of_week: 'Day of Week',
+    is_weekend: 'Weekend Flag',
+    holiday_flag: 'Holiday Flag',
+  };
+  if (dictionary[name]) return dictionary[name];
+
+  return String(name)
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+};
+
+const DOMAIN_CONTEXTS = {
+  retail: 'Forecasting retail sales demand using historical sales, pricing, economic indicators, calendar signals, and lag features.',
+  electricity: 'Forecasting electricity grid demand using temporal patterns, historical load, and rolling aggregate features.',
+};
+
 export default function ForecastDashboard({ initialDomain = 'retail' }) {
   const [domain, setDomain] = useState(initialDomain);
   const [model, setModel] = useState('random_forest');
 
-  // Sync state if initialDomain prop changes
-  useEffect(() => {
-    setDomain(initialDomain);
-    handleRunForecast('random_forest', initialDomain);
-  }, [initialDomain]);
-  
-  // Forecast State
+  // State Management
   const [forecastLoading, setForecastLoading] = useState(false);
   const [forecastData, setForecastData] = useState(null);
   const [forecastError, setForecastError] = useState(null);
 
-  // Compare State
   const [compareLoading, setCompareLoading] = useState(false);
   const [compareData, setCompareData] = useState(null);
   const [compareError, setCompareError] = useState(null);
 
-  // Auto Select recommended model note
   const [autoSelectedModel, setAutoSelectedModel] = useState(null);
 
-  // Explainability State
   const [explainLoading, setExplainLoading] = useState(false);
   const [explainData, setExplainData] = useState(null);
   const [explainError, setExplainError] = useState(null);
 
-  // Auto run initial forecast on mount
+  // Sync state if initialDomain prop changes
   useEffect(() => {
-    handleRunForecast('random_forest', 'retail');
+    handleDomainSwitch(initialDomain);
+  }, [initialDomain]);
+
+  // Initial forecast on mount
+  useEffect(() => {
+    handleRunForecast('random_forest', initialDomain);
   }, []);
 
-  // Primary forecast handler
+  // Clear stale state when domain changes
+  const handleDomainSwitch = (newDomain) => {
+    setDomain(newDomain);
+    setForecastData(null);
+    setCompareData(null);
+    setExplainData(null);
+    setAutoSelectedModel(null);
+    setForecastError(null);
+    setCompareError(null);
+    setExplainError(null);
+    handleRunForecast(model, newDomain);
+  };
+
+  // Primary forecast runner
   const handleRunForecast = async (targetModel = model, targetDomain = domain) => {
     setForecastLoading(true);
     setForecastError(null);
@@ -102,7 +144,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
     let recModel = null;
 
     try {
-      // Handle Auto Select
+      // Auto Select workflow
       if (targetModel === 'auto_select') {
         setCompareLoading(true);
         try {
@@ -130,19 +172,19 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
 
       setForecastData(res);
 
-      // Trigger SHAP explainability for supported tree models (RF & XGBoost)
+      // Trigger SHAP explainability for supported tree models
       if (['random_forest', 'xgboost'].includes(actualModel)) {
         fetchExplainability(targetDomain, actualModel);
       }
     } catch (err) {
       console.error('Forecast error:', err);
-      setForecastError(err.message || 'Failed to generate forecast');
+      setForecastError('Forecast request failed. Please verify that the SmartXSense backend server is running.');
     } finally {
       setForecastLoading(false);
     }
   };
 
-  // Model comparison handler
+  // Model comparison runner
   const handleCompareModels = async () => {
     setCompareLoading(true);
     setCompareError(null);
@@ -151,13 +193,13 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
       setCompareData(res);
     } catch (err) {
       console.error('Comparison error:', err);
-      setCompareError(err.message || 'Failed to compare models');
+      setCompareError('Model comparison request failed. Please verify backend service.');
     } finally {
       setCompareLoading(false);
     }
   };
 
-  // Explainability handler
+  // Explainability runner
   const fetchExplainability = async (expDomain, expModel) => {
     setExplainLoading(true);
     setExplainError(null);
@@ -171,29 +213,35 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
       setExplainData(res);
     } catch (err) {
       console.error('Explainability error:', err);
-      setExplainError(err.message || 'Explainability request failed');
+      setExplainError('Explainability request failed for this model.');
     } finally {
       setExplainLoading(false);
     }
   };
 
   // Prepare chart series from predictions[]
-  const chartData = forecastData?.predictions?.map((item) => ({
-    rawTimestamp: item.timestamp,
-    timestamp: formatTimestamp(item.timestamp),
-    actual: item.actual !== undefined && item.actual !== null ? Number(item.actual) : null,
-    predicted: item.predicted !== undefined && item.predicted !== null ? Number(item.predicted) : null,
-  })) || [];
+  const chartData = forecastData?.predictions?.map((item) => {
+    const act = item.actual !== undefined && item.actual !== null ? Number(item.actual) : null;
+    const pred = item.predicted !== undefined && item.predicted !== null ? Number(item.predicted) : null;
+    const absErr = act !== null && pred !== null ? Math.abs(act - pred) : null;
+    return {
+      rawTimestamp: item.timestamp,
+      timestamp: formatTimestamp(item.timestamp),
+      actual: act,
+      predicted: pred,
+      absError: absErr,
+    };
+  }) || [];
 
   const activeModelDisplay = autoSelectedModel
-    ? `${autoSelectedModel} (Auto Selected)`
-    : forecastData?.model || model;
+    ? `${autoSelectedModel.replace('_', ' ')} (Auto Selected)`
+    : (forecastData?.model || model).replace('_', ' ');
 
   const isExplainableModel = ['random_forest', 'xgboost'].includes(forecastData?.model || model);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-      {/* ─── Header & Control Bar ─── */}
+      {/* ─── 1. Control Header & Domain Context ─── */}
       <div
         style={{
           background: COLORS.bg.card,
@@ -208,10 +256,10 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
           <div>
             <h1 style={{ fontSize: 24, fontWeight: 800, margin: 0, color: COLORS.text.primary, fontFamily: "'Space Grotesk', sans-serif" }}>
-              Forecast Intelligence Dashboard
+              SmartXSense Forecast Intelligence
             </h1>
-            <p style={{ fontSize: 13, color: COLORS.text.secondary, margin: '4px 0 0' }}>
-              Interactive ML demand forecasting with validation-driven adaptive model selection & feature explainability
+            <p style={{ fontSize: 13, color: COLORS.text.secondary, margin: '4px 0 0', maxWidth: 800, lineHeight: 1.5 }}>
+              {DOMAIN_CONTEXTS[domain]}
             </p>
           </div>
           <div style={{ display: 'flex', gap: 10 }}>
@@ -250,29 +298,26 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
                 transition: 'all 0.2s',
               }}
             >
-              {compareLoading ? 'Evaluating...' : '📊 Compare Models'}
+              {compareLoading ? 'Benchmarking...' : '📊 Compare Models'}
             </button>
           </div>
         </div>
 
         {/* Form Controls */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
-          {/* Domain Selection */}
+          {/* Domain Selector */}
           <div>
             <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               Target Domain
             </label>
             <div style={{ display: 'flex', gap: 8 }}>
               {[
-                { id: 'retail', label: '🛒 Retail', sub: 'Sales Demand' },
-                { id: 'electricity', label: '⚡ Electricity', sub: 'System Load' },
+                { id: 'retail', label: '🛒 Retail Demand', sub: 'Sales & Inventory' },
+                { id: 'electricity', label: '⚡ Electricity Load', sub: 'Grid System MW' },
               ].map((d) => (
                 <button
                   key={d.id}
-                  onClick={() => {
-                    setDomain(d.id);
-                    handleRunForecast(model, d.id);
-                  }}
+                  onClick={() => handleDomainSwitch(d.id)}
                   style={{
                     flex: 1,
                     padding: '10px 14px',
@@ -294,7 +339,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
             </div>
           </div>
 
-          {/* Model Selection */}
+          {/* Model Selector */}
           <div>
             <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
               Forecasting Model
@@ -320,78 +365,98 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
             >
               <option value="random_forest">Random Forest (Tree Ensemble)</option>
               <option value="xgboost">XGBoost (Gradient Boosted Trees)</option>
-              <option value="hybrid">Hybrid (Validation-Weighted Ensemble)</option>
+              <option value="hybrid">Hybrid Ensemble (Validation-Weighted)</option>
               <option value="auto_select">⚡ Auto Select (Validation Recommended)</option>
               {domain === 'electricity' && <option value="arima">ARIMA (Time Series)</option>}
             </select>
           </div>
 
-          {/* Metadata Display */}
+          {/* Active Status Display */}
           <div style={{ background: COLORS.bg.dark, borderRadius: 10, padding: '12px 16px', border: `1px solid ${COLORS.bg.border}`, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-            <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Active Configuration</div>
+            <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Demo Dataset Status</div>
             <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary, marginTop: 4, fontFamily: "'Space Mono', monospace" }}>
-              {domain.toUpperCase()} • {activeModelDisplay.toUpperCase()}
+              Demo Dataset: {domain.toUpperCase()}
             </div>
-            {forecastData?.target && (
-              <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2 }}>
-                Target Variable: <span style={{ color: COLORS.primary }}>{forecastData.target}</span>
-              </div>
-            )}
+            <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2 }}>
+              Active Model: <span style={{ color: COLORS.primary, fontWeight: 700, textTransform: 'capitalize' }}>{activeModelDisplay}</span>
+            </div>
           </div>
         </div>
 
-        {/* Auto Select / Recommended Banner */}
+        {/* ─── Auto Select Explanation Banner ─── */}
         {autoSelectedModel && (
-          <div style={{ background: `${COLORS.success}15`, border: `1px solid ${COLORS.success}44`, borderRadius: 10, padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 12 }}>
-            <span style={{ fontSize: 20 }}>🏆</span>
+          <div style={{ background: `${COLORS.success}15`, border: `1px solid ${COLORS.success}44`, borderRadius: 10, padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 14 }}>
+            <span style={{ fontSize: 24 }}>🏆</span>
             <div>
-              <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.success }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.success }}>
                 Auto Select Recommendation: <span style={{ textTransform: 'capitalize' }}>{autoSelectedModel.replace('_', ' ')}</span>
               </div>
-              <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2 }}>
-                Selected using optimal validation RMSE performance across candidate models.
+              <div style={{ fontSize: 13, color: COLORS.text.primary, marginTop: 2, lineHeight: 1.4 }}>
+                SmartXSense compared candidate models using validation RMSE and selected <strong>{autoSelectedModel.replace('_', ' ').toUpperCase()}</strong> as the best-performing candidate. The held-out test set remains reserved strictly for final evaluation.
               </div>
             </div>
           </div>
         )}
       </div>
 
-      {/* Error Alert */}
+      {/* Presentation-Safe Error Alert */}
       {forecastError && (
         <div style={{ background: `${COLORS.accent}18`, border: `1px solid ${COLORS.accent}44`, borderRadius: 12, padding: '16px 20px', color: COLORS.accent, fontSize: 14, fontWeight: 600 }}>
-          ⚠️ Forecast Error: {forecastError}
+          ⚠️ {forecastError}
         </div>
       )}
 
-      {/* ─── P0: Metric Cards ─── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
+      {/* ─── 2. Compact Forecast Summary Header ─── */}
+      {forecastData && (
+        <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 14, padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+          <div>
+            <span style={{ fontSize: 16, fontWeight: 800, color: COLORS.text.primary }}>
+              {domain === 'retail' ? 'Retail Sales Demand Forecast' : 'Electricity System Load Forecast'}
+            </span>
+            <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2 }}>
+              Target Variable: <span style={{ color: COLORS.primary, fontWeight: 700 }}>{forecastData.target}</span> • Dataset: <span style={{ color: COLORS.text.primary }}>Demo Dataset ({domain})</span>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, color: COLORS.primary, padding: '4px 12px', borderRadius: 8, fontSize: 12, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
+              Model: {forecastData.model?.replace('_', ' ').toUpperCase()}
+            </span>
+            <span style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, color: COLORS.success, padding: '4px 12px', borderRadius: 8, fontSize: 12, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
+              {forecastData.prediction_count || chartData.length} Forecast Points
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* ─── 3. Metric Cards with Tooltip Explanations ─── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
         {[
           {
             label: 'MAE',
             title: 'Mean Absolute Error',
             value: formatNumber(forecastData?.test_metrics?.mae),
-            sub: 'Test Set Evaluation',
+            desc: 'Average absolute prediction error between forecast and actuals.',
             color: COLORS.primary,
           },
           {
             label: 'RMSE',
             title: 'Root Mean Squared Error',
             value: formatNumber(forecastData?.test_metrics?.rmse),
-            sub: 'Test Set Evaluation',
+            desc: 'Root mean squared error penalizing larger forecasting deviations.',
             color: COLORS.secondary,
           },
           {
             label: 'MAPE',
             title: 'Mean Abs % Error',
             value: formatMape(forecastData?.test_metrics?.mape),
-            sub: 'Test Set Percentage',
+            desc: 'Average percentage forecasting error across test horizon.',
             color: COLORS.success,
           },
           {
             label: 'R² Score',
             title: 'Coefficient of Determination',
             value: formatNumber(forecastData?.test_metrics?.r2, 4),
-            sub: 'Test Set Fit Quality',
+            desc: 'Explained variance / goodness of fit (1.0 = perfect fit).',
             color: COLORS.warning,
           },
         ].map((m, idx) => (
@@ -404,47 +469,83 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
               padding: '20px',
               position: 'relative',
               overflow: 'hidden',
+              display: 'flex',
+              flexDirection: 'column',
+              justify: 'space-between',
             }}
           >
-            <div style={{ fontSize: 12, color: COLORS.text.secondary, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
-              {m.label}
+            <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.text.secondary, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                  {m.label}
+                </span>
+                <span style={{ fontSize: 11, color: COLORS.text.muted }} title={m.desc}>ℹ️</span>
+              </div>
+              <div style={{ fontSize: 26, fontWeight: 800, color: m.color, fontFamily: "'Space Mono', monospace", margin: '6px 0' }}>
+                {forecastLoading ? '...' : m.value}
+              </div>
             </div>
-            <div style={{ fontSize: 26, fontWeight: 800, color: m.color, fontFamily: "'Space Mono', monospace", margin: '6px 0' }}>
-              {forecastLoading ? '...' : m.value}
+            <div style={{ fontSize: 11, color: COLORS.text.muted, lineHeight: 1.4, marginTop: 4 }}>
+              {m.desc}
             </div>
-            <div style={{ fontSize: 11, color: COLORS.text.muted }}>{m.sub}</div>
           </div>
         ))}
       </div>
 
-      {/* Hybrid Component Weights (if applicable) */}
+      {/* ─── Performance Interpretation Banner ─── */}
+      {forecastData?.test_metrics && (
+        <div style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 12, padding: '12px 18px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+          <div style={{ fontSize: 13, color: COLORS.text.secondary }}>
+            📊 <strong style={{ color: COLORS.text.primary }}>Performance Interpretation (Held-Out Test Set):</strong> Test MAPE is <span style={{ color: COLORS.success, fontWeight: 700 }}>{formatMape(forecastData.test_metrics.mape)}</span> with R² of <span style={{ color: COLORS.warning, fontWeight: 700 }}>{formatNumber(forecastData.test_metrics.r2, 4)}</span>.
+          </div>
+          <span style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            Evaluation Split: Held-Out Test Data
+          </span>
+        </div>
+      )}
+
+      {/* ─── 4. Hybrid Component Weights Visualization ─── */}
       {forecastData?.model === 'hybrid' && forecastData?.weights && (
-        <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 12, padding: '14px 20px', display: 'flex', alignItems: 'center', gap: 20 }}>
-          <span style={{ fontSize: 13, fontWeight: 700, color: COLORS.text.primary }}>Ensemble Component Weights:</span>
-          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-            {Object.entries(forecastData.weights).map(([comp, w]) => (
-              <span key={comp} style={{ fontSize: 13, color: COLORS.primary, fontFamily: "'Space Mono', monospace", background: COLORS.bg.dark, padding: '4px 10px', borderRadius: 6, border: `1px solid ${COLORS.bg.border}` }}>
-                {comp}: {(Number(w) * 100).toFixed(1)}%
-              </span>
-            ))}
+        <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 16, padding: 20 }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary, marginBottom: 4 }}>
+            Ensemble Component Weights (Validation Derived)
+          </div>
+          <div style={{ fontSize: 12, color: COLORS.text.secondary, marginBottom: 14 }}>
+            Hybrid ensemble weights are derived automatically from inverse validation RMSE performance.
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            {Object.entries(forecastData.weights).map(([comp, w]) => {
+              const pct = Number(w) * 100;
+              return (
+                <div key={comp} style={{ background: COLORS.bg.dark, borderRadius: 10, padding: '10px 14px', border: `1px solid ${COLORS.bg.border}` }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, fontWeight: 700, color: COLORS.text.primary, marginBottom: 6 }}>
+                    <span style={{ textTransform: 'capitalize' }}>{comp.replace('_', ' ')}</span>
+                    <span style={{ color: COLORS.primary, fontFamily: "'Space Mono', monospace" }}>{pct.toFixed(1)}%</span>
+                  </div>
+                  <div style={{ background: COLORS.bg.border, height: 6, borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{ width: `${pct}%`, height: '100%', background: `linear-gradient(90deg, ${COLORS.primary}, ${COLORS.secondary})`, borderRadius: 3 }} />
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
 
-      {/* ─── P0: Actual vs Predicted Line Chart ─── */}
+      {/* ─── 5. Actual vs Predicted Line Chart ─── */}
       <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 16, padding: 24 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 10 }}>
           <div>
             <h3 style={{ fontSize: 16, fontWeight: 700, color: COLORS.text.primary, margin: 0 }}>
-              Actual vs Predicted Demand Series
+              Actual vs Predicted Demand Series (Held-Out Test Set)
             </h3>
             <p style={{ fontSize: 12, color: COLORS.text.secondary, margin: '2px 0 0' }}>
-              Test set forecasting evaluation ({chartData.length} predictions)
+              Comparison of actual ground truth observations against model forecasts
             </p>
           </div>
           {forecastData?.total_test_predictions && (
             <span style={{ fontSize: 12, color: COLORS.text.muted, fontFamily: "'Space Mono', monospace" }}>
-              Showing {chartData.length} of {forecastData.total_test_predictions} total test samples
+              Showing {chartData.length} of {forecastData.total_test_predictions} test observations
             </span>
           )}
         </div>
@@ -465,7 +566,22 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
                 minTickGap={20}
               />
               <YAxis tick={{ fill: COLORS.text.muted, fontSize: 11 }} domain={['auto', 'auto']} />
-              <Tooltip contentStyle={customTooltipStyle} formatter={(val) => [formatNumber(val), 'Value']} />
+              <Tooltip
+                contentStyle={customTooltipStyle}
+                formatter={(val, name, entry) => {
+                  if (name === 'Actual Ground Truth' || name === 'Predicted Forecast') {
+                    return [formatNumber(val), name];
+                  }
+                  return [formatNumber(val), name];
+                }}
+                labelFormatter={(label, payload) => {
+                  const pt = payload && payload[0]?.payload;
+                  if (pt && pt.absError !== null) {
+                    return `${label} (Abs Error: ${formatNumber(pt.absError)})`;
+                  }
+                  return label;
+                }}
+              />
               <Legend wrapperStyle={{ fontSize: 13, color: COLORS.text.secondary, paddingTop: 10 }} />
               <Line
                 type="monotone"
@@ -489,21 +605,27 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
             </LineChart>
           </ResponsiveContainer>
         ) : (
-          <div style={{ height: 260, display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.text.muted }}>
-            No forecast data available. Click "Run Forecast" above.
+          <div style={{ height: 260, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: COLORS.text.muted }}>
+            <div style={{ fontSize: 28, marginBottom: 8 }}>📊</div>
+            <div>Select a domain and forecasting model, then run a forecast to view model performance and predictions.</div>
           </div>
         )}
       </div>
 
-      {/* ─── P1: Model Comparison Section ─── */}
+      {/* ─── 6. Model Comparison & Validation Benchmark ─── */}
       <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 16, padding: 24 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
           <div>
-            <h3 style={{ fontSize: 16, fontWeight: 700, color: COLORS.text.primary, margin: 0 }}>
-              Validation-Driven Model Benchmark & Adaptive Selection
-            </h3>
-            <p style={{ fontSize: 12, color: COLORS.text.secondary, margin: '2px 0 0' }}>
-              Model selection is performed strictly on validation performance to prevent test-set leakage
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <h3 style={{ fontSize: 16, fontWeight: 700, color: COLORS.text.primary, margin: 0 }}>
+                Validation-Driven Model Benchmark
+              </h3>
+              <span style={{ background: `${COLORS.success}22`, color: COLORS.success, border: `1px solid ${COLORS.success}44`, borderRadius: 6, padding: '2px 8px', fontSize: 10, fontWeight: 700 }}>
+                Selected on Validation Set
+              </span>
+            </div>
+            <p style={{ fontSize: 12, color: COLORS.text.secondary, margin: '4px 0 0' }}>
+              Model recommendation is determined strictly by validation performance to ensure unbiased evaluation.
             </p>
           </div>
           <button
@@ -529,92 +651,118 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
         )}
 
         {compareData?.ranking ? (
-          <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: 13 }}>
-              <thead>
-                <tr style={{ borderBottom: `1px solid ${COLORS.bg.border}`, color: COLORS.text.muted }}>
-                  <th style={{ padding: '10px 12px' }}>Rank</th>
-                  <th style={{ padding: '10px 12px' }}>Model</th>
-                  <th style={{ padding: '10px 12px' }}>Val RMSE</th>
-                  <th style={{ padding: '10px 12px' }}>Val MAE</th>
-                  <th style={{ padding: '10px 12px' }}>Val MAPE</th>
-                  <th style={{ padding: '10px 12px' }}>Val R²</th>
-                  <th style={{ padding: '10px 12px' }}>Test RMSE</th>
-                </tr>
-              </thead>
-              <tbody>
-                {compareData.ranking.map((row) => {
-                  const isRec = row.model === compareData.recommended_model;
-                  return (
-                    <tr
-                      key={row.model}
-                      style={{
-                        borderBottom: `1px solid ${COLORS.bg.border}33`,
-                        background: isRec ? `${COLORS.primary}10` : 'transparent',
-                      }}
-                    >
-                      <td style={{ padding: '12px', fontWeight: 700, color: isRec ? COLORS.primary : COLORS.text.primary }}>
-                        #{row.rank}
-                      </td>
-                      <td style={{ padding: '12px', fontWeight: 600, color: COLORS.text.primary, textTransform: 'capitalize' }}>
-                        {row.model.replace('_', ' ')}
-                        {isRec && (
-                          <span
-                            style={{
-                              marginLeft: 8,
-                              background: `${COLORS.success}22`,
-                              color: COLORS.success,
-                              border: `1px solid ${COLORS.success}44`,
-                              borderRadius: 6,
-                              padding: '2px 8px',
-                              fontSize: 10,
-                              fontWeight: 700,
-                            }}
-                          >
-                            RECOMMENDED
-                          </span>
-                        )}
-                      </td>
-                      <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.primary }}>
-                        {formatNumber(row.validation_metrics?.rmse)}
-                      </td>
-                      <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.secondary }}>
-                        {formatNumber(row.validation_metrics?.mae)}
-                      </td>
-                      <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.secondary }}>
-                        {formatMape(row.validation_metrics?.mape)}
-                      </td>
-                      <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.secondary }}>
-                        {formatNumber(row.validation_metrics?.r2, 3)}
-                      </td>
-                      <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.muted }}>
-                        {formatNumber(row.test_metrics?.rmse)}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            <div style={{ marginTop: 12, fontSize: 11, color: COLORS.text.muted, fontStyle: 'italic' }}>
-              Note: Test set metrics are reported separately for final evaluation only and were not used during model recommendation.
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+            {/* Validation RMSE Bar Chart */}
+            <div style={{ background: COLORS.bg.dark, borderRadius: 12, padding: '16px 20px', border: `1px solid ${COLORS.bg.border}` }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.text.primary, marginBottom: 2 }}>
+                Validation RMSE by Candidate Model (Lower is Better)
+              </div>
+              <div style={{ fontSize: 11, color: COLORS.text.muted, marginBottom: 12 }}>
+                Validation split RMSE used for adaptive model selection
+              </div>
+              <ResponsiveContainer width="100%" height={180}>
+                <BarChart data={compareData.ranking} margin={{ top: 10, right: 20, left: 10, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={COLORS.bg.border} />
+                  <XAxis dataKey="model" tick={{ fill: COLORS.text.primary, fontSize: 11 }} tickFormatter={(m) => m.replace('_', ' ').toUpperCase()} />
+                  <YAxis tick={{ fill: COLORS.text.muted, fontSize: 11 }} />
+                  <Tooltip contentStyle={customTooltipStyle} formatter={(val) => [formatNumber(val), 'Val RMSE']} />
+                  <Bar dataKey="validation_metrics.rmse" name="Val RMSE" radius={[4, 4, 0, 0]}>
+                    {compareData.ranking.map((entry) => (
+                      <Cell
+                        key={entry.model}
+                        fill={entry.model === compareData.recommended_model ? COLORS.primary : COLORS.secondary}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* Ranking Table */}
+            <div style={{ overflowX: 'auto' }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: 13 }}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${COLORS.bg.border}`, color: COLORS.text.muted }}>
+                    <th style={{ padding: '10px 12px' }}>Rank</th>
+                    <th style={{ padding: '10px 12px' }}>Model</th>
+                    <th style={{ padding: '10px 12px' }}>Val RMSE</th>
+                    <th style={{ padding: '10px 12px' }}>Val MAE</th>
+                    <th style={{ padding: '10px 12px' }}>Val MAPE</th>
+                    <th style={{ padding: '10px 12px' }}>Val R²</th>
+                    <th style={{ padding: '10px 12px' }}>Test RMSE</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {compareData.ranking.map((row) => {
+                    const isRec = row.model === compareData.recommended_model;
+                    return (
+                      <tr
+                        key={row.model}
+                        style={{
+                          borderBottom: `1px solid ${COLORS.bg.border}33`,
+                          background: isRec ? `${COLORS.primary}12` : 'transparent',
+                        }}
+                      >
+                        <td style={{ padding: '12px', fontWeight: 700, color: isRec ? COLORS.primary : COLORS.text.primary }}>
+                          #{row.rank}
+                        </td>
+                        <td style={{ padding: '12px', fontWeight: 600, color: COLORS.text.primary, textTransform: 'capitalize' }}>
+                          {row.model.replace('_', ' ')}
+                          {isRec && (
+                            <span
+                              style={{
+                                marginLeft: 8,
+                                background: `${COLORS.success}22`,
+                                color: COLORS.success,
+                                border: `1px solid ${COLORS.success}44`,
+                                borderRadius: 6,
+                                padding: '2px 8px',
+                                fontSize: 10,
+                                fontWeight: 700,
+                              }}
+                            >
+                              RECOMMENDED WINNER
+                            </span>
+                          )}
+                        </td>
+                        <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.primary, fontWeight: 700 }}>
+                          {formatNumber(row.validation_metrics?.rmse)}
+                        </td>
+                        <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.secondary }}>
+                          {formatNumber(row.validation_metrics?.mae)}
+                        </td>
+                        <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.secondary }}>
+                          {formatMape(row.validation_metrics?.mape)}
+                        </td>
+                        <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.secondary }}>
+                          {formatNumber(row.validation_metrics?.r2, 3)}
+                        </td>
+                        <td style={{ padding: '12px', fontFamily: "'Space Mono', monospace", color: COLORS.text.muted }}>
+                          {formatNumber(row.test_metrics?.rmse)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           </div>
         ) : (
-          <div style={{ padding: '20px 0', textTransform: 'none', color: COLORS.text.muted, fontSize: 13 }}>
+          <div style={{ padding: '20px 0', color: COLORS.text.muted, fontSize: 13 }}>
             Click "Compare Models" above to run validation benchmark across all candidate models for {domain}.
           </div>
         )}
       </div>
 
-      {/* ─── P2: Explainability Section (Global SHAP) ─── */}
+      {/* ─── 7. Explainable AI (Top Forecast Drivers) ─── */}
       <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 16, padding: 24 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
           <div>
             <h3 style={{ fontSize: 16, fontWeight: 700, color: COLORS.text.primary, margin: 0 }}>
-              Explainable AI — Feature Importance (SHAP)
+              Top Forecast Drivers (Explainable AI — SHAP)
             </h3>
             <p style={{ fontSize: 12, color: COLORS.text.secondary, margin: '2px 0 0' }}>
-              Global feature attributions for model predictions
+              Mean |SHAP Value| — Higher values indicate features with greater influence on predictions.
             </p>
           </div>
           {isExplainableModel && (
@@ -639,26 +787,33 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
 
         {!isExplainableModel ? (
           <div style={{ padding: '20px', background: COLORS.bg.dark, borderRadius: 12, border: `1px solid ${COLORS.bg.border}`, color: COLORS.text.secondary, fontSize: 13 }}>
-            ℹ️ Explainability via Tree SHAP is available for <span style={{ color: COLORS.primary, fontWeight: 700 }}>Random Forest</span> and <span style={{ color: COLORS.primary, fontWeight: 700 }}>XGBoost</span> models. Switch to one of these models to inspect feature drivers.
+            ℹ️ Feature explainability via Tree SHAP is available for <span style={{ color: COLORS.primary, fontWeight: 700 }}>Random Forest</span> and <span style={{ color: COLORS.primary, fontWeight: 700 }}>XGBoost</span> tree ensemble models. Switch to one of these models to inspect top feature drivers.
           </div>
         ) : explainLoading ? (
           <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.text.secondary }}>
-            Computing SHAP values across evaluation set...
+            Computing SHAP values across evaluation dataset...
           </div>
         ) : explainError ? (
           <div style={{ color: COLORS.accent, fontSize: 13 }}>⚠️ {explainError}</div>
         ) : explainData ? (() => {
-          const featureImportances = explainData.feature_importance
-            ? Object.entries(explainData.feature_importance).map(([feature, importance]) => ({
-                feature,
-                importance: Number(importance),
-              }))
-            : explainData.feature_importances || [];
+          const featureImportances = (
+            explainData.feature_importance
+              ? Object.entries(explainData.feature_importance).map(([feature, importance]) => ({
+                  feature: formatFeatureName(feature),
+                  rawFeature: feature,
+                  importance: Number(importance),
+                }))
+              : (explainData.feature_importances || []).map((item) => ({
+                  feature: formatFeatureName(item.feature),
+                  rawFeature: item.feature,
+                  importance: Number(item.importance),
+                }))
+          );
 
           if (featureImportances.length === 0) {
             return (
               <div style={{ padding: '20px 0', color: COLORS.text.muted, fontSize: 13 }}>
-                No feature importances found for model {explainData.model}.
+                No feature importances returned for model {explainData.model}.
               </div>
             );
           }
