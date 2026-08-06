@@ -647,35 +647,52 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
           </div>
         ) : explainError ? (
           <div style={{ color: COLORS.accent, fontSize: 13 }}>⚠️ {explainError}</div>
-        ) : explainData?.feature_importances ? (
-          <div>
-            <div style={{ fontSize: 13, color: COLORS.text.secondary, marginBottom: 16 }}>
-              Top feature drivers for model <span style={{ color: COLORS.primary, fontWeight: 700 }}>{explainData.model}</span>:
+        ) : explainData ? (() => {
+          const featureImportances = explainData.feature_importance
+            ? Object.entries(explainData.feature_importance).map(([feature, importance]) => ({
+                feature,
+                importance: Number(importance),
+              }))
+            : explainData.feature_importances || [];
+
+          if (featureImportances.length === 0) {
+            return (
+              <div style={{ padding: '20px 0', color: COLORS.text.muted, fontSize: 13 }}>
+                No feature importances found for model {explainData.model}.
+              </div>
+            );
+          }
+
+          return (
+            <div>
+              <div style={{ fontSize: 13, color: COLORS.text.secondary, marginBottom: 16 }}>
+                Top feature drivers for model <span style={{ color: COLORS.primary, fontWeight: 700, textTransform: 'capitalize' }}>{explainData.model?.replace('_', ' ')}</span>:
+              </div>
+              <ResponsiveContainer width="100%" height={Math.max(240, featureImportances.slice(0, 10).length * 32)}>
+                <BarChart
+                  layout="vertical"
+                  data={featureImportances.slice(0, 10)}
+                  margin={{ top: 5, right: 30, left: 140, bottom: 5 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke={COLORS.bg.border} />
+                  <XAxis type="number" tick={{ fill: COLORS.text.muted, fontSize: 11 }} />
+                  <YAxis
+                    type="category"
+                    dataKey="feature"
+                    tick={{ fill: COLORS.text.primary, fontSize: 11 }}
+                    width={130}
+                  />
+                  <Tooltip contentStyle={customTooltipStyle} formatter={(val) => [formatNumber(val, 4), 'Mean |SHAP|']} />
+                  <Bar dataKey="importance" fill={COLORS.primary} radius={[0, 4, 4, 0]}>
+                    {featureImportances.slice(0, 10).map((_, i) => (
+                      <Cell key={i} fill={i < 3 ? COLORS.primary : COLORS.secondary} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
             </div>
-            <ResponsiveContainer width="100%" height={Math.max(220, explainData.feature_importances.slice(0, 10).length * 28)}>
-              <BarChart
-                layout="vertical"
-                data={explainData.feature_importances.slice(0, 10)}
-                margin={{ top: 5, right: 30, left: 120, bottom: 5 }}
-              >
-                <CartesianGrid strokeDasharray="3 3" stroke={COLORS.bg.border} />
-                <XAxis type="number" tick={{ fill: COLORS.text.muted, fontSize: 11 }} />
-                <YAxis
-                  type="category"
-                  dataKey="feature"
-                  tick={{ fill: COLORS.text.primary, fontSize: 12 }}
-                  width={110}
-                />
-                <Tooltip contentStyle={customTooltipStyle} formatter={(val) => [val.toFixed(4), 'Mean |SHAP|']} />
-                <Bar dataKey="importance" fill={COLORS.primary} radius={[0, 4, 4, 0]}>
-                  {explainData.feature_importances.slice(0, 10).map((_, i) => (
-                    <Cell key={i} fill={i < 3 ? COLORS.primary : COLORS.secondary} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        ) : (
+          );
+        })() : (
           <div style={{ padding: '20px 0', color: COLORS.text.muted, fontSize: 13 }}>
             Click "Recompute SHAP" to view feature importance analysis.
           </div>
