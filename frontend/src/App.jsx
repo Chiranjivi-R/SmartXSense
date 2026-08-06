@@ -7,6 +7,7 @@ import {
   AreaChart, Area, RadarChart, Radar, PolarGrid, PolarAngleAxis,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from "recharts";
+import ForecastDashboard from "./components/forecasting/ForecastDashboard";
 
 // ─── Color Palette ────────────────────────────────────────────────────────────
 const COLORS = {
@@ -1194,11 +1195,11 @@ export default function App() {
 
   const pageComponents = {
     home: <HomePage setActive={setActive} />,
-    dashboard: <DashboardPage />,
-    retail: <RetailPage />,
-    electricity: <ElectricityPage />,
+    dashboard: <ForecastDashboard initialDomain="retail" />,
+    retail: <ForecastDashboard initialDomain="retail" />,
+    electricity: <ForecastDashboard initialDomain="electricity" />,
     xai: <XAIPage />,
-    forecast: <ForecastPage />,
+    forecast: <ForecastDashboard initialDomain="retail" />,
     models: <ModelsPage />,
     settings: <SettingsPage />,
   };

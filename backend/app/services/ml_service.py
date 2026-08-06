@@ -30,9 +30,12 @@ class MLError(ValueError):
         self.code = code
 
 
+import tempfile
+
 ALLOWED_ROOT_PATHS = (
     Path(__file__).resolve().parents[3] / "ml_engine" / "data" / "features",  # Constrained feature artifact root
     Path(__file__).resolve().parents[3],                                       # Repository root
+    Path(tempfile.gettempdir()),                                                # System temp directory for tests
     Path("C:/tmp"),                                                            # Temporary test directories
     Path("/tmp"),
 )
@@ -60,7 +63,16 @@ def validate_features_directory(features_dir_input: str | Path) -> Path:
         raise MLError("Path traversal detected in features_dir", code=400)
 
     try:
-        resolved_path = Path(raw_str).resolve()
+        raw_path = Path(raw_str)
+        if not raw_path.is_absolute():
+            project_root = Path(__file__).resolve().parents[3]
+            candidate = (project_root / raw_path).resolve()
+            if candidate.exists():
+                resolved_path = candidate
+            else:
+                resolved_path = raw_path.resolve()
+        else:
+            resolved_path = raw_path.resolve()
     except Exception as err:
         raise MLError(f"Invalid features_dir path format: {err}", code=400) from err
 
