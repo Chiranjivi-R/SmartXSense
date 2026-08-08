@@ -13,6 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from ml_engine.features.artifacts import materialize_forecasting_features
 from ml_engine.features.common import FeatureEngineeringError
 from ml_engine.preprocessing.cleaner import PreprocessingError
+from ml_engine.preprocessing.calendar_features import SUPPORTED_REGIONS
 from ml_engine.preprocessing.domain import preprocess_frame
 from ml_engine.splitting.time_series import TimeSeriesSplitError
 
@@ -35,6 +36,7 @@ def _options(payload: object) -> dict:
     lag_intervals = body.get("lag_intervals", [])
     # Default True: connect upload flow to existing forecasting feature pipeline.
     generate_forecast_features = body.get("generate_forecast_features", True)
+    dataset_region = str(body.get("dataset_region", "other")).lower().strip()
     if imputation not in ALLOWED_IMPUTATION or scaler not in ALLOWED_SCALERS or outlier_method not in ALLOWED_OUTLIER_METHODS:
         raise DatasetError("Invalid preprocessing parameters", errors={"preprocessing": ["Unsupported imputation, scaler, or outlier method."]})
     if not isinstance(generate_lags, bool) or not isinstance(lag_intervals, list) or not all(isinstance(value, int) and value > 0 for value in lag_intervals):
@@ -46,11 +48,14 @@ def _options(payload: object) -> dict:
             "Invalid preprocessing parameters",
             errors={"generate_forecast_features": ["Must be a boolean."]},
         )
+    if dataset_region not in SUPPORTED_REGIONS:
+        raise DatasetError("Invalid preprocessing parameters", errors={"dataset_region": ["Must be India, UK, or Other."]})
     return {
         "imputation": imputation,
         "scaler": scaler,
         "outlier_method": outlier_method,
         "generate_forecast_features": generate_forecast_features,
+        "dataset_region": dataset_region,
     }
 
 
@@ -99,7 +104,10 @@ def preprocess_dataset(dataset: Dataset, payload: object) -> tuple[DatasetPrepro
 
     try:
         frame = _read_dataset(raw_path, _extension(dataset.filename))
-        processed, features, _removed_rows = preprocess_frame(frame, dataset.domain)
+        processed, features, _removed_rows = preprocess_frame(frame, dataset.domain, region=options["dataset_region"])
+        # Region travels with the existing feature artifact.  It is a declared
+        # dataset attribute, not inferred from the source or silently assumed.
+        processed["calendar_region"] = options["dataset_region"]
         output_dir.mkdir(parents=True, exist_ok=True)
         processed.to_parquet(output_path, index=False)
     except (DatasetError, PreprocessingError) as exc:

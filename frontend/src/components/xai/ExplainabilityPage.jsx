@@ -77,6 +77,9 @@ export default function ExplainabilityPage() {
   })();
 
   const top = importances.slice(0, 12);
+  const explanationSummary = top.length
+    ? `${top[0].feature} had the strongest model influence${top.length > 1 ? `, followed by ${top.slice(1, 3).map((item) => item.feature).join(' and ')}` : ''}. These features were most strongly associated with this ${method.toUpperCase()} explanation; this does not establish causation.`
+    : null;
 
   return (
     <div>
@@ -84,6 +87,9 @@ export default function ExplainabilityPage() {
       <p style={{ margin: '6px 0 20px', fontSize: 13, color: COLORS.text.secondary }}>
         Live SHAP/LIME explanations from the existing explainability API (Random Forest & XGBoost).
       </p>
+      <div style={{ margin: '-8px 0 16px', fontSize: 12, color: COLORS.text.muted }}>
+        SHAP summarizes feature contribution across evaluation data; LIME explains one local prediction with an interpretable approximation.
+      </div>
 
       <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 14, padding: 18, marginBottom: 16 }}>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 12 }}>
@@ -148,13 +154,19 @@ export default function ExplainabilityPage() {
                 <XAxis type="number" tick={{ fill: COLORS.text.muted, fontSize: 11 }} />
                 <YAxis type="category" dataKey="feature" width={110} tick={{ fill: COLORS.text.primary, fontSize: 11 }} />
                 <Tooltip contentStyle={tooltipStyle} />
-                <Bar dataKey="importance" name="Mean |SHAP|" radius={[0, 4, 4, 0]}>
+                <Bar dataKey="importance" name={method === 'lime' ? 'Local contribution' : 'Mean |SHAP|'} radius={[0, 4, 4, 0]}>
                   {top.map((_, i) => (
                     <Cell key={i} fill={i < 3 ? COLORS.primary : COLORS.secondary} />
                   ))}
                 </Bar>
               </BarChart>
             </ResponsiveContainer>
+          )}
+          {explanationSummary && (
+            <div style={{ marginTop: 16, padding: 14, borderRadius: 10, background: `${COLORS.primary}0d`, border: `1px solid ${COLORS.primary}33`, fontSize: 13, lineHeight: 1.6 }}>
+              <div style={{ fontWeight: 800, color: COLORS.primary, fontSize: 11, letterSpacing: '0.06em', marginBottom: 5 }}>EXPLANATION SUMMARY</div>
+              <div style={{ color: COLORS.text.primary }}>{explanationSummary}</div>
+            </div>
           )}
         </div>
       )}

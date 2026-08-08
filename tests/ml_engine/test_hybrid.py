@@ -201,6 +201,15 @@ def test_changing_test_targets_does_not_affect_hybrid_weights() -> None:
     assert w1 == w2
 
 
+def test_adaptive_selection_chooses_hybrid_only_when_validation_improves() -> None:
+    components = {"random_forest": {"rmse": 10.0}, "xgboost": {"rmse": 11.0}}
+    winning = HybridForecaster.select_adaptive_winner(components, {"rmse": 9.5})
+    losing = HybridForecaster.select_adaptive_winner(components, {"rmse": 10.0})
+    assert winning["selected_model"] == "hybrid"
+    assert losing["selected_model"] == "random_forest"
+    assert winning["selection_split"] == "validation"
+
+
 # ---------------------------------------------------------------------------
 # 5. Trainer Integration Tests
 # ---------------------------------------------------------------------------

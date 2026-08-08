@@ -49,6 +49,7 @@ from ml_engine.history.forecast_history import (
 )
 
 from .client_error_sanitize import sanitize_client_error_message
+from .forecast_summary_service import derive_forecast_facts
 
 
 class MLError(ValueError):
@@ -107,6 +108,15 @@ def _attach_history(
         features_id = derive_features_id(features_dir)
     except Exception:
         features_id = Path(features_dir).name if features_dir else None
+    context_frame = None
+    if forecast_type == "test_evaluation":
+        try:
+            # This is an already-authorized, controlled feature artifact.  The
+            # summary service retains only aggregates, never source rows.
+            context_frame = pd.read_parquet(features_dir / "test.parquet")
+        except Exception:
+            context_frame = None
+    result["summary_facts"] = derive_forecast_facts(result, context_frame=context_frame)
     summary = safe_record_from_forecast_result(
         result=result,
         forecast_type=forecast_type,

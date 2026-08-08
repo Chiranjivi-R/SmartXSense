@@ -155,6 +155,38 @@ class HybridForecaster:
         normalized_weights = {m: raw_weights[m] / total_raw for m in models}
         return normalized_weights
 
+    @staticmethod
+    def select_adaptive_winner(
+        component_validation_metrics: dict[str, dict[str, float]],
+        hybrid_validation_metrics: dict[str, float],
+    ) -> dict[str, Any]:
+        """Select using validation RMSE only; test data is intentionally absent."""
+        if not component_validation_metrics or "rmse" not in hybrid_validation_metrics:
+            raise HybridModelError("Validation metrics are required for adaptive hybrid selection.")
+        best_single, best_metrics = min(
+            component_validation_metrics.items(), key=lambda item: float(item[1]["rmse"])
+        )
+        best_rmse = float(best_metrics["rmse"])
+        hybrid_rmse = float(hybrid_validation_metrics["rmse"])
+        hybrid_wins = hybrid_rmse < best_rmse
+        selected = "hybrid" if hybrid_wins else best_single
+        reason = (
+            f"Hybrid validation RMSE ({hybrid_rmse:.4f}) improved on best single model "
+            f"{best_single} ({best_rmse:.4f}); Hybrid was selected."
+            if hybrid_wins else
+            f"Hybrid validation RMSE ({hybrid_rmse:.4f}) did not improve on best single model "
+            f"{best_single} ({best_rmse:.4f}); {best_single} was selected."
+        )
+        return {
+            "selection_split": "validation",
+            "selection_metric": "rmse",
+            "best_single_model": best_single,
+            "best_single_validation_rmse": best_rmse,
+            "hybrid_validation_rmse": hybrid_rmse,
+            "selected_model": selected,
+            "selection_reason": reason,
+        }
+
     @classmethod
     def validate_prediction_alignment(
         cls, predictions_map: dict[str, pd.Series]

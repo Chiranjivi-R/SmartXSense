@@ -8,6 +8,7 @@ import ExplainabilityPage from "./components/xai/ExplainabilityPage";
 import ModelsCatalogPage from "./components/models/ModelsCatalogPage";
 import ReportsPage from "./components/reports/ReportsPage";
 import SystemSettingsPage from "./components/settings/SystemSettingsPage";
+import { fetchAuthenticatedUser, login } from "./services/mlApi";
 
 // ─── Color Palette ────────────────────────────────────────────────────────────
 const COLORS = {
@@ -97,7 +98,7 @@ const Sidebar = ({ active, setActive, collapsed, setCollapsed }) => (
 );
 
 // ─── Top Bar ──────────────────────────────────────────────────────────────────
-const TopBar = ({ page, showNotifs, setShowNotifs }) => {
+const TopBar = ({ page, showNotifs, setShowNotifs, user }) => {
   const [search, setSearch] = useState("");
   return (
     <div style={{
@@ -114,6 +115,7 @@ const TopBar = ({ page, showNotifs, setShowNotifs }) => {
           }} />
       </div>
       <GlowBadge color={COLORS.success}>Local</GlowBadge>
+      <GlowBadge color={COLORS.primary}>{user?.role || "analyst"}</GlowBadge>
       <div style={{ fontSize: 12, color: COLORS.text.muted, fontFamily: "'Space Mono', monospace" }}>
         {new Date().toLocaleString()}
       </div>
@@ -135,6 +137,32 @@ const TopBar = ({ page, showNotifs, setShowNotifs }) => {
       }}>A</div>
     </div>
   );
+};
+
+const LoginPage = ({ onLogin, error }) => {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async (event) => {
+    event.preventDefault();
+    setSubmitting(true);
+    await onLogin(email, password);
+    setSubmitting(false);
+  };
+  return <div style={{ minHeight: '100vh', background: COLORS.bg.dark, display: 'grid', placeItems: 'center', padding: 24 }}>
+    <form onSubmit={submit} style={{ width: '100%', maxWidth: 380, background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 16, padding: 28 }}>
+      <h1 style={{ margin: 0, color: COLORS.text.primary }}>SmartXSense</h1>
+      <p style={{ color: COLORS.text.secondary, fontSize: 14 }}>Sign in to load your assigned workspace. Your account role controls dataset administration.</p>
+      <label style={{ display: 'block', color: COLORS.text.secondary, fontSize: 13, marginTop: 16 }}>Email
+        <input required type="email" value={email} onChange={(e) => setEmail(e.target.value)} style={{ width: '100%', marginTop: 6, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}`, background: COLORS.bg.dark, color: COLORS.text.primary }} />
+      </label>
+      <label style={{ display: 'block', color: COLORS.text.secondary, fontSize: 13, marginTop: 14 }}>Password
+        <input required type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={{ width: '100%', marginTop: 6, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}`, background: COLORS.bg.dark, color: COLORS.text.primary }} />
+      </label>
+      {error && <div style={{ marginTop: 12, color: COLORS.accent, fontSize: 13 }}>{error}</div>}
+      <button disabled={submitting} type="submit" style={{ width: '100%', marginTop: 18, padding: 11, border: 0, borderRadius: 8, cursor: 'pointer', fontWeight: 700, background: COLORS.primary, color: '#06101e' }}>{submitting ? 'Signing in…' : 'Sign in'}</button>
+    </form>
+  </div>;
 };
 
 // ─── Notification Panel ───────────────────────────────────────────────────────
@@ -316,12 +344,35 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(false);
   const [showNotifs, setShowNotifs] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [user, setUser] = useState(null);
+  const [accessToken, setAccessToken] = useState(() => window.localStorage.getItem('smartxsense_access_token'));
+  const [loginError, setLoginError] = useState(null);
 
   useEffect(() => {
     // Loading animation
     const t = setTimeout(() => setLoading(false), 1200);
     return () => clearTimeout(t);
   }, []);
+
+  useEffect(() => {
+    if (!accessToken) return;
+    fetchAuthenticatedUser(accessToken).then(setUser).catch(() => {
+      window.localStorage.removeItem('smartxsense_access_token');
+      setAccessToken(null);
+    });
+  }, [accessToken]);
+
+  const handleLogin = async (email, password) => {
+    setLoginError(null);
+    try {
+      const session = await login({ email, password });
+      window.localStorage.setItem('smartxsense_access_token', session.access_token);
+      setAccessToken(session.access_token);
+      setUser(session.user);
+    } catch (error) {
+      setLoginError(error.message || 'Unable to sign in.');
+    }
+  };
 
   // Loading screen
   if (loading) return (
@@ -348,15 +399,17 @@ export default function App() {
     </div>
   );
 
+  if (!user) return <LoginPage onLogin={handleLogin} error={loginError} />;
+
   const sideW = collapsed ? 64 : 220;
   const isHome = active === "home";
 
   const pageComponents = {
     home: <HomePage setActive={setActive} />,
     dashboard: <OverviewDashboard onNavigate={setActive} />,
-    retail: <ForecastDashboard initialDomain="retail" />,
-    electricity: <ForecastDashboard initialDomain="electricity" />,
-    forecast: <ForecastDashboard initialDomain="retail" />,
+    retail: <ForecastDashboard initialDomain="retail" userRole={user?.role} accessToken={accessToken} />,
+    electricity: <ForecastDashboard initialDomain="electricity" userRole={user?.role} accessToken={accessToken} />,
+    forecast: <ForecastDashboard initialDomain="retail" userRole={user?.role} accessToken={accessToken} />,
     xai: <ExplainabilityPage />,
     models: <ModelsCatalogPage />,
     reports: <ReportsPage />,
@@ -382,7 +435,7 @@ export default function App() {
       <div style={{ marginLeft: sideW, transition: "margin-left 0.3s ease", minHeight: "100vh" }}>
         {/* TopBar always visible except home hero */}
         <div style={{ position: "sticky", top: 0, zIndex: 50 }}>
-          <TopBar page={active} showNotifs={showNotifs} setShowNotifs={setShowNotifs} />
+          <TopBar page={active} showNotifs={showNotifs} setShowNotifs={setShowNotifs} user={user} />
         </div>
 
         {/* Notification Panel */}

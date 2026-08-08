@@ -33,6 +33,7 @@ import pandas as pd
 
 from ml_engine.models.arima import ARIMAForecaster
 from ml_engine.models.trainer import DOMAIN_TARGET_MAP
+from ml_engine.preprocessing.calendar_features import add_region_calendar_features
 
 
 class FutureForecastError(ValueError):
@@ -40,7 +41,9 @@ class FutureForecastError(ValueError):
 
 
 ARTIFACT_VERSION_NOTE = 1
-MAX_HORIZON = 168
+# 90 days of hourly electricity demand.  Tabular recursion remains bounded so
+# a request cannot accidentally turn into an unbounded browser/API workload.
+MAX_HORIZON = 2160
 
 DOMAIN_FREQUENCY = {
     "retail": "D",
@@ -169,7 +172,7 @@ def load_chronological_history(features_dir, target_column: str) -> pd.DataFrame
     return history
 
 
-def _calendar_features_for_timestamp(ts: pd.Timestamp, domain: str) -> dict[str, Any]:
+def _calendar_features_for_timestamp(ts: pd.Timestamp, domain: str, *, region: str = "other") -> dict[str, Any]:
     ts = pd.Timestamp(ts)
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
@@ -188,6 +191,11 @@ def _calendar_features_for_timestamp(ts: pd.Timestamp, domain: str) -> dict[str,
         values["hour"] = int(ts.hour)
     if domain == "retail":
         values["week_of_month"] = int(((ts.day - 1) // 7) + 1)
+    # Reuse the preprocessing calendar feature generator so future rows match
+    # the selected dataset's regional calendar without a parallel pipeline.
+    calendar_frame, _ = add_region_calendar_features(pd.DataFrame({"timestamp": [ts]}), region=region)
+    values.update({key: value for key, value in calendar_frame.iloc[0].to_dict().items() if key != "timestamp"})
+    values["calendar_region"] = region
     return values
 
 
@@ -245,13 +253,14 @@ def build_future_feature_frame(
     future_timestamps = pd.date_range(last_ts + pd.tseries.frequencies.to_offset(freq), periods=horizon, freq=freq, tz="UTC")
 
     base = history_df.iloc[-1].to_dict()
+    region = str(base.get("calendar_region") or "other").lower().strip()
     target_history = [float(v) for v in history_df[target_column].astype(float).tolist()]
     rows: list[dict[str, Any]] = []
 
     for step, ts in enumerate(future_timestamps):
         row = dict(base)
         row["timestamp"] = ts
-        row.update(_calendar_features_for_timestamp(ts, domain))
+        row.update(_calendar_features_for_timestamp(ts, domain, region=region))
         row.update(_lag_rolling_from_history(target_history, domain=domain))
         # Future actual target is unknown — never fabricate an actual value for metrics.
         if predicted_targets is not None:
@@ -285,6 +294,7 @@ def recursive_tabular_future_forecast(
     offset = pd.tseries.frequencies.to_offset(freq)
 
     base = history_df.iloc[-1].to_dict()
+    region = str(base.get("calendar_region") or "other").lower().strip()
     target_history = [float(v) for v in history_df[target_column].astype(float).tolist()]
     predictions: list[dict[str, Any]] = []
 
@@ -306,7 +316,7 @@ def recursive_tabular_future_forecast(
 
         row = dict(base)
         row["timestamp"] = current_ts
-        row.update(_calendar_features_for_timestamp(current_ts, domain))
+        row.update(_calendar_features_for_timestamp(current_ts, domain, region=region))
         row.update(_lag_rolling_from_history(target_history, domain=domain))
         row[target_column] = np.nan
 

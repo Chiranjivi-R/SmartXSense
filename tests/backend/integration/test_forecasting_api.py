@@ -476,7 +476,7 @@ def test_future_endpoint_valid_horizon(tmp_path, mock_features_dir):
         db.drop_all()
 
 
-@pytest.mark.parametrize("bad_horizon", [0, -1, True, 7.5, "12", 500])
+@pytest.mark.parametrize("bad_horizon", [0, -1, True, 7.5, "12", 2161])
 def test_future_endpoint_rejects_invalid_horizon(tmp_path, mock_features_dir, bad_horizon):
     class Cfg(TestConfig):
         ML_ARTIFACTS_ROOT = str(tmp_path / "future_bad_horizon")

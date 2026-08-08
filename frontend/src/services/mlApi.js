@@ -11,7 +11,7 @@ export const DOMAIN_FEATURE_ARTIFACTS = {
 
 export const FUTURE_HORIZON_PRESETS = {
   retail: [7, 14, 30],
-  electricity: [24, 48, 168],
+  electricity: [24, 168, 720, 2160],
 };
 
 export const FUTURE_SUPPORTED_MODELS = {
@@ -37,37 +37,21 @@ async function parseJsonResponse(response) {
   return data.data;
 }
 
-export async function ensureUploadAuthToken() {
-  const email = 'upload.demo@smartxsense.local';
-  const password = 'SmartXSenseUpload123!';
-  const fullName = 'Upload Demo User';
+export async function fetchAuthenticatedUser(accessToken) {
+  if (!accessToken) return null;
+  const response = await fetch(`${API_BASE_URL}/api/v1/auth/me`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  return parseJsonResponse(response);
+}
 
-  let login = await fetch(`${API_BASE_URL}/api/v1/auth/login`, {
+export async function login({ email, password }) {
+  const response = await fetch(`${API_BASE_URL}/api/v1/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password }),
   });
-  if (login.ok) {
-    const body = await login.json();
-    return body.data.access_token;
-  }
-
-  await fetch(`${API_BASE_URL}/api/v1/auth/register`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password, full_name: fullName, role: 'analyst' }),
-  });
-
-  login = await fetch(`${API_BASE_URL}/api/v1/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password }),
-  });
-  const body = await login.json();
-  if (!login.ok || body.status === 'error') {
-    throw new Error(body.message || 'Unable to authenticate for dataset upload');
-  }
-  return body.data.access_token;
+  return parseJsonResponse(response);
 }
 
 export async function uploadDataset({ file, domain, accessToken }) {

@@ -155,6 +155,7 @@ def build_history_record(
     horizon: int | None = None,
     artifact_source: str | None = None,
     selection_method: str | None = None,
+    summary_facts: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a metadata-only history record (no prediction arrays)."""
     if forecast_type not in {"test_evaluation", "future"}:
@@ -185,6 +186,8 @@ def build_history_record(
         record["horizon"] = int(horizon)
     if selection_method:
         record["selection_method"] = str(selection_method)
+    if summary_facts:
+        record["summary_facts"] = {str(key): value for key, value in summary_facts.items() if isinstance(value, (str, int, float, bool)) or value is None}
     return record
 
 
@@ -303,6 +306,7 @@ def safe_record_from_forecast_result(
             horizon=result.get("horizon") if forecast_type == "future" else None,
             artifact_source=artifact.get("source"),
             selection_method=selection_method,
+            summary_facts=result.get("summary_facts") if isinstance(result.get("summary_facts"), dict) else None,
         )
         summary = record_forecast_run(record, history_root=history_root)
         return summary

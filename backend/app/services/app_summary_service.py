@@ -19,6 +19,7 @@ from ml_engine.models.capability_matrix import (
     get_models_catalog_payload,
 )
 from ml_engine.models.trainer import DOMAIN_TARGET_MAP
+from .forecast_summary_service import build_forecast_summary
 
 
 class AppSummaryError(ValueError):
@@ -150,6 +151,7 @@ def get_report(run_id: str) -> dict[str, Any]:
 
     clean = {key: value for key, value in record.items() if key != "predictions"}
     clean["report_id"] = clean.get("run_id")
+    clean["forecast_summary"] = build_forecast_summary(clean)
     return clean
 
 

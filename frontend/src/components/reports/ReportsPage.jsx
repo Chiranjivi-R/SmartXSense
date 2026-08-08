@@ -124,6 +124,19 @@ export default function ReportsPage() {
           {detailError && <div style={{ color: COLORS.accent, fontSize: 13 }}>{detailError}</div>}
           {detail && !detailLoading && (
             <div style={{ fontSize: 13, color: COLORS.text.secondary, lineHeight: 1.7 }}>
+              {detail.forecast_summary && (
+                <div style={{ marginBottom: 16, padding: 12, borderRadius: 10, background: `${COLORS.primary}0d`, border: `1px solid ${COLORS.primary}33` }}>
+                  <div style={{ color: COLORS.primary, fontWeight: 800, fontSize: 11, letterSpacing: '0.06em', marginBottom: 6 }}>FORECAST SUMMARY</div>
+                  <div style={{ color: COLORS.text.primary }}>{detail.forecast_summary.summary}</div>
+                  <div style={{ marginTop: 7, color: COLORS.text.secondary }}>{detail.forecast_summary.interpretation}</div>
+                  {detail.forecast_summary.insights?.length > 0 && (
+                    <ul style={{ margin: '10px 0 0', paddingLeft: 18, color: COLORS.text.secondary }}>
+                      {detail.forecast_summary.insights.map((insight) => <li key={insight}>{insight}</li>)}
+                    </ul>
+                  )}
+                </div>
+              )}
+              <div style={{ color: COLORS.text.primary, fontWeight: 700, marginBottom: 4 }}>Report Detail</div>
               {[
                 ['Run ID', detail.run_id],
                 ['Domain', detail.domain],

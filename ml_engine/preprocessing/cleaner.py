@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+from .calendar_features import add_region_calendar_features
 
 
 class PreprocessingError(ValueError):
@@ -28,7 +29,7 @@ def clean_timestamp_and_target(frame: pd.DataFrame, target: str) -> tuple[pd.Dat
     return result, before - len(result)
 
 
-def add_calendar_features(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def add_calendar_features(frame: pd.DataFrame, *, region: str = "other") -> tuple[pd.DataFrame, list[str]]:
     """Create deterministic calendar features only; no lag or rolling values."""
     result = frame.copy()
     timestamp = result["timestamp"].dt
@@ -42,6 +43,8 @@ def add_calendar_features(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]
     if timestamp.hour.nunique() > 1 or (timestamp.hour != 0).any():
         result["hour"] = timestamp.hour
         features.append("hour")
+    result, region_features = add_region_calendar_features(result, region=region)
+    features.extend(region_features)
     # Parquet represents timezone-aware values consistently; retaining UTC
     # eliminates ambiguous local timestamps from mixed source files.
     result["timestamp"] = result["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")

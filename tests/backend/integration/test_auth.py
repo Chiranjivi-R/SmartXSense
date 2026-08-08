@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 from app import create_app  # noqa: E402
 from app.extensions import db  # noqa: E402
+from flask_jwt_extended import decode_token  # noqa: E402
 
 
 class TestConfig:
@@ -99,3 +100,30 @@ def test_me_with_valid_token(client):
     assert response.status_code == 200
     assert body["data"]["email"] == "analyst@smartxsense.ai"
     assert "password_hash" not in body["data"]
+
+
+def test_viewer_role_is_returned_on_login_and_cannot_mutate_datasets(client):
+    response = client.post("/api/v1/auth/register", json=registration_payload(
+        email="viewer@smartxsense.ai", full_name="Read Only Viewer", role="viewer"
+    ))
+    assert response.status_code == 201
+    login = client.post("/api/v1/auth/login", json={"email": "viewer@smartxsense.ai", "password": "SecurePassword123!"})
+    body = login.get_json()
+    assert body["data"]["user"]["role"] == "viewer"
+    headers = {"Authorization": f"Bearer {body['data']['access_token']}"}
+    denied = client.post("/api/v1/datasets/not-a-real-dataset/preprocess", json={}, headers=headers)
+    assert denied.status_code == 403
+    assert "permissions" in denied.get_json()["message"].lower()
+
+
+def test_admin_and_viewer_roles_persist_in_login_refresh_and_profile(client):
+    for role in ("admin", "data_scientist", "viewer"):
+        email = f"{role}@smartxsense.ai"
+        assert client.post("/api/v1/auth/register", json=registration_payload(email=email, role=role)).status_code == 201
+        login = client.post("/api/v1/auth/login", json={"email": email, "password": "SecurePassword123!"}).get_json()["data"]
+        assert login["user"]["role"] == role
+        assert decode_token(login["access_token"])["role"] == role
+        refreshed = client.post("/api/v1/auth/refresh", json={"refresh_token": login["refresh_token"]}).get_json()["data"]["access_token"]
+        assert decode_token(refreshed)["role"] == role
+        me = client.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {refreshed}"})
+        assert me.get_json()["data"]["role"] == role

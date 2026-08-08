@@ -17,7 +17,8 @@ from ..models import User, UserSession
 
 
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-ALLOWED_ROLES = {"admin", "analyst", "viewer"}
+# ``analyst`` remains a compatible name for existing data-scientist accounts.
+ALLOWED_ROLES = {"admin", "analyst", "data_scientist", "viewer"}
 
 
 class AuthError(Exception):
@@ -99,7 +100,7 @@ def register_user(payload: object) -> User:
     if len(full_name) > 255:
         raise AuthError("Validation failed", errors={"full_name": ["Must not exceed 255 characters."]})
     if role not in ALLOWED_ROLES:
-        raise AuthError("Validation failed", errors={"role": ["Must be one of: admin, analyst, viewer."]})
+        raise AuthError("Validation failed", errors={"role": ["Must be one of: admin, data_scientist, analyst, viewer."]})
     _validate_password(password)
 
     try:
@@ -145,8 +146,12 @@ def login_user(payload: object, *, ip_address: str | None, user_agent: str | Non
         if user is None or not user.is_active or not check_password_hash(user.password_hash, password):
             raise AuthError("Invalid email or password credentials", 401)
 
-        access_token = create_access_token(identity=user.user_id)
-        refresh_token = create_refresh_token(identity=user.user_id)
+        # The role is carried in both JWT types so clients can render the
+        # appropriate workspace immediately.  Protected routes still load the
+        # current user from the database and never trust this claim alone.
+        role_claim = {"role": user.role}
+        access_token = create_access_token(identity=user.user_id, additional_claims=role_claim)
+        refresh_token = create_refresh_token(identity=user.user_id, additional_claims=role_claim)
         refresh_claims = decode_token(refresh_token)
         expires_at = datetime.fromtimestamp(refresh_claims["exp"], UTC).isoformat().replace("+00:00", "Z")
         session = UserSession(
@@ -188,7 +193,7 @@ def refresh_access_token(refresh_token: str) -> str:
         user = db.session.get(User, claims["sub"])
         if session is None or user is None or not user.is_active:
             raise AuthError("Invalid or expired refresh token", 401)
-        return create_access_token(identity=user.user_id)
+        return create_access_token(identity=user.user_id, additional_claims={"role": user.role})
     except AuthError:
         raise
     except SQLAlchemyError as exc:

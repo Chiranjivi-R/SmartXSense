@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   LineChart, Line, BarChart, Bar, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
@@ -12,7 +12,6 @@ import {
   FUTURE_HORIZON_PRESETS,
   FUTURE_SUPPORTED_MODELS,
   DOMAIN_FEATURE_ARTIFACTS,
-  ensureUploadAuthToken,
   uploadDataset,
   getDatasetDetail,
   validateDataset,
@@ -111,7 +110,7 @@ const DOMAIN_CONTEXTS = {
   electricity: 'Forecasting electricity grid demand using temporal patterns, historical load, and rolling aggregate features.',
 };
 
-export default function ForecastDashboard({ initialDomain = 'retail' }) {
+export default function ForecastDashboard({ initialDomain = 'retail', userRole = 'viewer', accessToken = null }) {
   const [domain, setDomain] = useState(initialDomain);
   const [model, setModel] = useState('random_forest');
 
@@ -151,6 +150,11 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
   const [historyRuns, setHistoryRuns] = useState([]);
   const [historyError, setHistoryError] = useState(null);
   const [exportStatus, setExportStatus] = useState(null);
+  const canManageDatasets = ['admin', 'analyst', 'data_scientist'].includes(String(userRole).toLowerCase());
+  // Domain changes invalidate all response data from the former domain.  This
+  // monotonically increasing token also prevents a slower former request from
+  // repainting the dashboard after the user has switched domains.
+  const domainRequestToken = useRef(0);
 
   const handleExport = (kind, format) => {
     setExportStatus(null);
@@ -202,7 +206,14 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
 
   // Clear stale state when domain changes
   const handleDomainSwitch = (newDomain) => {
+    if (!['retail', 'electricity'].includes(newDomain)) return;
+    domainRequestToken.current += 1;
+    const validModel = newDomain === 'retail' && model === 'arima'
+      ? 'random_forest'
+      : model;
     setDomain(newDomain);
+    setModel(validModel);
+    setUploadDomain(newDomain);
     setForecastData(null);
     setCompareData(null);
     setExplainData(null);
@@ -214,11 +225,17 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
     setFutureError(null);
     setFutureModel('random_forest');
     setFutureHorizon(FUTURE_HORIZON_PRESETS[newDomain]?.[0] || 7);
-    handleRunForecast(model, newDomain);
+    // A domain-specific uploaded feature artifact must never be used under a
+    // different domain.  The demo artifact is restored until another upload.
+    if (customFeaturesDir && uploadInfo?.domain !== newDomain) {
+      setCustomFeaturesDir(null);
+    }
+    handleRunForecast(validModel, newDomain, uploadInfo?.domain === newDomain ? undefined : DOMAIN_FEATURE_ARTIFACTS[newDomain]);
   };
 
   // Primary forecast runner
   const handleRunForecast = async (targetModel = model, targetDomain = domain, featuresDirOverride = undefined) => {
+    const requestToken = domainRequestToken.current;
     setForecastLoading(true);
     setForecastError(null);
     setExplainData(null);
@@ -238,6 +255,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
             domain: targetDomain,
             featuresDir: activeFeaturesDir,
           });
+          if (requestToken !== domainRequestToken.current) return;
           setCompareData(compResult);
           actualModel = compResult.recommended_model || 'random_forest';
           recModel = actualModel;
@@ -261,6 +279,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
         selectionMethod: targetModel === 'auto_select' ? 'validation_rmse' : undefined,
       });
 
+      if (requestToken !== domainRequestToken.current) return;
       setForecastData(res);
       loadForecastHistory();
 
@@ -278,6 +297,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
 
   // Model comparison runner
   const handleCompareModels = async () => {
+    const requestToken = domainRequestToken.current;
     setCompareLoading(true);
     setCompareError(null);
     try {
@@ -285,7 +305,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
         domain,
         featuresDir: customFeaturesDir || undefined,
       });
-      setCompareData(res);
+      if (requestToken === domainRequestToken.current) setCompareData(res);
     } catch (err) {
       console.error('Comparison error:', err);
       setCompareError('Model comparison request failed. Please verify backend service.');
@@ -296,6 +316,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
 
   // Explainability runner
   const fetchExplainability = async (expDomain, expModel, featuresDirOverride = undefined) => {
+    const requestToken = domainRequestToken.current;
     setExplainLoading(true);
     setExplainError(null);
     try {
@@ -306,7 +327,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
         explanationType: 'global',
         method: 'shap',
       });
-      setExplainData(res);
+      if (requestToken === domainRequestToken.current) setExplainData(res);
     } catch (err) {
       console.error('Explainability error:', err);
       setExplainError('Explainability request failed for this model.');
@@ -319,6 +340,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
   const isFutureModelSupported = futureSupportedModels.includes(futureModel);
 
   const handleRunFutureForecast = async () => {
+    const requestToken = domainRequestToken.current;
     if (!isFutureModelSupported) {
       setFutureError(`Future forecasting is not currently supported for model ${futureModel}.`);
       return;
@@ -332,6 +354,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
         horizon: Number(futureHorizon),
         featuresDir: customFeaturesDir || undefined,
       });
+      if (requestToken !== domainRequestToken.current) return;
       setFutureData(res);
       loadForecastHistory();
     } catch (err) {
@@ -363,7 +386,8 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
     setUploadValidation(null);
     setUploadProcess(null);
     try {
-      const token = await ensureUploadAuthToken();
+      if (!accessToken) throw new Error('Please sign in with a Data Scientist or Admin account to upload a dataset.');
+      const token = accessToken;
       const uploaded = await uploadDataset({
         file: uploadFile,
         domain: uploadDomain,
@@ -579,7 +603,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
         </div>
 
         {/* Dataset Upload (optional — demo datasets remain default) */}
-        <div style={{ marginTop: 4, background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 12, padding: 16 }}>
+        {canManageDatasets && <div style={{ marginTop: 4, background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 12, padding: 16 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
             <div>
               <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary }}>Dataset Upload</div>
@@ -674,7 +698,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
               {customFeaturesDir ? ` · active features_dir set` : ''}
             </div>
           )}
-        </div>
+        </div>}
 
         {/* ─── Auto Select Explanation Banner ─── */}
         {autoSelectedModel && (
@@ -860,6 +884,13 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
               );
             })}
           </div>
+          {forecastData.adaptive_selection && (
+            <div style={{ marginTop: 14, padding: 12, borderRadius: 10, background: `${COLORS.primary}10`, border: `1px solid ${COLORS.primary}33`, color: COLORS.text.secondary, fontSize: 13 }}>
+              <strong style={{ color: COLORS.primary }}>Validation-only adaptive decision:</strong>{' '}
+              {forecastData.adaptive_selection.selection_reason}
+              <div style={{ marginTop: 4 }}>Selected model: <strong style={{ color: COLORS.text.primary, textTransform: 'capitalize' }}>{forecastData.selected_model?.replace('_', ' ')}</strong>. Held-out test metrics are reported only after this decision.</div>
+            </div>
+          )}
         </div>
       )}
 

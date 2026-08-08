@@ -403,9 +403,24 @@ def run_training_pipeline(
         val_metrics = evaluate_forecast(val_targets, val_hybrid_pred)
         test_metrics = evaluate_forecast(test_targets, test_hybrid_pred)
 
+        # This choice intentionally receives only validation facts.  The
+        # held-out test metrics above are reported for evaluation, never for
+        # choosing whether the ensemble is better than a component.
+        adaptive_selection = HybridForecaster.select_adaptive_winner(
+            component_val_metrics,
+            val_metrics,
+        )
+        selected_model = adaptive_selection["selected_model"]
+        if selected_model == "hybrid":
+            selected_test_pred = test_hybrid_pred
+            selected_test_metrics = test_metrics
+        else:
+            selected_test_pred = test_predictions[selected_model]
+            selected_test_metrics = component_test_metrics[selected_model]
+
         predictions_list, pred_count, total_test_preds = format_chart_predictions(
             test_df=test_df,
-            test_pred=test_hybrid_pred,
+            test_pred=selected_test_pred,
             target_column=target_column,
             prediction_limit=prediction_limit,
         )
@@ -426,6 +441,9 @@ def run_training_pipeline(
             "test_rows": len(test_df),
             "validation_metrics": val_metrics,
             "test_metrics": test_metrics,
+            "selected_model": selected_model,
+            "selected_test_metrics": selected_test_metrics,
+            "adaptive_selection": adaptive_selection,
             "predictions": predictions_list,
             "prediction_count": pred_count,
             "total_test_predictions": total_test_preds,

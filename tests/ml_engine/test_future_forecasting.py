@@ -113,8 +113,9 @@ def test_horizon_validation() -> None:
         validate_horizon(True, domain="retail")
     with pytest.raises(FutureForecastError):
         validate_horizon(7.5, domain="retail")
+    assert validate_horizon(2160, domain="electricity") == 2160
     with pytest.raises(FutureForecastError):
-        validate_horizon(500, domain="retail")
+        validate_horizon(2161, domain="electricity")
 
 
 def test_support_matrix() -> None:
@@ -123,6 +124,37 @@ def test_support_matrix() -> None:
     assert not is_future_forecast_supported("retail", "lstm")
     assert not is_future_forecast_supported("retail", "hybrid")
     assert not is_future_forecast_supported("retail", "arima")
+
+
+def test_future_calendar_region_is_recomputed_not_carried_forward() -> None:
+    from ml_engine.models.future_forecasting import build_future_feature_frame
+
+    history = pd.DataFrame({
+        "timestamp": pd.to_datetime(["2026-11-06T00:00:00Z", "2026-11-07T00:00:00Z"]),
+        "demand_mw": [100.0, 101.0],
+        "calendar_region": ["india", "india"],
+    })
+    future, _ = build_future_feature_frame(history, domain="electricity", target_column="demand_mw", horizon=1)
+    assert future.loc[0, "calendar_region"] == "india"
+    assert future.loc[0, "is_festival"] == 0
+    assert future.loc[0, "holiday_name"] is pd.NA or pd.isna(future.loc[0, "holiday_name"])
+
+
+def test_future_calendar_uses_declared_india_uk_or_other_context() -> None:
+    from ml_engine.models.future_forecasting import build_future_feature_frame
+
+    def future_for(region: str, last_timestamp: str):
+        history = pd.DataFrame({"timestamp": pd.to_datetime([last_timestamp]), "demand_mw": [100.0], "calendar_region": [region]})
+        return build_future_feature_frame(history, domain="electricity", target_column="demand_mw", horizon=1)[0].iloc[0]
+
+    india = future_for("india", "2026-03-03T23:00:00Z")
+    uk = future_for("uk", "2026-12-24T23:00:00Z")
+    other = future_for("other", "2026-03-03T23:00:00Z")
+    assert india["holiday_name"] == "Holi"
+    assert india["is_festival"] == 1
+    assert uk["holiday_name"] == "Christmas Day"
+    assert "is_festival" not in uk.index
+    assert "is_holiday" not in other.index
 
 
 def test_lag_rolling_uses_only_past_targets() -> None:
