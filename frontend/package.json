@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:export": "node --test src/utils/forecastExport.test.js"
   },
   "dependencies": {
     "react": "^18.3.1",

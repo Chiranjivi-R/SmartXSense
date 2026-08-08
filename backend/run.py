@@ -1,5 +1,6 @@
 """Development entry point for the SmartXSense backend."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -17,4 +18,17 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    # Never enable the Werkzeug interactive debugger (no HTML traceback UI).
+    # Optional auto-reload: set SMARTXSENSE_RELOAD=1 for local edit-reload loops.
+    use_reloader = os.getenv("SMARTXSENSE_RELOAD", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False,
+        use_debugger=False,
+        use_reloader=use_reloader,
+    )

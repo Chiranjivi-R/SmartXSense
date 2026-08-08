@@ -1,11 +1,15 @@
 # SmartXSense — REST API Contract Specification
 **Explainable Hybrid Demand Forecasting Framework for Retail and Electricity Systems**
 
+> **SUPERSEDED — do not use as the live API contract.**
+> This document is a legacy draft and describes many endpoints and behaviors that are **not** implemented (async training jobs, domain-split train/predict routes, PDF reports, mutable settings, fabricated dashboard KPIs, etc.).
+> **Authoritative sources:** [`docs/ML_API_CONTRACT.md`](../ML_API_CONTRACT.md), [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md), [`docs/MODEL_CAPABILITY_MATRIX.md`](../MODEL_CAPABILITY_MATRIX.md), and [`README.md`](../../README.md).
+
 ---
 
 ## 1. Overview & API Architecture
 
-This specification defines the complete RESTful API contract for the SmartXSense backend. All API requests and responses utilize standard JSON format (except binary file uploads and downloads).
+~~This specification defines the complete RESTful API contract for the SmartXSense backend.~~ *(Legacy draft retained for historical reference only.)* All API requests and responses utilize standard JSON format (except binary file uploads and downloads).
 
 * **Base URL**: `http://localhost:5000/api/v1`
 * **Authentication Standard**: JSON Web Token (JWT) passed in the `Authorization: Bearer <token>` HTTP header.

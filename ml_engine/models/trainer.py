@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import pickle
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +11,13 @@ import pandas as pd
 import numpy as np
 
 from ml_engine.evaluation.metrics import evaluate_forecast
+from ml_engine.models.artifact_store import (
+    ArtifactError,
+    derive_features_id,
+    is_persistence_supported,
+    predict_with_fitted_model,
+    save_model_artifact,
+)
 
 
 def format_chart_predictions(
@@ -426,19 +431,13 @@ def run_training_pipeline(
             "total_test_predictions": total_test_preds,
         }
 
+        # Hybrid persistence is intentionally unsupported: component models are
+        # not retained after training, so weights-only artifacts cannot be reused.
         if save_artifact:
-            artifacts_dir = Path(artifacts_root) / domain
-            artifacts_dir.mkdir(parents=True, exist_ok=True)
-            artifact_filename = f"{domain}_hybrid_{uuid.uuid4().hex[:8]}.pkl"
-            artifact_path = artifacts_dir / artifact_filename
-            artifact_data = {
-                "result": result,
-                "weights": weights,
-                "components": hybrid_forecaster.components,
+            result["artifact_persistence"] = {
+                "supported": False,
+                "reason": "hybrid requires fitted component models which are not retained",
             }
-            with open(artifact_path, "wb") as f:
-                pickle.dump(artifact_data, f)
-            result["artifact_path"] = str(artifact_path.as_posix())
 
         return result
 
@@ -519,19 +518,200 @@ def run_training_pipeline(
         result["feature_importances"] = feature_importances
 
     if save_artifact:
-        artifacts_dir = Path(artifacts_root) / domain
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
-        artifact_filename = f"{domain}_{model_key}_{uuid.uuid4().hex[:8]}.pkl"
-        artifact_path = artifacts_dir / artifact_filename
-        artifact_data = {
-            "result": result,
-            "model": res["model"],
-        }
-        with open(artifact_path, "wb") as f:
-            pickle.dump(artifact_data, f)
-        result["artifact_path"] = str(artifact_path.as_posix())
+        if is_persistence_supported(model_key):
+            try:
+                features_id = derive_features_id(features_dir)
+                saved = save_model_artifact(
+                    model=res["model"],
+                    domain=domain,
+                    model_key=model_key,
+                    target=target_column,
+                    features_id=features_id,
+                    feature_names=feature_names,
+                    configuration=res["configuration"],
+                    validation_metrics=val_metrics,
+                    test_metrics=test_metrics,
+                    artifacts_root=artifacts_root,
+                )
+                result["artifact_path"] = saved["artifact_dir"]
+                result["artifact_key"] = saved["relative_key"]
+                result["artifact_persistence"] = {"supported": True, "saved": True}
+            except ArtifactError as err:
+                result["artifact_persistence"] = {
+                    "supported": True,
+                    "saved": False,
+                    "reason": str(err),
+                }
+        else:
+            result["artifact_persistence"] = {
+                "supported": False,
+                "reason": f"model '{model_key}' does not support safe persistence",
+            }
 
     return result
+
+
+def evaluate_fitted_model_on_splits(
+    *,
+    domain: str,
+    model_key: str,
+    model: Any,
+    features_dir: Path | str,
+    configuration: dict[str, Any] | None = None,
+    prediction_limit: int = 100,
+    feature_names: list[str] | None = None,
+) -> dict[str, Any]:
+    """Evaluate an already-fitted model on feature splits and return API-shaped results."""
+    domain = domain.lower().strip()
+    if domain not in DOMAIN_TARGET_MAP:
+        raise TrainerError(f"Unsupported domain '{domain}'. Supported domains: {list(DOMAIN_TARGET_MAP.keys())}")
+
+    model_key = model_key.lower().strip()
+    if model_key == "baseline":
+        model_key = "naive"
+
+    target_column = DOMAIN_TARGET_MAP[domain]
+    features_dir = Path(features_dir)
+    train_df = pd.read_parquet(features_dir / "train.parquet")
+    val_df = pd.read_parquet(features_dir / "validation.parquet")
+    test_df = pd.read_parquet(features_dir / "test.parquet")
+
+    try:
+        pred_res = predict_with_fitted_model(
+            model_key=model_key,
+            model=model,
+            domain=domain,
+            target_column=target_column,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+        )
+    except Exception as err:
+        raise TrainerError(f"Failed to predict with loaded artifact: {err}") from err
+
+    val_pred = pred_res["val_pred"]
+    test_pred = pred_res["test_pred"]
+    resolved_feature_names = list(feature_names if feature_names is not None else pred_res["feature_names"])
+
+    if model_key in ("lstm", "cnn_lstm"):
+        val_targets = val_df.loc[val_pred.index, target_column]
+        test_targets = test_df.loc[test_pred.index, target_column]
+    else:
+        if len(val_pred) != len(val_df):
+            raise TrainerError(f"Validation prediction length mismatch: got {len(val_pred)}, expected {len(val_df)}")
+        if len(test_pred) != len(test_df):
+            raise TrainerError(f"Test prediction length mismatch: got {len(test_pred)}, expected {len(test_df)}")
+        val_targets = val_df[target_column]
+        test_targets = test_df[target_column]
+
+    val_metrics = evaluate_forecast(val_targets, val_pred)
+    test_metrics = evaluate_forecast(test_targets, test_pred)
+    predictions_list, pred_count, total_test_preds = format_chart_predictions(
+        test_df=test_df,
+        test_pred=test_pred,
+        target_column=target_column,
+        prediction_limit=prediction_limit,
+    )
+
+    result: dict[str, Any] = {
+        "model": model_key,
+        "domain": domain,
+        "target": target_column,
+        "configuration": configuration or {},
+        "feature_count": len(resolved_feature_names),
+        "feature_names": resolved_feature_names,
+        "training_rows": len(train_df),
+        "validation_rows": len(val_df),
+        "test_rows": len(test_df),
+        "validation_metrics": val_metrics,
+        "test_metrics": test_metrics,
+        "predictions": predictions_list,
+        "prediction_count": pred_count,
+        "total_test_predictions": total_test_preds,
+    }
+
+    if model_key in ("lstm", "cnn_lstm"):
+        result["training_sequences"] = pred_res["training_sequences"]
+        result["validation_sequences"] = pred_res["validation_sequences"]
+        result["test_sequences"] = pred_res["test_sequences"]
+        result["epochs_trained"] = pred_res["epochs_trained"]
+
+    if pred_res["feature_importances"] is not None:
+        result["feature_importances"] = pred_res["feature_importances"]
+
+    return result
+
+
+def expected_configuration_for_request(
+    *,
+    model_key: str,
+    domain: str,
+    order: tuple[int, int, int] = (1, 1, 1),
+    seasonal_period: int | None = None,
+    n_estimators: int = 200,
+    max_depth: int | None = None,
+    learning_rate: float = 0.05,
+    random_state: int = 42,
+    lookback: int | None = None,
+    lstm_units: int = 64,
+    dropout: float = 0.1,
+    epochs: int = 20,
+    batch_size: int = 32,
+    lstm_learning_rate: float = 0.001,
+    cnn_filters: int = 32,
+    kernel_size: int = 3,
+) -> dict[str, Any]:
+    """Mirror trainer configuration keys so artifact fingerprints match training saves."""
+    model_key = model_key.lower().strip()
+    if model_key == "baseline":
+        model_key = "naive"
+
+    if model_key == "arima":
+        return {"order": list(order)}
+    if model_key == "naive":
+        return {"seasonal_period": 1}
+    if model_key == "seasonal_naive":
+        period = seasonal_period if seasonal_period is not None else DEFAULT_SEASONAL_PERIODS[domain]
+        return {"seasonal_period": period}
+    if model_key == "random_forest":
+        return {
+            "n_estimators": n_estimators,
+            "max_depth": max_depth,
+            "random_state": random_state,
+        }
+    if model_key == "xgboost":
+        depth = max_depth if max_depth is not None else 6
+        return {
+            "n_estimators": n_estimators,
+            "max_depth": depth,
+            "learning_rate": learning_rate,
+            "random_state": random_state,
+        }
+    if model_key == "lstm":
+        effective_lookback = lookback if lookback is not None else DEFAULT_LOOKBACK.get(domain, 7)
+        return {
+            "lookback": effective_lookback,
+            "lstm_units": lstm_units,
+            "dropout": dropout,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": lstm_learning_rate,
+            "random_seed": random_state,
+        }
+    if model_key == "cnn_lstm":
+        effective_lookback = lookback if lookback is not None else DEFAULT_LOOKBACK_CNN_LSTM.get(domain, 7)
+        return {
+            "lookback": effective_lookback,
+            "cnn_filters": cnn_filters,
+            "kernel_size": kernel_size,
+            "lstm_units": lstm_units,
+            "dropout": dropout,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": lstm_learning_rate,
+            "random_seed": random_state,
+        }
+    return {}
 
 
 def main() -> None:

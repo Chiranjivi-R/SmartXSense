@@ -3,7 +3,27 @@ import {
   LineChart, Line, BarChart, Bar, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
 } from 'recharts';
-import { runForecast, compareModels, explainForecast } from '../../services/mlApi';
+import {
+  runForecast,
+  compareModels,
+  explainForecast,
+  runFutureForecast,
+  fetchForecastHistory,
+  FUTURE_HORIZON_PRESETS,
+  FUTURE_SUPPORTED_MODELS,
+  DOMAIN_FEATURE_ARTIFACTS,
+  ensureUploadAuthToken,
+  uploadDataset,
+  getDatasetDetail,
+  validateDataset,
+  preprocessDataset,
+} from '../../services/mlApi';
+import {
+  exportFutureForecastCsv,
+  exportFutureForecastJson,
+  exportTestForecastCsv,
+  exportTestForecastJson,
+} from '../../utils/forecastExport';
 
 const COLORS = {
   primary: '#00D4FF',
@@ -110,6 +130,65 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
   const [explainData, setExplainData] = useState(null);
   const [explainError, setExplainError] = useState(null);
 
+  const [futureModel, setFutureModel] = useState('random_forest');
+  const [futureHorizon, setFutureHorizon] = useState(
+    FUTURE_HORIZON_PRESETS[initialDomain]?.[0] || 7
+  );
+  const [futureLoading, setFutureLoading] = useState(false);
+  const [futureData, setFutureData] = useState(null);
+  const [futureError, setFutureError] = useState(null);
+
+  const [customFeaturesDir, setCustomFeaturesDir] = useState(null);
+  const [uploadFile, setUploadFile] = useState(null);
+  const [uploadDomain, setUploadDomain] = useState(initialDomain);
+  const [uploadLoading, setUploadLoading] = useState(false);
+  const [uploadError, setUploadError] = useState(null);
+  const [uploadInfo, setUploadInfo] = useState(null);
+  const [uploadValidation, setUploadValidation] = useState(null);
+  const [uploadProcess, setUploadProcess] = useState(null);
+
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyRuns, setHistoryRuns] = useState([]);
+  const [historyError, setHistoryError] = useState(null);
+  const [exportStatus, setExportStatus] = useState(null);
+
+  const handleExport = (kind, format) => {
+    setExportStatus(null);
+    try {
+      let filename;
+      if (kind === 'test') {
+        if (!forecastData) throw new Error('Run a forecast before exporting.');
+        filename = format === 'csv'
+          ? exportTestForecastCsv(forecastData)
+          : exportTestForecastJson(forecastData);
+      } else {
+        if (!futureData) throw new Error('Run a future forecast before exporting.');
+        filename = format === 'csv'
+          ? exportFutureForecastCsv(futureData)
+          : exportFutureForecastJson(futureData);
+      }
+      setExportStatus(`Downloaded ${filename}`);
+    } catch (err) {
+      console.error('Export error:', err);
+      setExportStatus(err.message || 'Export failed.');
+    }
+  };
+
+  const loadForecastHistory = async () => {
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const res = await fetchForecastHistory({ limit: 20 });
+      setHistoryRuns(Array.isArray(res?.runs) ? res.runs : []);
+    } catch (err) {
+      console.error('History load error:', err);
+      setHistoryError(err.message || 'Unable to load forecast history.');
+      setHistoryRuns([]);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
   // Sync state if initialDomain prop changes
   useEffect(() => {
     handleDomainSwitch(initialDomain);
@@ -118,6 +197,7 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
   // Initial forecast on mount
   useEffect(() => {
     handleRunForecast('random_forest', initialDomain);
+    loadForecastHistory();
   }, []);
 
   // Clear stale state when domain changes
@@ -130,11 +210,15 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
     setForecastError(null);
     setCompareError(null);
     setExplainError(null);
+    setFutureData(null);
+    setFutureError(null);
+    setFutureModel('random_forest');
+    setFutureHorizon(FUTURE_HORIZON_PRESETS[newDomain]?.[0] || 7);
     handleRunForecast(model, newDomain);
   };
 
   // Primary forecast runner
-  const handleRunForecast = async (targetModel = model, targetDomain = domain) => {
+  const handleRunForecast = async (targetModel = model, targetDomain = domain, featuresDirOverride = undefined) => {
     setForecastLoading(true);
     setForecastError(null);
     setExplainData(null);
@@ -142,13 +226,18 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
 
     let actualModel = targetModel;
     let recModel = null;
+    const activeFeaturesDir =
+      featuresDirOverride !== undefined ? featuresDirOverride : (customFeaturesDir || undefined);
 
     try {
       // Auto Select workflow
       if (targetModel === 'auto_select') {
         setCompareLoading(true);
         try {
-          const compResult = await compareModels({ domain: targetDomain });
+          const compResult = await compareModels({
+            domain: targetDomain,
+            featuresDir: activeFeaturesDir,
+          });
           setCompareData(compResult);
           actualModel = compResult.recommended_model || 'random_forest';
           recModel = actualModel;
@@ -167,14 +256,17 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
       const res = await runForecast({
         domain: targetDomain,
         model: actualModel,
+        featuresDir: activeFeaturesDir,
         predictionLimit: 100,
+        selectionMethod: targetModel === 'auto_select' ? 'validation_rmse' : undefined,
       });
 
       setForecastData(res);
+      loadForecastHistory();
 
       // Trigger SHAP explainability for supported tree models
       if (['random_forest', 'xgboost'].includes(actualModel)) {
-        fetchExplainability(targetDomain, actualModel);
+        fetchExplainability(targetDomain, actualModel, activeFeaturesDir);
       }
     } catch (err) {
       console.error('Forecast error:', err);
@@ -189,7 +281,10 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
     setCompareLoading(true);
     setCompareError(null);
     try {
-      const res = await compareModels({ domain });
+      const res = await compareModels({
+        domain,
+        featuresDir: customFeaturesDir || undefined,
+      });
       setCompareData(res);
     } catch (err) {
       console.error('Comparison error:', err);
@@ -200,13 +295,14 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
   };
 
   // Explainability runner
-  const fetchExplainability = async (expDomain, expModel) => {
+  const fetchExplainability = async (expDomain, expModel, featuresDirOverride = undefined) => {
     setExplainLoading(true);
     setExplainError(null);
     try {
       const res = await explainForecast({
         domain: expDomain,
         model: expModel,
+        featuresDir: featuresDirOverride !== undefined ? featuresDirOverride : (customFeaturesDir || undefined),
         explanationType: 'global',
         method: 'shap',
       });
@@ -216,6 +312,99 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
       setExplainError('Explainability request failed for this model.');
     } finally {
       setExplainLoading(false);
+    }
+  };
+
+  const futureSupportedModels = FUTURE_SUPPORTED_MODELS[domain] || [];
+  const isFutureModelSupported = futureSupportedModels.includes(futureModel);
+
+  const handleRunFutureForecast = async () => {
+    if (!isFutureModelSupported) {
+      setFutureError(`Future forecasting is not currently supported for model ${futureModel}.`);
+      return;
+    }
+    setFutureLoading(true);
+    setFutureError(null);
+    try {
+      const res = await runFutureForecast({
+        domain,
+        model: futureModel,
+        horizon: Number(futureHorizon),
+        featuresDir: customFeaturesDir || undefined,
+      });
+      setFutureData(res);
+      loadForecastHistory();
+    } catch (err) {
+      console.error('Future forecast error:', err);
+      setFutureError(err.message || 'Future forecast request failed. Please verify backend service.');
+    } finally {
+      setFutureLoading(false);
+    }
+  };
+
+  const handleUseDemoDataset = () => {
+    setCustomFeaturesDir(null);
+    setUploadInfo(null);
+    setUploadValidation(null);
+    setUploadProcess(null);
+    setUploadError(null);
+    setUploadFile(null);
+    handleRunForecast(model, domain, DOMAIN_FEATURE_ARTIFACTS[domain]);
+  };
+
+  const handleUploadAndPrepare = async () => {
+    if (!uploadFile) {
+      setUploadError('Please select a CSV or Excel file to upload.');
+      return;
+    }
+    setUploadLoading(true);
+    setUploadError(null);
+    setUploadInfo(null);
+    setUploadValidation(null);
+    setUploadProcess(null);
+    try {
+      const token = await ensureUploadAuthToken();
+      const uploaded = await uploadDataset({
+        file: uploadFile,
+        domain: uploadDomain,
+        accessToken: token,
+      });
+      const detail = await getDatasetDetail({
+        datasetId: uploaded.dataset_id,
+        accessToken: token,
+        previewRows: 5,
+      });
+      setUploadInfo({ ...uploaded, columns: detail.columns, preview: detail.preview });
+
+      const validation = await validateDataset({
+        datasetId: uploaded.dataset_id,
+        domain: uploadDomain,
+        accessToken: token,
+      });
+      setUploadValidation(validation);
+
+      const processed = await preprocessDataset({
+        datasetId: uploaded.dataset_id,
+        accessToken: token,
+      });
+      setUploadProcess(processed);
+
+      if (!processed.features_ready || !processed.features_dir) {
+        throw new Error(
+          processed.features_error
+            || 'Upload cleaned successfully, but forecasting feature splits could not be generated. Use a longer time series.',
+        );
+      }
+
+      setCustomFeaturesDir(processed.features_dir);
+      setDomain(uploadDomain);
+      setFutureHorizon(FUTURE_HORIZON_PRESETS[uploadDomain]?.[0] || 7);
+      await handleRunForecast(model, uploadDomain, processed.features_dir);
+    } catch (err) {
+      console.error('Upload pipeline error:', err);
+      setUploadError(err.message || 'Dataset upload/processing failed.');
+    } finally {
+      setUploadLoading(false);
     }
   };
 
@@ -232,6 +421,12 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
       absError: absErr,
     };
   }) || [];
+
+  const futureChartData = futureData?.predictions?.map((item) => ({
+    rawTimestamp: item.timestamp,
+    timestamp: formatTimestamp(item.timestamp),
+    predicted: item.predicted !== undefined && item.predicted !== null ? Number(item.predicted) : null,
+  })) || [];
 
   const activeModelDisplay = autoSelectedModel
     ? `${autoSelectedModel.replace('_', ' ')} (Auto Selected)`
@@ -373,14 +568,112 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
 
           {/* Active Status Display */}
           <div style={{ background: COLORS.bg.dark, borderRadius: 10, padding: '12px 16px', border: `1px solid ${COLORS.bg.border}`, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-            <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Demo Dataset Status</div>
+            <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dataset Status</div>
             <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary, marginTop: 4, fontFamily: "'Space Mono', monospace" }}>
-              Demo Dataset: {domain.toUpperCase()}
+              {customFeaturesDir ? 'Uploaded Dataset' : `Demo Dataset: ${domain.toUpperCase()}`}
             </div>
             <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2 }}>
               Active Model: <span style={{ color: COLORS.primary, fontWeight: 700, textTransform: 'capitalize' }}>{activeModelDisplay}</span>
             </div>
           </div>
+        </div>
+
+        {/* Dataset Upload (optional — demo datasets remain default) */}
+        <div style={{ marginTop: 4, background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 12, padding: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary }}>Dataset Upload</div>
+              <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2 }}>
+                Optional CSV/Excel upload using the existing preprocessing + feature-engineering pipeline. Demo datasets stay available.
+              </div>
+            </div>
+            <button
+              onClick={handleUseDemoDataset}
+              style={{
+                background: 'transparent',
+                border: `1px solid ${COLORS.bg.border}`,
+                color: COLORS.text.secondary,
+                borderRadius: 8,
+                padding: '8px 12px',
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: 'pointer',
+              }}
+            >
+              Use Demo Dataset
+            </button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 6 }}>FILE</label>
+              <input
+                type="file"
+                accept=".csv,.xlsx"
+                onChange={(e) => {
+                  setUploadFile(e.target.files?.[0] || null);
+                  setUploadError(null);
+                }}
+                style={{ width: '100%', color: COLORS.text.secondary, fontSize: 12 }}
+              />
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 6 }}>DOMAIN</label>
+              <select
+                value={uploadDomain}
+                onChange={(e) => setUploadDomain(e.target.value)}
+                style={{
+                  width: '100%',
+                  background: COLORS.bg.card,
+                  border: `1px solid ${COLORS.bg.border}`,
+                  borderRadius: 8,
+                  padding: '8px 10px',
+                  color: COLORS.text.primary,
+                  fontSize: 13,
+                }}
+              >
+                <option value="retail">Retail</option>
+                <option value="electricity">Electricity</option>
+              </select>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+              <button
+                onClick={handleUploadAndPrepare}
+                disabled={uploadLoading}
+                style={{
+                  width: '100%',
+                  background: uploadLoading ? COLORS.bg.border : `linear-gradient(135deg, ${COLORS.success}, ${COLORS.primary})`,
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: 8,
+                  padding: '10px 14px',
+                  fontWeight: 700,
+                  cursor: uploadLoading ? 'not-allowed' : 'pointer',
+                }}
+              >
+                {uploadLoading ? 'Uploading & Preparing...' : 'Upload → Validate → Prepare'}
+              </button>
+            </div>
+          </div>
+          {uploadFile && (
+            <div style={{ marginTop: 10, fontSize: 12, color: COLORS.text.secondary }}>
+              Selected: <strong style={{ color: COLORS.text.primary }}>{uploadFile.name}</strong>
+              {' · '}{(uploadFile.size / 1024).toFixed(1)} KB
+            </div>
+          )}
+          {uploadError && (
+            <div style={{ marginTop: 10, color: COLORS.accent, fontSize: 13 }}>⚠️ {uploadError}</div>
+          )}
+          {uploadInfo && (
+            <div style={{ marginTop: 10, fontSize: 12, color: COLORS.text.secondary, lineHeight: 1.6 }}>
+              Uploaded <strong style={{ color: COLORS.text.primary }}>{uploadInfo.filename}</strong>
+              {' · '}rows {uploadInfo.row_count}
+              {' · '}cols {uploadInfo.column_count}
+              {uploadInfo.columns?.length ? ` · columns: ${uploadInfo.columns.slice(0, 8).join(', ')}${uploadInfo.columns.length > 8 ? '…' : ''}` : ''}
+              {uploadValidation ? ` · validation: ${uploadValidation.is_valid ? 'passed' : 'failed'}` : ''}
+              {uploadProcess ? ` · features_ready: ${uploadProcess.features_ready ? 'yes' : 'no'}` : ''}
+              {customFeaturesDir ? ` · active features_dir set` : ''}
+            </div>
+          )}
         </div>
 
         {/* ─── Auto Select Explanation Banner ─── */}
@@ -417,14 +710,52 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
               Target Variable: <span style={{ color: COLORS.primary, fontWeight: 700 }}>{forecastData.target}</span> • Dataset: <span style={{ color: COLORS.text.primary }}>Demo Dataset ({domain})</span>
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
             <span style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, color: COLORS.primary, padding: '4px 12px', borderRadius: 8, fontSize: 12, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
               Model: {forecastData.model?.replace('_', ' ').toUpperCase()}
             </span>
             <span style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, color: COLORS.success, padding: '4px 12px', borderRadius: 8, fontSize: 12, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
               {forecastData.prediction_count || chartData.length} Forecast Points
             </span>
+            <button
+              type="button"
+              onClick={() => handleExport('test', 'csv')}
+              style={{
+                background: COLORS.bg.dark,
+                border: `1px solid ${COLORS.bg.border}`,
+                color: COLORS.text.primary,
+                borderRadius: 8,
+                padding: '6px 12px',
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: 'pointer',
+              }}
+            >
+              Export CSV
+            </button>
+            <button
+              type="button"
+              onClick={() => handleExport('test', 'json')}
+              style={{
+                background: COLORS.bg.dark,
+                border: `1px solid ${COLORS.bg.border}`,
+                color: COLORS.primary,
+                borderRadius: 8,
+                padding: '6px 12px',
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: 'pointer',
+              }}
+            >
+              Export JSON
+            </button>
           </div>
+        </div>
+      )}
+
+      {exportStatus && (
+        <div style={{ fontSize: 12, color: COLORS.text.secondary, padding: '0 4px' }}>
+          {exportStatus}
         </div>
       )}
 
@@ -608,6 +939,283 @@ export default function ForecastDashboard({ initialDomain = 'retail' }) {
           <div style={{ height: 260, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: COLORS.text.muted }}>
             <div style={{ fontSize: 28, marginBottom: 8 }}>📊</div>
             <div>Select a domain and forecasting model, then run a forecast to view model performance and predictions.</div>
+          </div>
+        )}
+      </div>
+
+      {/* ─── 5b. Future Forecast (no actual values) ─── */}
+      <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 16, padding: 24 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap', gap: 12 }}>
+          <div>
+            <h3 style={{ fontSize: 16, fontWeight: 700, color: COLORS.text.primary, margin: 0 }}>
+              Future Forecast
+            </h3>
+            <p style={{ fontSize: 12, color: COLORS.text.secondary, margin: '4px 0 0', maxWidth: 720 }}>
+              Out-of-sample demand forecast beyond the last historical timestamp. Actual values are not available.
+            </p>
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <span style={{ background: `${COLORS.warning}18`, color: COLORS.warning, border: `1px solid ${COLORS.warning}44`, borderRadius: 8, padding: '4px 10px', fontSize: 11, fontWeight: 700 }}>
+              Future Forecast — Actual values are not available
+            </span>
+            <button
+              type="button"
+              onClick={() => handleExport('future', 'csv')}
+              disabled={!futureData}
+              style={{
+                background: COLORS.bg.dark,
+                border: `1px solid ${COLORS.bg.border}`,
+                color: futureData ? COLORS.text.primary : COLORS.text.muted,
+                borderRadius: 8,
+                padding: '6px 12px',
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: futureData ? 'pointer' : 'not-allowed',
+              }}
+            >
+              Export CSV
+            </button>
+            <button
+              type="button"
+              onClick={() => handleExport('future', 'json')}
+              disabled={!futureData}
+              style={{
+                background: COLORS.bg.dark,
+                border: `1px solid ${COLORS.bg.border}`,
+                color: futureData ? COLORS.primary : COLORS.text.muted,
+                borderRadius: 8,
+                padding: '6px 12px',
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: futureData ? 'pointer' : 'not-allowed',
+              }}
+            >
+              Export JSON
+            </button>
+          </div>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12, marginBottom: 16 }}>
+          <div>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 6, textTransform: 'uppercase' }}>
+              Future Model
+            </label>
+            <select
+              value={futureModel}
+              onChange={(e) => {
+                setFutureModel(e.target.value);
+                setFutureError(null);
+              }}
+              style={{
+                width: '100%',
+                background: COLORS.bg.dark,
+                border: `1px solid ${COLORS.bg.border}`,
+                borderRadius: 10,
+                padding: '10px 12px',
+                color: COLORS.text.primary,
+                fontSize: 13,
+                fontWeight: 600,
+                outline: 'none',
+              }}
+            >
+              <option value="random_forest">Random Forest</option>
+              <option value="xgboost">XGBoost</option>
+              {domain === 'electricity' && <option value="arima">ARIMA</option>}
+              <option value="hybrid">Hybrid (unsupported)</option>
+              <option value="lstm">LSTM (unsupported)</option>
+            </select>
+          </div>
+          <div>
+            <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 6, textTransform: 'uppercase' }}>
+              Horizon
+            </label>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {(FUTURE_HORIZON_PRESETS[domain] || [7]).map((h) => (
+                <button
+                  key={h}
+                  onClick={() => setFutureHorizon(h)}
+                  style={{
+                    padding: '8px 14px',
+                    borderRadius: 8,
+                    border: `1px solid ${futureHorizon === h ? COLORS.primary : COLORS.bg.border}`,
+                    background: futureHorizon === h ? `${COLORS.primary}22` : COLORS.bg.dark,
+                    color: futureHorizon === h ? COLORS.primary : COLORS.text.secondary,
+                    cursor: 'pointer',
+                    fontWeight: 700,
+                    fontSize: 13,
+                  }}
+                >
+                  {h}{domain === 'electricity' ? 'h' : 'd'}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+            <button
+              onClick={handleRunFutureForecast}
+              disabled={futureLoading || !isFutureModelSupported}
+              style={{
+                width: '100%',
+                background: futureLoading || !isFutureModelSupported
+                  ? COLORS.bg.border
+                  : `linear-gradient(135deg, ${COLORS.warning}, ${COLORS.accent})`,
+                color: '#fff',
+                border: 'none',
+                borderRadius: 10,
+                padding: '12px 18px',
+                fontSize: 14,
+                fontWeight: 700,
+                cursor: futureLoading || !isFutureModelSupported ? 'not-allowed' : 'pointer',
+              }}
+            >
+              {futureLoading ? 'Generating Future Forecast...' : 'Run Future Forecast'}
+            </button>
+          </div>
+        </div>
+
+        {!isFutureModelSupported && (
+          <div style={{ background: `${COLORS.accent}15`, border: `1px solid ${COLORS.accent}44`, borderRadius: 10, padding: '10px 14px', color: COLORS.accent, fontSize: 13, marginBottom: 12 }}>
+            Future forecasting is not currently supported for model {futureModel}. Choose Random Forest or XGBoost{domain === 'electricity' ? ' (or ARIMA)' : ''}.
+          </div>
+        )}
+
+        {futureError && (
+          <div style={{ background: `${COLORS.accent}18`, border: `1px solid ${COLORS.accent}44`, borderRadius: 10, padding: '12px 14px', color: COLORS.accent, fontSize: 13, marginBottom: 12 }}>
+            ⚠️ {futureError}
+          </div>
+        )}
+
+        {futureData && (
+          <div style={{ fontSize: 12, color: COLORS.text.secondary, marginBottom: 12 }}>
+            Horizon: <strong style={{ color: COLORS.text.primary }}>{futureData.horizon}</strong>
+            {' · '}Last historical: <strong style={{ color: COLORS.text.primary }}>{formatTimestamp(futureData.last_historical_timestamp)}</strong>
+            {' · '}Policy: <strong style={{ color: COLORS.text.primary }}>{futureData.exogenous_policy}</strong>
+            {futureData.artifact?.source && (
+              <>
+                {' · '}Artifact: <strong style={{ color: COLORS.primary }}>{futureData.artifact.source}</strong>
+              </>
+            )}
+          </div>
+        )}
+
+        {futureLoading ? (
+          <div style={{ height: 260, display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.text.secondary }}>
+            Generating recursive future predictions...
+          </div>
+        ) : futureChartData.length > 0 ? (
+          <ResponsiveContainer width="100%" height={300}>
+            <LineChart data={futureChartData} margin={{ top: 10, right: 20, left: 10, bottom: 20 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={COLORS.bg.border} opacity={0.6} />
+              <XAxis dataKey="timestamp" tick={{ fill: COLORS.text.muted, fontSize: 11 }} interval="preserveStartEnd" minTickGap={20} />
+              <YAxis tick={{ fill: COLORS.text.muted, fontSize: 11 }} domain={['auto', 'auto']} />
+              <Tooltip contentStyle={customTooltipStyle} formatter={(val) => [formatNumber(val), 'Predicted']} />
+              <Legend wrapperStyle={{ fontSize: 13, color: COLORS.text.secondary, paddingTop: 10 }} />
+              <Line
+                type="monotone"
+                dataKey="predicted"
+                name="Future Predicted"
+                stroke={COLORS.warning}
+                strokeWidth={2.5}
+                dot={{ r: 3 }}
+                activeDot={{ r: 5 }}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        ) : (
+          <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.text.muted, fontSize: 13 }}>
+            Select a supported model and horizon, then run a future forecast.
+          </div>
+        )}
+      </div>
+
+      {/* ─── 5c. Forecast History ─── */}
+      <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 16, padding: 24 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
+          <div>
+            <h3 style={{ fontSize: 16, fontWeight: 700, color: COLORS.text.primary, margin: 0 }}>
+              Forecast History
+            </h3>
+            <p style={{ fontSize: 12, color: COLORS.text.secondary, margin: '4px 0 0' }}>
+              Recent successful forecast runs (metadata only — prediction arrays are not stored).
+            </p>
+          </div>
+          <button
+            onClick={loadForecastHistory}
+            disabled={historyLoading}
+            style={{
+              background: COLORS.bg.dark,
+              border: `1px solid ${COLORS.bg.border}`,
+              color: COLORS.primary,
+              borderRadius: 10,
+              padding: '8px 14px',
+              fontSize: 13,
+              fontWeight: 700,
+              cursor: historyLoading ? 'not-allowed' : 'pointer',
+            }}
+          >
+            {historyLoading ? 'Refreshing...' : 'Refresh History'}
+          </button>
+        </div>
+
+        {historyError && (
+          <div style={{ background: `${COLORS.accent}18`, border: `1px solid ${COLORS.accent}44`, borderRadius: 10, padding: '12px 14px', color: COLORS.accent, fontSize: 13, marginBottom: 12 }}>
+            {historyError}
+          </div>
+        )}
+
+        {!historyError && !historyLoading && historyRuns.length === 0 && (
+          <div style={{ padding: '18px 0', color: COLORS.text.muted, fontSize: 13 }}>
+            No forecast runs yet.
+          </div>
+        )}
+
+        {historyRuns.length > 0 && (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr style={{ color: COLORS.text.secondary, textAlign: 'left' }}>
+                  <th style={{ padding: '8px 10px', borderBottom: `1px solid ${COLORS.bg.border}`, fontWeight: 700 }}>Time</th>
+                  <th style={{ padding: '8px 10px', borderBottom: `1px solid ${COLORS.bg.border}`, fontWeight: 700 }}>Domain</th>
+                  <th style={{ padding: '8px 10px', borderBottom: `1px solid ${COLORS.bg.border}`, fontWeight: 700 }}>Model</th>
+                  <th style={{ padding: '8px 10px', borderBottom: `1px solid ${COLORS.bg.border}`, fontWeight: 700 }}>Type</th>
+                  <th style={{ padding: '8px 10px', borderBottom: `1px solid ${COLORS.bg.border}`, fontWeight: 700 }}>Metrics</th>
+                </tr>
+              </thead>
+              <tbody>
+                {historyRuns.map((run) => {
+                  const ts = run.timestamp ? new Date(run.timestamp) : null;
+                  const timeLabel = ts && !Number.isNaN(ts.getTime())
+                    ? ts.toLocaleString(undefined, {
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })
+                    : '—';
+                  const typeLabel = run.forecast_type === 'future'
+                    ? 'Future Forecast'
+                    : 'Test Evaluation';
+                  const modelLabel = String(run.model || '').replace(/_/g, ' ');
+                  let metricsLabel = `${run.prediction_count || 0} points`;
+                  if (run.forecast_type === 'future' && run.horizon != null) {
+                    metricsLabel = `Horizon ${run.horizon} · ${run.prediction_count || 0} points`;
+                  } else if (run.metrics) {
+                    const rmse = run.metrics.rmse != null ? `RMSE ${formatNumber(run.metrics.rmse)}` : null;
+                    const mape = run.metrics.mape != null ? `MAPE ${formatMape(run.metrics.mape)}` : null;
+                    metricsLabel = [rmse, mape].filter(Boolean).join(' · ') || metricsLabel;
+                  }
+                  return (
+                    <tr key={run.run_id} style={{ color: COLORS.text.primary }}>
+                      <td style={{ padding: '10px', borderBottom: `1px solid ${COLORS.bg.border}`, whiteSpace: 'nowrap' }}>{timeLabel}</td>
+                      <td style={{ padding: '10px', borderBottom: `1px solid ${COLORS.bg.border}`, textTransform: 'capitalize' }}>{run.domain}</td>
+                      <td style={{ padding: '10px', borderBottom: `1px solid ${COLORS.bg.border}`, textTransform: 'capitalize' }}>{modelLabel}</td>
+                      <td style={{ padding: '10px', borderBottom: `1px solid ${COLORS.bg.border}` }}>{typeLabel}</td>
+                      <td style={{ padding: '10px', borderBottom: `1px solid ${COLORS.bg.border}`, color: COLORS.text.secondary }}>{metricsLabel}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </div>

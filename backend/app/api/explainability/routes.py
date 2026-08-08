@@ -27,4 +27,4 @@ def explain_route():
     except MLError as err:
         return _error_response(err)
     except Exception as err:
-        return jsonify({"status": "error", "code": 500, "message": f"Internal server error: {err}"}), 500
+        return jsonify({"status": "error", "code": 500, "message": "Internal server error"}), 500

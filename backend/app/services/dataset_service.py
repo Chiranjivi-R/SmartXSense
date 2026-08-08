@@ -19,6 +19,7 @@ from ml_engine.preprocessing.schema import DOMAIN_TARGETS, normalise_domain_sche
 
 from ..extensions import db
 from ..models import Dataset, DatasetPreprocessing, DatasetValidation
+from .client_error_sanitize import sanitize_client_error_message
 
 
 ALLOWED_EXTENSIONS = {"csv", "xlsx"}
@@ -29,14 +30,27 @@ ALLOWED_MIMETYPES = {
 ALLOWED_DOMAINS = {"retail", "electricity"}
 
 
+def _sanitize_error_map(errors: dict | None) -> dict | None:
+    if not errors:
+        return None
+    cleaned: dict = {}
+    for key, values in errors.items():
+        if isinstance(values, list):
+            cleaned[key] = [sanitize_client_error_message(str(v)) for v in values]
+        else:
+            cleaned[key] = sanitize_client_error_message(str(values))
+    return cleaned
+
+
 class DatasetError(Exception):
     """Expected API-facing dataset failure."""
 
     def __init__(self, message: str, code: int = 400, errors: dict | None = None):
-        super().__init__(message)
-        self.message = message
+        safe = sanitize_client_error_message(message)
+        super().__init__(safe)
+        self.message = safe
         self.code = code
-        self.errors = errors
+        self.errors = _sanitize_error_map(errors)
 
 
 def error_payload(error: DatasetError) -> dict:
@@ -189,6 +203,10 @@ def dataset_detail(dataset: Dataset, preview_rows: int) -> dict:
         "dataset_id": dataset.dataset_id,
         "filename": dataset.filename,
         "domain": dataset.domain,
+        "file_size_bytes": dataset.file_size_bytes,
+        "row_count": dataset.row_count,
+        "column_count": dataset.column_count,
+        "status": dataset.status,
         "columns": [str(column) for column in frame.columns],
         "preview": _safe_table_records(frame),
     }
@@ -198,11 +216,19 @@ def delete_dataset(dataset: Dataset) -> None:
     """Remove a dataset's owned metadata and managed raw file without arbitrary deletion."""
     raw_path = Path(dataset.file_path)
     processed_paths: list[Path] = []
+    feature_dirs: list[Path] = []
     try:
         # These dependent records have no ORM delete cascade in the existing schema.
         preprocessing = list(db.session.scalars(db.select(DatasetPreprocessing).where(DatasetPreprocessing.dataset_id == dataset.dataset_id)))
         for record in preprocessing:
             processed_paths.append(Path(record.processed_file_path))
+            if record.lags_generated_json:
+                try:
+                    lineage = json.loads(record.lags_generated_json)
+                except json.JSONDecodeError:
+                    lineage = None
+                if isinstance(lineage, dict) and lineage.get("features_dir"):
+                    feature_dirs.append(Path(str(lineage["features_dir"])))
             db.session.delete(record)
         for validation in db.session.scalars(db.select(DatasetValidation).where(DatasetValidation.dataset_id == dataset.dataset_id)):
             db.session.delete(validation)
@@ -224,6 +250,23 @@ def delete_dataset(dataset: Dataset) -> None:
                 processed_path.unlink(missing_ok=True)
             except OSError as exc:
                 raise DatasetError("Dataset metadata was deleted but a processed file could not be removed", 500) from exc
+
+    # Best-effort cleanup of managed forecasting feature splits (no migrations).
+    import shutil
+
+    project_root = Path(__file__).resolve().parents[3]
+    features_root = Path(current_app.config.get(
+        "FEATURES_DATA_FOLDER",
+        str(project_root / "ml_engine" / "data" / "features"),
+    )).resolve()
+    for features_dir in feature_dirs:
+        path = features_dir if features_dir.is_absolute() else (project_root / features_dir).resolve()
+        try:
+            path.relative_to(features_root)
+        except ValueError:
+            continue
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def _schema_issues(frame: pd.DataFrame, domain: str, strict_mode: bool) -> list[dict]:

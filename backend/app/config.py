@@ -13,6 +13,9 @@ load_dotenv()
 class Config:
     """Base configuration for the SmartXSense backend."""
 
+    # Do not enable the interactive debugger by default (run.py also disables use_debugger).
+    DEBUG = False
+    TESTING = False
     SECRET_KEY = os.getenv("SECRET_KEY")
     SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL", "sqlite:///smartxsense.db")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
@@ -22,4 +25,9 @@ class Config:
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
     UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", str(Path(__file__).resolve().parents[2] / "storage" / "uploads"))
     PROCESSED_DATA_FOLDER = os.getenv("PROCESSED_DATA_FOLDER", str(Path(__file__).resolve().parents[2] / "ml_engine" / "data" / "processed"))
+    FEATURES_DATA_FOLDER = os.getenv("FEATURES_DATA_FOLDER", str(Path(__file__).resolve().parents[2] / "ml_engine" / "data" / "features"))
+    FORECAST_HISTORY_ROOT = os.getenv(
+        "FORECAST_HISTORY_ROOT",
+        str(Path(__file__).resolve().parents[2] / "ml_engine" / "artifacts" / "history"),
+    )
     MAX_CONTENT_LENGTH = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))

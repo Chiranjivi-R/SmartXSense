@@ -33,9 +33,27 @@ storage/uploads/
 reports/generated_pdf/
 reports/generated_csv/
 
-# ML Artifacts
+# ML Artifacts (generated model binaries stay local; directory structure retained on disk)
 ml_engine/artifacts/
+*.pt
+*.joblib
 ml_engine/data/features/
+
+# Local smoke / temp test outputs / caches
+.test-tmp/
+.test-run/
+pytest-cache-files-*/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+frontend/.vite/
+*.tmp
+*.temp
+exports/
+# Client exports are browser downloads; ignore any accidental local dump dirs
+tmp/
+temp/
 
 # IDE
 .vscode/

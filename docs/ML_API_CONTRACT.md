@@ -207,3 +207,69 @@ Returned for path traversal, invalid parameters, missing files, or unsupported m
 5. Render summary metric cards using `validation_metrics` and `test_metrics`.
 6. Plot the Actual vs Predicted time-series graph using `data.predictions` (`timestamp`, `actual`, `predicted`).
 7. For tree models (`random_forest`, `xgboost`), call `POST /api/v1/explainability/explain` to populate the feature importance / XAI panel.
+8. Optionally call `POST /api/v1/forecasting/future` for out-of-sample horizons (no actuals).
+9. List prior runs via `GET /api/v1/forecasting/history`.
+10. Export series client-side (CSV/JSON); do not rely on server filesystem paths.
+
+---
+
+## 4. Future Forecast Endpoint
+
+Out-of-sample horizon forecasts. Responses never include future actuals.
+
+- **HTTP Method**: `POST`
+- **URL**: `/api/v1/forecasting/future`
+- **Content-Type**: `application/json`
+
+### Request
+
+```json
+{
+  "domain": "retail",
+  "features_dir": "ml_engine/data/features/retail/features_1c0c92ff-264e-4398-b83c-e0e082b956b4",
+  "model": "random_forest",
+  "horizon": 7
+}
+```
+
+### Response shape (`data`)
+
+- `predictions`: `[{ "timestamp": "...", "predicted": <number> }, ...]` (no `actual`)
+- Supported models: RF, XGBoost; ARIMA for electricity. LSTM/CNN-LSTM/Hybrid: unsupported.
+
+---
+
+## 5. Forecast History
+
+File-based metadata store (no prediction arrays).
+
+| Method | URL | Notes |
+|---|---|---|
+| `GET` | `/api/v1/forecasting/history` | Query: `domain`, `limit` |
+| `GET` | `/api/v1/forecasting/history/<run_id>` | Single run metadata |
+| `DELETE` | `/api/v1/forecasting/history/<run_id>` | Remove one entry |
+
+---
+
+## 6. Health
+
+- **URL**: `GET /api/v1/health`
+- Reports `ml_engine`, optional `database` (`SELECT 1`), and `overall` (`healthy` / `degraded`).
+- Forecasting remains usable when DB is down (`degraded` if DB unavailable).
+
+---
+
+## 7. Dashboard / Models / Reports / Settings
+
+| Method | URL | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/dashboard` | Counts from history + capability facts |
+| `GET` | `/api/v1/dashboard/models` | Capability matrix catalog (no fake MAPE) |
+| `GET` | `/api/v1/reports` | Report list from history metadata |
+| `GET` | `/api/v1/reports/<run_id>` | Single report-style history entry |
+| `GET` | `/api/v1/settings` | Read-only runtime / path facts |
+
+Success envelope: `{ "status": "success", "code": 200, "data": {...} }`
+Error envelope: `{ "status": "error", "code": <int>, "message": "..." }`
+
+Internal 500 responses use a generic message (no exception text leakage).

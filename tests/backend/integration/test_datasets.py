@@ -28,6 +28,7 @@ def client(tmp_path):
         CORS_ORIGINS = ["http://localhost:5173"]
         UPLOAD_FOLDER = str(tmp_path / "uploads")
         PROCESSED_DATA_FOLDER = str(tmp_path / "processed")
+        FEATURES_DATA_FOLDER = str(tmp_path / "features")
         MAX_CONTENT_LENGTH = 1024 * 1024
 
     app = create_app(TestConfig)
@@ -249,3 +250,112 @@ def test_preprocess_invalid_domain_schema(client, domain, contents, filename):
     response = test_client.post(f"/api/v1/datasets/{dataset_id}/preprocess", headers=headers, json={"generate_lags": False})
     assert response.status_code == 400
     assert response.get_json()["status"] == "error"
+
+
+def _retail_series_csv(n_days: int = 60) -> bytes:
+    lines = ["timestamp,sales,price,city"]
+    for i in range(n_days):
+        day = 1 + (i % 28)
+        month = 1 + (i // 28)
+        lines.append(f"2024-{month:02d}-{day:02d},{50 + i % 17},100,Delhi")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def test_upload_rejects_empty_file(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "empty-file@example.com")
+    response = upload(test_client, headers, b"", "empty.csv", "retail")
+    assert response.status_code == 400
+
+
+def test_upload_rejects_malformed_csv(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "malformed@example.com")
+    # Unreadable as tabular CSV with no columns
+    response = upload(test_client, headers, b"\n\n\n", "bad.csv", "retail")
+    assert response.status_code == 400
+
+
+def test_upload_excel_when_supported(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "excel-upload@example.com")
+    frame = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=40, freq="D"),
+            "sales": list(range(40)),
+            "price": [10] * 40,
+        }
+    )
+    buffer = BytesIO()
+    frame.to_excel(buffer, index=False)
+    contents = buffer.getvalue()
+    response = upload(
+        test_client,
+        headers,
+        contents,
+        "retail.xlsx",
+        "retail",
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    assert response.status_code == 201
+    assert response.get_json()["data"]["row_count"] == 40
+
+
+def test_upload_oversized_file_rejected(client):
+    test_client, app = client
+    headers = auth_header(test_client, "oversized@example.com")
+    # Exceed TestConfig MAX_CONTENT_LENGTH (1 MiB)
+    big = b"timestamp,sales\n" + b"2024-01-01,1\n" * 200000
+    assert len(big) > app.config["MAX_CONTENT_LENGTH"]
+    response = upload(test_client, headers, big, "huge.csv", "retail")
+    assert response.status_code in {413, 400}
+
+
+def test_preprocess_generates_forecast_feature_splits(client):
+    test_client, app = client
+    headers = auth_header(test_client, "features-ready@example.com")
+    dataset_id = upload(test_client, headers, _retail_series_csv(60), "retail-series.csv", "retail").get_json()["data"]["dataset_id"]
+    validate = test_client.post(
+        f"/api/v1/datasets/{dataset_id}/validate",
+        headers=headers,
+        json={"schema_type": "retail_v1", "strict_mode": True},
+    )
+    assert validate.status_code == 200
+    response = test_client.post(
+        f"/api/v1/datasets/{dataset_id}/preprocess",
+        headers=headers,
+        json={"generate_lags": False, "generate_forecast_features": True},
+    )
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body["data"]["features_ready"] is True
+    assert body["data"]["features_dir"]
+    assert body["data"]["train_rows"] > 0
+    assert body["data"]["validation_rows"] > 0
+    assert body["data"]["test_rows"] > 0
+    features_dir = Path(app.config["FEATURES_DATA_FOLDER"]) / "retail" / Path(body["data"]["features_dir"]).name
+    # relative path may include full relative chain — resolve via returned path under configured root
+    candidate = Path(app.config["FEATURES_DATA_FOLDER"]) / "retail"
+    matches = list(candidate.glob("features_*"))
+    assert matches
+    feature_path = matches[-1]
+    assert (feature_path / "train.parquet").exists()
+    assert (feature_path / "validation.parquet").exists()
+    assert (feature_path / "test.parquet").exists()
+    assert (feature_path / "metadata.json").exists()
+
+
+def test_preprocess_small_dataset_reports_features_not_ready(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "too-small@example.com")
+    dataset_id = upload(test_client, headers, RETAIL_PREPROCESS_CSV, "retail.csv", "retail").get_json()["data"]["dataset_id"]
+    response = test_client.post(
+        f"/api/v1/datasets/{dataset_id}/preprocess",
+        headers=headers,
+        json={"generate_lags": False, "generate_forecast_features": True},
+    )
+    body = response.get_json()
+    assert response.status_code == 200
+    assert body["data"]["features_ready"] is False
+    assert "features_error" in body["data"]
+    assert body["data"]["processed_rows"] == 2

@@ -5,6 +5,7 @@ Strict Security & Integration Rules:
 2. Model comparison strictly relies on VALIDATION performance.
 3. Lightweight candidates are used for quick comparison (deep learning models excluded by default).
 4. Direct Python service calls (no subprocess CLI calls).
+5. Model artifacts are loaded only from the controlled SmartXSense artifacts directory.
 """
 
 from __future__ import annotations
@@ -16,17 +17,47 @@ import pandas as pd
 
 from ml_engine.evaluation import AdaptiveModelSelector, compare_models
 from ml_engine.explainability import ForecastExplainer, SUPPORTED_EXPLAINABLE_MODELS
+from ml_engine.models.artifact_store import (
+    default_artifacts_root,
+    derive_features_id,
+    is_persistence_supported,
+    try_load_compatible_artifact,
+)
+from ml_engine.models.capability_matrix import DEFAULT_COMPARE_MODELS as DEFAULT_COMPARISON_MODELS
+from ml_engine.models.future_forecasting import (
+    FutureForecastError,
+    future_support_error,
+    generate_future_forecast,
+    is_future_forecast_supported,
+    validate_horizon,
+)
 from ml_engine.models.random_forest import RandomForestForecaster
-from ml_engine.models.trainer import DOMAIN_TARGET_MAP, TrainerError, run_training_pipeline
+from ml_engine.models.trainer import (
+    DOMAIN_TARGET_MAP,
+    TrainerError,
+    evaluate_fitted_model_on_splits,
+    expected_configuration_for_request,
+    run_training_pipeline,
+)
 from ml_engine.models.xgboost_model import XGBoostForecaster
+from ml_engine.history.forecast_history import (
+    ForecastHistoryError,
+    delete_forecast_run,
+    get_forecast_run,
+    list_forecast_history,
+    safe_record_from_forecast_result,
+)
+
+from .client_error_sanitize import sanitize_client_error_message
 
 
 class MLError(ValueError):
     """Raised when an ML backend service operation fails."""
 
     def __init__(self, message: str, code: int = 400) -> None:
-        super().__init__(message)
-        self.message = message
+        safe = sanitize_client_error_message(message)
+        super().__init__(safe)
+        self.message = safe
         self.code = code
 
 
@@ -40,10 +71,76 @@ ALLOWED_ROOT_PATHS = (
     Path("/tmp"),
 )
 
-DEFAULT_COMPARISON_MODELS = {
-    "electricity": ["arima", "random_forest", "xgboost", "hybrid"],
-    "retail": ["random_forest", "xgboost", "hybrid"],
-}
+KNOWN_FORECAST_MODELS = frozenset({
+    "naive",
+    "seasonal_naive",
+    "baseline",
+    "arima",
+    "random_forest",
+    "xgboost",
+    "lstm",
+    "cnn_lstm",
+    "hybrid",
+})
+
+ALLOWED_SELECTION_METRICS = frozenset({"rmse", "mae", "mape"})
+MAX_COMPARE_MODELS = 6
+
+
+def _artifact_response(*, used: bool, source: str, key: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"used": used, "source": source}
+    if key:
+        payload["key"] = key
+    return payload
+
+
+def _attach_history(
+    result: dict[str, Any],
+    *,
+    forecast_type: str,
+    features_dir: Path,
+    selection_method: str | None = None,
+) -> dict[str, Any]:
+    """Record successful forecast metadata without storing prediction arrays."""
+    features_id = None
+    try:
+        features_id = derive_features_id(features_dir)
+    except Exception:
+        features_id = Path(features_dir).name if features_dir else None
+    summary = safe_record_from_forecast_result(
+        result=result,
+        forecast_type=forecast_type,
+        features_id=features_id,
+        selection_method=selection_method,
+    )
+    if summary is not None:
+        result["history"] = {
+            "recorded": True,
+            "run_id": summary.get("run_id"),
+        }
+    else:
+        result["history"] = {"recorded": False}
+    return result
+
+
+def _resolve_artifacts_root() -> Path:
+    """Resolve controlled artifacts root; never trusts request-supplied paths."""
+    try:
+        from flask import current_app, has_app_context
+
+        if has_app_context():
+            configured = current_app.config.get("ML_ARTIFACTS_ROOT")
+            if configured:
+                root = Path(str(configured)).resolve()
+                if ".." in str(configured):
+                    raise MLError("Invalid ML_ARTIFACTS_ROOT configuration", code=500)
+                root.mkdir(parents=True, exist_ok=True)
+                return root
+    except MLError:
+        raise
+    except Exception:
+        pass
+    return default_artifacts_root()
 
 
 def validate_features_directory(features_dir_input: str | Path) -> Path:
@@ -77,7 +174,7 @@ def validate_features_directory(features_dir_input: str | Path) -> Path:
         raise MLError(f"Invalid features_dir path format: {err}", code=400) from err
 
     if not resolved_path.exists() or not resolved_path.is_dir():
-        raise MLError(f"Features directory does not exist or is not a directory: {resolved_path.as_posix()}", code=400)
+        raise MLError("Features directory does not exist or is not a directory", code=400)
 
     # Check allowed root containment
     is_allowed = any(
@@ -85,17 +182,26 @@ def validate_features_directory(features_dir_input: str | Path) -> Path:
         for root in ALLOWED_ROOT_PATHS
     )
     if not is_allowed:
-        raise MLError(f"Access denied to features directory outside allowed project scope: {resolved_path.as_posix()}", code=400)
+        raise MLError("Access denied to features directory outside allowed project scope", code=400)
 
     for artifact in ("train.parquet", "validation.parquet", "test.parquet"):
         if not (resolved_path / artifact).exists():
-            raise MLError(f"Required feature artifact '{artifact}' missing from directory: {resolved_path.as_posix()}", code=400)
+            raise MLError(
+                f"Required feature artifact '{artifact}' missing from features directory",
+                code=400,
+            )
 
     return resolved_path
 
 
 def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
-    """Execute model training and prediction pipeline for a single model or hybrid ensemble."""
+    """Execute forecast via compatible artifact reuse or fresh training.
+
+    Flow:
+      1. Validate request
+      2. If a compatible controlled artifact exists → load + predict
+      3. Else train normally, persist when supported, return trained result
+    """
     if not isinstance(payload, dict):
         raise MLError("Invalid JSON request body")
 
@@ -110,10 +216,24 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     if model_name == "baseline":
         model_name = "naive"
 
+    if model_name == "auto_select":
+        raise MLError(
+            "Model 'auto_select' is not a trainable model. "
+            "Resolve the recommended model via /compare and submit that model name."
+        )
+
+    if model_name not in KNOWN_FORECAST_MODELS:
+        raise MLError(
+            f"Unsupported model '{model_name}'. Supported: {sorted(KNOWN_FORECAST_MODELS - {'baseline'})}"
+        )
+
     if model_name == "arima" and domain == "retail":
         raise MLError("ARIMA model is currently supported only for the electricity domain")
 
     features_dir = validate_features_directory(payload.get("features_dir"))
+    selection_method = payload.get("selection_method")
+    if selection_method is not None:
+        selection_method = str(selection_method).strip() or None
 
     prediction_limit_raw = payload.get("prediction_limit", 100)
     if isinstance(prediction_limit_raw, bool):
@@ -134,6 +254,65 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     if max_depth is not None:
         max_depth = int(max_depth)
     learning_rate = float(payload.get("learning_rate", 0.05))
+    force_retrain = bool(payload.get("force_retrain", False))
+
+    # Artifacts are loaded/saved only from the controlled project directory
+    # (or ML_ARTIFACTS_ROOT when configured for tests). Never from request paths.
+    artifacts_root = _resolve_artifacts_root()
+
+    target = DOMAIN_TARGET_MAP[domain]
+    expected_config = expected_configuration_for_request(
+        model_key=model_name,
+        domain=domain,
+        order=order,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+    )
+
+    # Attempt safe artifact reuse for supported non-hybrid models.
+    if (
+        not force_retrain
+        and model_name != "hybrid"
+        and is_persistence_supported(model_name)
+    ):
+        try:
+            features_id = derive_features_id(features_dir)
+            loaded = try_load_compatible_artifact(
+                domain=domain,
+                model_key=model_name,
+                target=target,
+                features_id=features_id,
+                configuration=expected_config,
+                artifacts_root=artifacts_root,
+            )
+            if loaded is not None:
+                res = evaluate_fitted_model_on_splits(
+                    domain=domain,
+                    model_key=model_name,
+                    model=loaded["model"],
+                    features_dir=features_dir,
+                    configuration=expected_config,
+                    prediction_limit=prediction_limit,
+                    feature_names=loaded["metadata"].get("feature_names"),
+                )
+                res["artifact"] = _artifact_response(
+                    used=True,
+                    source="loaded",
+                    key=loaded.get("relative_key"),
+                )
+                return _attach_history(
+                    res,
+                    forecast_type="test_evaluation",
+                    features_dir=features_dir,
+                    selection_method=selection_method,
+                )
+        except TrainerError:
+            # Incompatible/corrupt runtime prediction → fall through to training.
+            pass
+        except Exception:
+            # Never fail the API solely because artifact reuse failed.
+            pass
 
     try:
         res = run_training_pipeline(
@@ -147,12 +326,205 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             max_depth=max_depth,
             learning_rate=learning_rate,
             prediction_limit=prediction_limit,
+            save_artifact=is_persistence_supported(model_name) and model_name != "hybrid",
+            artifacts_root=artifacts_root,
         )
-        return res
+        res["artifact"] = _artifact_response(
+            used=False,
+            source="trained",
+            key=res.get("artifact_key"),
+        )
+        return _attach_history(
+            res,
+            forecast_type="test_evaluation",
+            features_dir=features_dir,
+            selection_method=selection_method,
+        )
     except TrainerError as err:
         raise MLError(f"Forecasting pipeline error: {err}", code=400) from err
     except Exception as err:
-        raise MLError(f"Internal ML forecasting error: {err}", code=500) from err
+        raise MLError("Internal server error", code=500) from err
+
+
+def _obtain_fitted_model_for_inference(
+    *,
+    domain: str,
+    model_name: str,
+    features_dir: Path,
+    order: tuple[int, int, int],
+    n_estimators: int,
+    max_depth: int | None,
+    learning_rate: float,
+    force_retrain: bool = False,
+) -> tuple[Any, dict[str, Any]]:
+    """Load a compatible Phase A artifact or train+persist a fitted model."""
+    import pandas as pd
+
+    from ml_engine.evaluation.metrics import evaluate_forecast
+    from ml_engine.models.artifact_store import save_model_artifact
+    from ml_engine.models.trainer import _train_and_predict_single_model
+
+    artifacts_root = _resolve_artifacts_root()
+    target = DOMAIN_TARGET_MAP[domain]
+    expected_config = expected_configuration_for_request(
+        model_key=model_name,
+        domain=domain,
+        order=order,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+    )
+
+    if not force_retrain and is_persistence_supported(model_name):
+        try:
+            features_id = derive_features_id(features_dir)
+            loaded = try_load_compatible_artifact(
+                domain=domain,
+                model_key=model_name,
+                target=target,
+                features_id=features_id,
+                configuration=expected_config,
+                artifacts_root=artifacts_root,
+            )
+            if loaded is not None:
+                return loaded["model"], _artifact_response(
+                    used=True,
+                    source="loaded",
+                    key=loaded.get("relative_key"),
+                )
+        except Exception:
+            pass
+
+    train_df = pd.read_parquet(features_dir / "train.parquet")
+    val_df = pd.read_parquet(features_dir / "validation.parquet")
+    test_df = pd.read_parquet(features_dir / "test.parquet")
+
+    try:
+        trained = _train_and_predict_single_model(
+            model_key=model_name,
+            domain=domain,
+            target_column=target,
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            order=order,
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+        )
+    except TrainerError as err:
+        raise MLError(f"Future forecasting pipeline error: {err}", code=400) from err
+
+    artifact_info = _artifact_response(used=False, source="trained")
+    if is_persistence_supported(model_name):
+        try:
+            val_pred = trained["val_pred"]
+            test_pred = trained["test_pred"]
+            if model_name in ("lstm", "cnn_lstm"):
+                val_metrics = evaluate_forecast(val_df.loc[val_pred.index, target], val_pred)
+                test_metrics = evaluate_forecast(test_df.loc[test_pred.index, target], test_pred)
+            else:
+                val_metrics = evaluate_forecast(val_df[target], val_pred)
+                test_metrics = evaluate_forecast(test_df[target], test_pred)
+
+            saved = save_model_artifact(
+                model=trained["model"],
+                domain=domain,
+                model_key=model_name,
+                target=target,
+                features_id=derive_features_id(features_dir),
+                feature_names=trained.get("feature_names") or [],
+                configuration=trained.get("configuration") or expected_config,
+                validation_metrics=val_metrics,
+                test_metrics=test_metrics,
+                artifacts_root=artifacts_root,
+            )
+            artifact_info = _artifact_response(
+                used=False,
+                source="trained",
+                key=saved.get("relative_key"),
+            )
+        except Exception:
+            # Persistence failure must not block future forecasting once the model is fitted.
+            pass
+
+    return trained["model"], artifact_info
+
+
+def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
+    """Generate future forecasts with no actual values (separate from test evaluation)."""
+    if not isinstance(payload, dict):
+        raise MLError("Invalid JSON request body")
+
+    domain = payload.get("domain", "").lower().strip()
+    if not domain or domain not in DOMAIN_TARGET_MAP:
+        raise MLError(f"Invalid or missing domain '{domain}'. Supported: {list(DOMAIN_TARGET_MAP.keys())}")
+
+    model_name = payload.get("model", "").lower().strip()
+    if not model_name:
+        raise MLError("Missing required parameter 'model'")
+    if model_name == "baseline":
+        model_name = "naive"
+
+    if model_name == "auto_select":
+        raise MLError(
+            "Model 'auto_select' is not a trainable model. "
+            "Resolve the recommended model via /compare and submit that model name."
+        )
+
+    if not is_future_forecast_supported(domain, model_name):
+        raise MLError(future_support_error(domain, model_name), code=400)
+
+    features_dir = validate_features_directory(payload.get("features_dir"))
+
+    if "horizon" not in payload:
+        raise MLError("Missing required parameter 'horizon'")
+    try:
+        horizon = validate_horizon(payload.get("horizon"), domain=domain)
+    except FutureForecastError as err:
+        raise MLError(str(err), code=400) from err
+
+    order = tuple(payload.get("order", [1, 1, 1]))
+    n_estimators = int(payload.get("n_estimators", 200))
+    max_depth = payload.get("max_depth")
+    if max_depth is not None:
+        max_depth = int(max_depth)
+    learning_rate = float(payload.get("learning_rate", 0.05))
+    force_retrain = bool(payload.get("force_retrain", False))
+
+    try:
+        model, artifact_info = _obtain_fitted_model_for_inference(
+            domain=domain,
+            model_name=model_name,
+            features_dir=features_dir,
+            order=order,
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            force_retrain=force_retrain,
+        )
+        result = generate_future_forecast(
+            model=model,
+            model_key=model_name,
+            domain=domain,
+            features_dir=features_dir,
+            horizon=horizon,
+        )
+        result["artifact"] = artifact_info
+        return _attach_history(
+            result,
+            forecast_type="future",
+            features_dir=features_dir,
+            selection_method=None,
+        )
+    except FutureForecastError as err:
+        raise MLError(str(err), code=400) from err
+    except TrainerError as err:
+        raise MLError(f"Future forecasting pipeline error: {err}", code=400) from err
+    except MLError:
+        raise
+    except Exception as err:
+        raise MLError("Internal server error", code=500) from err
 
 
 def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
@@ -165,7 +537,21 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
         raise MLError(f"Invalid or missing domain '{domain}'. Supported: {list(DOMAIN_TARGET_MAP.keys())}")
 
     features_dir = validate_features_directory(payload.get("features_dir"))
-    selection_metric = payload.get("selection_metric", "rmse").lower().strip()
+    selection_metric = payload.get("selection_metric", "rmse")
+    if not isinstance(selection_metric, str):
+        raise MLError(
+            f"Invalid selection_metric. Supported: {sorted(ALLOWED_SELECTION_METRICS)}"
+        )
+    selection_metric = selection_metric.lower().strip()
+    if selection_metric not in ALLOWED_SELECTION_METRICS:
+        raise MLError(
+            f"Invalid selection_metric '{selection_metric}'. Supported: {sorted(ALLOWED_SELECTION_METRICS)}"
+        )
+
+    selection_split = payload.get("selection_split", "validation")
+    if selection_split is not None:
+        if not isinstance(selection_split, str) or selection_split.lower().strip() != "validation":
+            raise MLError("Parameter 'selection_split' must be 'validation'")
 
     models_input = payload.get("models")
     if models_input is None:
@@ -173,7 +559,20 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         if not isinstance(models_input, list) or not models_input:
             raise MLError("Parameter 'models' must be a non-empty list of model names")
-        candidate_models = [m.lower().strip() for m in models_input]
+        if len(models_input) > MAX_COMPARE_MODELS:
+            raise MLError(
+                f"Parameter 'models' accepts at most {MAX_COMPARE_MODELS} candidates"
+            )
+        candidate_models = []
+        for raw in models_input:
+            if not isinstance(raw, str):
+                raise MLError("Parameter 'models' must contain model name strings only")
+            name = raw.lower().strip()
+            if name == "baseline":
+                name = "naive"
+            if name not in KNOWN_FORECAST_MODELS or name == "auto_select":
+                raise MLError(f"Unsupported comparison model '{name}'")
+            candidate_models.append(name)
 
     # Reject ARIMA for retail domain
     if domain == "retail" and "arima" in candidate_models:
@@ -271,3 +670,77 @@ def explain_service(payload: dict[str, Any]) -> dict[str, Any]:
         return explanation
     except Exception as err:
         raise MLError(f"Explanation generation failed: {err}", code=400) from err
+
+
+def list_history_service(
+    *,
+    domain: str | None = None,
+    model: str | None = None,
+    limit: int | str | None = 20,
+) -> dict[str, Any]:
+    """List forecast history summaries (newest first)."""
+    domain_clean = None
+    if domain is not None and str(domain).strip():
+        domain_clean = str(domain).lower().strip()
+        if domain_clean not in DOMAIN_TARGET_MAP:
+            raise MLError(
+                f"Invalid domain '{domain_clean}'. Supported: {list(DOMAIN_TARGET_MAP.keys())}"
+            )
+
+    model_clean = None
+    if model is not None and str(model).strip():
+        model_clean = str(model).lower().strip()
+        if model_clean == "baseline":
+            model_clean = "naive"
+
+    parsed_limit = 20
+    if limit is not None and str(limit).strip() != "":
+        if isinstance(limit, bool):
+            raise MLError("Parameter 'limit' must be an integer between 1 and 100")
+        try:
+            parsed_limit = int(limit)
+        except (TypeError, ValueError) as err:
+            raise MLError("Parameter 'limit' must be an integer between 1 and 100") from err
+
+    try:
+        runs = list_forecast_history(
+            domain=domain_clean,
+            model=model_clean,
+            limit=parsed_limit,
+        )
+    except ForecastHistoryError as err:
+        raise MLError(err.message, code=err.code) from err
+    except Exception:
+        # Corrupted/missing history must not crash the API.
+        runs = []
+
+    return {"runs": runs}
+
+
+def get_history_run_service(run_id: str) -> dict[str, Any]:
+    """Return metadata for a single history run."""
+    try:
+        record = get_forecast_run(run_id)
+    except ForecastHistoryError as err:
+        raise MLError(err.message, code=err.code) from err
+    except Exception as err:
+        raise MLError("Forecast history run not found", code=404) from err
+
+    # Reference only — predictions remain in the original forecast API response.
+    record["result_ref"] = {
+        "forecast_type": record.get("forecast_type"),
+        "features_id": record.get("features_id"),
+        "note": "Full prediction arrays are not stored in history; use the original forecast response.",
+    }
+    return record
+
+
+def delete_history_run_service(run_id: str) -> dict[str, Any]:
+    """Delete a single validated history run."""
+    try:
+        delete_forecast_run(run_id)
+    except ForecastHistoryError as err:
+        raise MLError(err.message, code=err.code) from err
+    except Exception as err:
+        raise MLError("Unable to delete forecast history run", code=500) from err
+    return {"deleted": True, "run_id": run_id}
