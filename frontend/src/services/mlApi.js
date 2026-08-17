@@ -1,4 +1,4 @@
-﻿/**
+/**
  * API client service for SmartXSense ML Forecasting and Explainability endpoints.
  */
 
@@ -107,6 +107,7 @@ export async function runForecast({
   featuresDir,
   predictionLimit = 100,
   selectionMethod,
+  forceRetrain = false,
 }) {
   const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
   const body = {
@@ -114,6 +115,7 @@ export async function runForecast({
     model,
     features_dir: targetFeaturesDir,
     prediction_limit: predictionLimit,
+    force_retrain: forceRetrain,
   };
   if (selectionMethod) {
     body.selection_method = selectionMethod;

@@ -13,10 +13,12 @@ import numpy as np
 from ml_engine.evaluation.metrics import evaluate_forecast
 from ml_engine.models.artifact_store import (
     ArtifactError,
+    compute_dataset_fingerprint,
     derive_features_id,
     is_persistence_supported,
     predict_with_fitted_model,
     save_model_artifact,
+    try_load_compatible_artifact,
 )
 
 
@@ -64,7 +66,7 @@ def format_chart_predictions(
 from .arima import ARIMAForecaster
 from .baseline import NaiveForecaster
 from .cnn_lstm import CNNLSTMForecaster, CNNLSTMModelError, DEFAULT_LOOKBACK_CNN_LSTM
-from .hybrid import HybridForecaster, HybridModelError
+from .hybrid import HybridForecaster, HybridModelError, DEFAULT_HYBRID_COMPONENTS
 from .lstm import DEFAULT_LOOKBACK, LSTMForecaster
 from .random_forest import RandomForestForecaster
 from .xgboost_model import XGBoostForecaster
@@ -305,9 +307,10 @@ def run_training_pipeline(
     hybrid_weighting: str = "inverse_rmse",
     prediction_limit: int = 100,
     save_artifact: bool = False,
+    force_retrain: bool = False,
     artifacts_root: Path | str = Path("ml_engine/artifacts/models"),
 ) -> dict[str, Any]:
-    """Execute model training on train split and evaluation on validation and test splits."""
+    """Execute model training or load existing reusable artifact, returning predictions and evaluation metrics."""
     domain = domain.lower().strip()
     if domain not in DOMAIN_TARGET_MAP:
         raise TrainerError(f"Unsupported domain '{domain}'. Supported domains: {list(DOMAIN_TARGET_MAP.keys())}")
@@ -337,6 +340,60 @@ def run_training_pipeline(
     if model_key == "baseline":
         model_key = "naive"
 
+    features_id = derive_features_id(features_dir)
+    dataset_fingerprint = compute_dataset_fingerprint(features_dir)
+
+    expected_config = expected_configuration_for_request(
+        model_key=model_key,
+        domain=domain,
+        order=order,
+        seasonal_period=seasonal_period,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        random_state=random_state,
+        lookback=lookback,
+        lstm_units=lstm_units,
+        dropout=dropout,
+        epochs=epochs,
+        batch_size=batch_size,
+        lstm_learning_rate=lstm_learning_rate,
+        cnn_filters=cnn_filters,
+        kernel_size=kernel_size,
+        components=components,
+        hybrid_weighting=hybrid_weighting,
+    )
+
+    # Attempt to reuse existing artifact if force_retrain is False and persistence is supported
+    if not force_retrain and is_persistence_supported(model_key):
+        loaded = try_load_compatible_artifact(
+            domain=domain,
+            model_key=model_key,
+            target=target_column,
+            features_id=features_id,
+            dataset_fingerprint=dataset_fingerprint,
+            configuration=expected_config,
+            artifacts_root=artifacts_root,
+        )
+        if loaded is not None:
+            try:
+                res = evaluate_fitted_model_on_splits(
+                    domain=domain,
+                    model_key=model_key,
+                    model=loaded["model"],
+                    features_dir=features_dir,
+                    configuration=expected_config,
+                    prediction_limit=prediction_limit,
+                    feature_names=loaded["metadata"].get("feature_names"),
+                )
+                res["artifact_path"] = loaded["artifact_dir"]
+                res["artifact_key"] = loaded["relative_key"]
+                res["artifact_persistence"] = {"supported": True, "saved": True, "reused": True}
+                return res
+            except Exception:
+                # Corrupt or un-evaluable artifact -> fall through to retraining.
+                pass
+
     if model_key == "hybrid":
         try:
             hybrid_forecaster = HybridForecaster(
@@ -351,15 +408,12 @@ def run_training_pipeline(
         test_predictions: dict[str, pd.Series] = {}
         component_val_metrics: dict[str, dict[str, float]] = {}
         component_test_metrics: dict[str, dict[str, float]] = {}
+        component_models: dict[str, Any] = {}
 
         for comp in hybrid_forecaster.components:
-            res = _train_and_predict_single_model(
+            comp_config = expected_configuration_for_request(
                 model_key=comp,
                 domain=domain,
-                target_column=target_column,
-                train_df=train_df,
-                val_df=val_df,
-                test_df=test_df,
                 order=order,
                 seasonal_period=seasonal_period,
                 n_estimators=n_estimators,
@@ -375,9 +429,78 @@ def run_training_pipeline(
                 cnn_filters=cnn_filters,
                 kernel_size=kernel_size,
             )
-            v_pred = res["val_pred"]
-            t_pred = res["test_pred"]
+            comp_loaded = None
+            if not force_retrain and is_persistence_supported(comp):
+                comp_loaded = try_load_compatible_artifact(
+                    domain=domain,
+                    model_key=comp,
+                    target=target_column,
+                    features_id=features_id,
+                    dataset_fingerprint=dataset_fingerprint,
+                    configuration=comp_config,
+                    artifacts_root=artifacts_root,
+                )
+            if comp_loaded is not None:
+                comp_model = comp_loaded["model"]
+                comp_pred_res = predict_with_fitted_model(
+                    model_key=comp,
+                    model=comp_model,
+                    domain=domain,
+                    target_column=target_column,
+                    train_df=train_df,
+                    val_df=val_df,
+                    test_df=test_df,
+                )
+                v_pred = comp_pred_res["val_pred"]
+                t_pred = comp_pred_res["test_pred"]
+            else:
+                res = _train_and_predict_single_model(
+                    model_key=comp,
+                    domain=domain,
+                    target_column=target_column,
+                    train_df=train_df,
+                    val_df=val_df,
+                    test_df=test_df,
+                    order=order,
+                    seasonal_period=seasonal_period,
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    random_state=random_state,
+                    lookback=lookback,
+                    lstm_units=lstm_units,
+                    dropout=dropout,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    lstm_learning_rate=lstm_learning_rate,
+                    cnn_filters=cnn_filters,
+                    kernel_size=kernel_size,
+                )
+                comp_model = res["model"]
+                v_pred = res["val_pred"]
+                t_pred = res["test_pred"]
 
+                if save_artifact and is_persistence_supported(comp):
+                    try:
+                        v_targs = val_df.loc[v_pred.index, target_column]
+                        t_targs = test_df.loc[t_pred.index, target_column]
+                        save_model_artifact(
+                            model=comp_model,
+                            domain=domain,
+                            model_key=comp,
+                            target=target_column,
+                            features_id=features_id,
+                            dataset_fingerprint=dataset_fingerprint,
+                            feature_names=res.get("feature_names") or [],
+                            configuration=comp_config,
+                            validation_metrics=evaluate_forecast(v_targs, v_pred),
+                            test_metrics=evaluate_forecast(t_targs, t_pred),
+                            artifacts_root=artifacts_root,
+                        )
+                    except Exception:
+                        pass
+
+            component_models[comp] = comp_model
             val_predictions[comp] = v_pred
             test_predictions[comp] = t_pred
 
@@ -397,15 +520,15 @@ def run_training_pipeline(
         except HybridModelError as err:
             raise TrainerError(f"Hybrid ensemble calculation failed: {err}") from err
 
+        hybrid_forecaster.weights = weights
+        hybrid_forecaster.component_models = component_models
+
         val_targets = val_df.loc[val_hybrid_pred.index, target_column]
         test_targets = test_df.loc[test_hybrid_pred.index, target_column]
 
         val_metrics = evaluate_forecast(val_targets, val_hybrid_pred)
         test_metrics = evaluate_forecast(test_targets, test_hybrid_pred)
 
-        # This choice intentionally receives only validation facts.  The
-        # held-out test metrics above are reported for evaluation, never for
-        # choosing whether the ensemble is better than a component.
         adaptive_selection = HybridForecaster.select_adaptive_winner(
             component_val_metrics,
             val_metrics,
@@ -429,10 +552,7 @@ def run_training_pipeline(
             "model": "hybrid",
             "domain": domain,
             "target": target_column,
-            "configuration": {
-                "components": hybrid_forecaster.components,
-                "weighting": hybrid_weighting,
-            },
+            "configuration": expected_config,
             "weights": weights,
             "component_validation_metrics": component_val_metrics,
             "component_test_metrics": component_test_metrics,
@@ -449,13 +569,26 @@ def run_training_pipeline(
             "total_test_predictions": total_test_preds,
         }
 
-        # Hybrid persistence is intentionally unsupported: component models are
-        # not retained after training, so weights-only artifacts cannot be reused.
         if save_artifact:
-            result["artifact_persistence"] = {
-                "supported": False,
-                "reason": "hybrid requires fitted component models which are not retained",
-            }
+            try:
+                saved = save_model_artifact(
+                    model=hybrid_forecaster,
+                    domain=domain,
+                    model_key="hybrid",
+                    target=target_column,
+                    features_id=features_id,
+                    dataset_fingerprint=dataset_fingerprint,
+                    feature_names=[],
+                    configuration=expected_config,
+                    validation_metrics=val_metrics,
+                    test_metrics=test_metrics,
+                    artifacts_root=artifacts_root,
+                )
+                result["artifact_path"] = saved["artifact_dir"]
+                result["artifact_key"] = saved["relative_key"]
+                result["artifact_persistence"] = {"supported": True, "saved": True, "reused": False}
+            except ArtifactError as err:
+                result["artifact_persistence"] = {"supported": True, "saved": False, "reason": str(err)}
 
         return result
 
@@ -538,13 +671,13 @@ def run_training_pipeline(
     if save_artifact:
         if is_persistence_supported(model_key):
             try:
-                features_id = derive_features_id(features_dir)
                 saved = save_model_artifact(
                     model=res["model"],
                     domain=domain,
                     model_key=model_key,
                     target=target_column,
                     features_id=features_id,
+                    dataset_fingerprint=dataset_fingerprint,
                     feature_names=feature_names,
                     configuration=res["configuration"],
                     validation_metrics=val_metrics,
@@ -553,7 +686,7 @@ def run_training_pipeline(
                 )
                 result["artifact_path"] = saved["artifact_dir"]
                 result["artifact_key"] = saved["relative_key"]
-                result["artifact_persistence"] = {"supported": True, "saved": True}
+                result["artifact_persistence"] = {"supported": True, "saved": True, "reused": False}
             except ArtifactError as err:
                 result["artifact_persistence"] = {
                     "supported": True,
@@ -610,6 +743,64 @@ def evaluate_fitted_model_on_splits(
     val_pred = pred_res["val_pred"]
     test_pred = pred_res["test_pred"]
     resolved_feature_names = list(feature_names if feature_names is not None else pred_res["feature_names"])
+
+    if model_key == "hybrid":
+        val_predictions = pred_res["val_predictions"]
+        test_predictions = pred_res["test_predictions"]
+        component_val_metrics: dict[str, dict[str, float]] = {}
+        component_test_metrics: dict[str, dict[str, float]] = {}
+        for comp, vp in val_predictions.items():
+            v_targets = val_df.loc[vp.index, target_column]
+            component_val_metrics[comp] = evaluate_forecast(v_targets, vp)
+        for comp, tp in test_predictions.items():
+            t_targets = test_df.loc[tp.index, target_column]
+            component_test_metrics[comp] = evaluate_forecast(t_targets, tp)
+
+        val_targets = val_df.loc[val_pred.index, target_column]
+        test_targets = test_df.loc[test_pred.index, target_column]
+
+        val_metrics = evaluate_forecast(val_targets, val_pred)
+        test_metrics = evaluate_forecast(test_targets, test_pred)
+
+        adaptive_selection = HybridForecaster.select_adaptive_winner(
+            component_val_metrics,
+            val_metrics,
+        )
+        selected_model = adaptive_selection["selected_model"]
+        if selected_model == "hybrid":
+            selected_test_pred = test_pred
+            selected_test_metrics = test_metrics
+        else:
+            selected_test_pred = test_predictions[selected_model]
+            selected_test_metrics = component_test_metrics[selected_model]
+
+        predictions_list, pred_count, total_test_preds = format_chart_predictions(
+            test_df=test_df,
+            test_pred=selected_test_pred,
+            target_column=target_column,
+            prediction_limit=prediction_limit,
+        )
+
+        return {
+            "model": "hybrid",
+            "domain": domain,
+            "target": target_column,
+            "configuration": configuration or {"components": getattr(model, "components", []), "weighting": getattr(model, "weighting_strategy", "inverse_rmse")},
+            "weights": getattr(model, "weights", {}),
+            "component_validation_metrics": component_val_metrics,
+            "component_test_metrics": component_test_metrics,
+            "training_rows": len(train_df),
+            "validation_rows": len(val_df),
+            "test_rows": len(test_df),
+            "validation_metrics": val_metrics,
+            "test_metrics": test_metrics,
+            "selected_model": selected_model,
+            "selected_test_metrics": selected_test_metrics,
+            "adaptive_selection": adaptive_selection,
+            "predictions": predictions_list,
+            "prediction_count": pred_count,
+            "total_test_predictions": total_test_preds,
+        }
 
     if model_key in ("lstm", "cnn_lstm"):
         val_targets = val_df.loc[val_pred.index, target_column]
@@ -678,11 +869,21 @@ def expected_configuration_for_request(
     lstm_learning_rate: float = 0.001,
     cnn_filters: int = 32,
     kernel_size: int = 3,
+    components: list[str] | None = None,
+    hybrid_weighting: str = "inverse_rmse",
 ) -> dict[str, Any]:
     """Mirror trainer configuration keys so artifact fingerprints match training saves."""
     model_key = model_key.lower().strip()
     if model_key == "baseline":
         model_key = "naive"
+
+    if model_key == "hybrid":
+        comps = components if components is not None else DEFAULT_HYBRID_COMPONENTS.get(domain, ["random_forest", "xgboost"])
+        comps = HybridForecaster.validate_components(comps, domain)
+        return {
+            "components": comps,
+            "weighting": hybrid_weighting,
+        }
 
     if model_key == "arima":
         return {"order": list(order)}

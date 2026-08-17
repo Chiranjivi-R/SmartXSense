@@ -234,7 +234,12 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
   };
 
   // Primary forecast runner
-  const handleRunForecast = async (targetModel = model, targetDomain = domain, featuresDirOverride = undefined) => {
+  const handleRunForecast = async (
+    targetModel = model,
+    targetDomain = domain,
+    featuresDirOverride = undefined,
+    forceRetrain = false,
+  ) => {
     const requestToken = domainRequestToken.current;
     setForecastLoading(true);
     setForecastError(null);
@@ -277,6 +282,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         featuresDir: activeFeaturesDir,
         predictionLimit: 100,
         selectionMethod: targetModel === 'auto_select' ? 'validation_rmse' : undefined,
+        forceRetrain,
       });
 
       if (requestToken !== domainRequestToken.current) return;
@@ -481,7 +487,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               {DOMAIN_CONTEXTS[domain]}
             </p>
           </div>
-          <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
             <button
               onClick={() => handleRunForecast(model, domain)}
               disabled={forecastLoading || compareLoading}
@@ -501,6 +507,24 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               }}
             >
               {forecastLoading ? 'Generating Forecast...' : '⚡ Run Forecast'}
+            </button>
+            <button
+              onClick={() => handleRunForecast(model, domain, undefined, true)}
+              disabled={forecastLoading || compareLoading}
+              title="Force fresh model retraining and update artifact"
+              style={{
+                background: 'transparent',
+                color: COLORS.text.secondary,
+                border: `1px solid ${COLORS.bg.border}`,
+                borderRadius: 10,
+                padding: '10px 14px',
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: forecastLoading || compareLoading ? 'not-allowed' : 'pointer',
+                transition: 'all 0.2s',
+              }}
+            >
+              🔄 Retrain
             </button>
             <button
               onClick={handleCompareModels}
@@ -592,12 +616,17 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
 
           {/* Active Status Display */}
           <div style={{ background: COLORS.bg.dark, borderRadius: 10, padding: '12px 16px', border: `1px solid ${COLORS.bg.border}`, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-            <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dataset Status</div>
+            <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dataset & Artifact Status</div>
             <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary, marginTop: 4, fontFamily: "'Space Mono', monospace" }}>
               {customFeaturesDir ? 'Uploaded Dataset' : `Demo Dataset: ${domain.toUpperCase()}`}
             </div>
-            <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2 }}>
-              Active Model: <span style={{ color: COLORS.primary, fontWeight: 700, textTransform: 'capitalize' }}>{activeModelDisplay}</span>
+            <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>Active Model: <span style={{ color: COLORS.primary, fontWeight: 700, textTransform: 'capitalize' }}>{activeModelDisplay}</span></span>
+              {forecastData?.execution && (
+                <span style={{ fontSize: 11, color: forecastData.execution.artifact_reused ? COLORS.success : COLORS.warning, fontWeight: 700 }}>
+                  {forecastData.execution.artifact_reused ? '⚡ Artifact Reused' : '🏋️ Model Trained'} ({forecastData.execution.execution_time_ms} ms)
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -1262,6 +1291,22 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               <span style={{ background: `${COLORS.success}22`, color: COLORS.success, border: `1px solid ${COLORS.success}44`, borderRadius: 6, padding: '2px 8px', fontSize: 10, fontWeight: 700 }}>
                 Selected on Validation Set
               </span>
+              {compareData?.benchmark_execution && (
+                <span
+                  style={{
+                    background: compareData.benchmark_execution.reused ? `${COLORS.primary}22` : `${COLORS.warning}22`,
+                    color: compareData.benchmark_execution.reused ? COLORS.primary : COLORS.warning,
+                    border: `1px solid ${compareData.benchmark_execution.reused ? COLORS.primary : COLORS.warning}44`,
+                    borderRadius: 6,
+                    padding: '2px 8px',
+                    fontSize: 10,
+                    fontWeight: 700,
+                    fontFamily: "'Space Mono', monospace",
+                  }}
+                >
+                  {compareData.benchmark_execution.reused ? '⚡ Benchmark Reused' : '🏋️ Benchmark Computed'} ({compareData.benchmark_execution.execution_time_ms} ms)
+                </span>
+              )}
             </div>
             <p style={{ fontSize: 12, color: COLORS.text.secondary, margin: '4px 0 0' }}>
               Model recommendation is determined strictly by validation performance to ensure unbiased evaluation.

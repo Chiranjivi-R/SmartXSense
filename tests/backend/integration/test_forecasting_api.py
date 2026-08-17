@@ -27,9 +27,12 @@ class TestConfig:
 
 
 @pytest.fixture()
-def client():
-    """Flask test client fixture — yields test_client only (no tuple)."""
-    app = create_app(TestConfig)
+def client(tmp_path):
+    """Flask test client fixture — yields test_client with isolated ML_ARTIFACTS_ROOT."""
+    class CustomTestConfig(TestConfig):
+        ML_ARTIFACTS_ROOT = str(tmp_path / "artifacts")
+
+    app = create_app(CustomTestConfig)
     with app.app_context():
         db.create_all()
         yield app.test_client()
@@ -150,6 +153,58 @@ def test_compare_selection_split_is_validation(client, mock_features_dir):
     recommended = data["recommended_model"]
     ranked_models = [r["model"] for r in data["ranking"]]
     assert recommended in ranked_models
+
+
+def test_compare_benchmark_cache_and_reuse(client, mock_features_dir):
+    """Confirm first compare computes benchmark and second identical call reuses cached benchmark."""
+    payload = {
+        "domain": "electricity",
+        "features_dir": str(mock_features_dir),
+        "models": ["random_forest", "xgboost"],
+        "selection_metric": "mae",
+    }
+    # First benchmark call
+    res1 = client.post("/api/v1/forecasting/compare", json=payload)
+    assert res1.status_code == 200
+    data1 = res1.get_json()["data"]
+    assert "benchmark_execution" in data1
+    assert data1["benchmark_execution"]["reused"] is False
+    assert data1["benchmark_execution"]["status"] == "Benchmark Computed"
+
+    # Second benchmark call -> reuses benchmark cache
+    res2 = client.post("/api/v1/forecasting/compare", json=payload)
+    assert res2.status_code == 200
+    data2 = res2.get_json()["data"]
+    assert "benchmark_execution" in data2
+    assert data2["benchmark_execution"]["reused"] is True
+    assert data2["benchmark_execution"]["status"] == "Benchmark Reused"
+    assert data2["recommended_model"] == data1["recommended_model"]
+
+
+def test_compare_dataset_fingerprint_change_invalidates_cache(client, mock_features_dir):
+    """Confirm that modifying dataset features invalidates benchmark cache reuse."""
+    payload = {
+        "domain": "electricity",
+        "features_dir": str(mock_features_dir),
+        "models": ["random_forest", "xgboost"],
+        "selection_metric": "rmse",
+    }
+    res1 = client.post("/api/v1/forecasting/compare", json=payload)
+    assert res1.status_code == 200
+    data1 = res1.get_json()["data"]
+    assert data1["benchmark_execution"]["reused"] is False
+
+    # Modify train.parquet
+    train_path = mock_features_dir / "train.parquet"
+    df = pd.read_parquet(train_path)
+    df["demand_mw"] = df["demand_mw"] * 1.5
+    df.to_parquet(train_path, index=False)
+
+    res2 = client.post("/api/v1/forecasting/compare", json=payload)
+    assert res2.status_code == 200
+    data2 = res2.get_json()["data"]
+    assert data2["benchmark_execution"]["reused"] is False
+    assert data2["benchmark_execution"]["status"] == "Benchmark Computed"
 
 
 # ---------------------------------------------------------------------------

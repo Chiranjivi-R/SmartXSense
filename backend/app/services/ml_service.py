@@ -11,6 +11,7 @@ Strict Security & Integration Rules:
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any
 
 import pandas as pd
@@ -18,9 +19,12 @@ import pandas as pd
 from ml_engine.evaluation import AdaptiveModelSelector, compare_models
 from ml_engine.explainability import ForecastExplainer, SUPPORTED_EXPLAINABLE_MODELS
 from ml_engine.models.artifact_store import (
+    compute_dataset_fingerprint,
     default_artifacts_root,
     derive_features_id,
     is_persistence_supported,
+    save_benchmark_cache,
+    try_load_benchmark_cache,
     try_load_compatible_artifact,
 )
 from ml_engine.models.capability_matrix import DEFAULT_COMPARE_MODELS as DEFAULT_COMPARISON_MODELS
@@ -266,64 +270,9 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     learning_rate = float(payload.get("learning_rate", 0.05))
     force_retrain = bool(payload.get("force_retrain", False))
 
-    # Artifacts are loaded/saved only from the controlled project directory
-    # (or ML_ARTIFACTS_ROOT when configured for tests). Never from request paths.
     artifacts_root = _resolve_artifacts_root()
 
-    target = DOMAIN_TARGET_MAP[domain]
-    expected_config = expected_configuration_for_request(
-        model_key=model_name,
-        domain=domain,
-        order=order,
-        n_estimators=n_estimators,
-        max_depth=max_depth,
-        learning_rate=learning_rate,
-    )
-
-    # Attempt safe artifact reuse for supported non-hybrid models.
-    if (
-        not force_retrain
-        and model_name != "hybrid"
-        and is_persistence_supported(model_name)
-    ):
-        try:
-            features_id = derive_features_id(features_dir)
-            loaded = try_load_compatible_artifact(
-                domain=domain,
-                model_key=model_name,
-                target=target,
-                features_id=features_id,
-                configuration=expected_config,
-                artifacts_root=artifacts_root,
-            )
-            if loaded is not None:
-                res = evaluate_fitted_model_on_splits(
-                    domain=domain,
-                    model_key=model_name,
-                    model=loaded["model"],
-                    features_dir=features_dir,
-                    configuration=expected_config,
-                    prediction_limit=prediction_limit,
-                    feature_names=loaded["metadata"].get("feature_names"),
-                )
-                res["artifact"] = _artifact_response(
-                    used=True,
-                    source="loaded",
-                    key=loaded.get("relative_key"),
-                )
-                return _attach_history(
-                    res,
-                    forecast_type="test_evaluation",
-                    features_dir=features_dir,
-                    selection_method=selection_method,
-                )
-        except TrainerError:
-            # Incompatible/corrupt runtime prediction → fall through to training.
-            pass
-        except Exception:
-            # Never fail the API solely because artifact reuse failed.
-            pass
-
+    start_time = time.perf_counter()
     try:
         res = run_training_pipeline(
             domain=domain,
@@ -336,14 +285,22 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             max_depth=max_depth,
             learning_rate=learning_rate,
             prediction_limit=prediction_limit,
-            save_artifact=is_persistence_supported(model_name) and model_name != "hybrid",
+            save_artifact=is_persistence_supported(model_name),
+            force_retrain=force_retrain,
             artifacts_root=artifacts_root,
         )
+        exec_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        is_reused = res.get("artifact_persistence", {}).get("reused", False)
         res["artifact"] = _artifact_response(
-            used=False,
-            source="trained",
+            used=is_reused,
+            source="loaded" if is_reused else "trained",
             key=res.get("artifact_key"),
         )
+        res["execution"] = {
+            "artifact_reused": is_reused,
+            "training_performed": not is_reused,
+            "execution_time_ms": exec_time_ms,
+        }
         return _attach_history(
             res,
             forecast_type="test_evaluation",
@@ -371,7 +328,7 @@ def _obtain_fitted_model_for_inference(
     import pandas as pd
 
     from ml_engine.evaluation.metrics import evaluate_forecast
-    from ml_engine.models.artifact_store import save_model_artifact
+    from ml_engine.models.artifact_store import compute_dataset_fingerprint, save_model_artifact
     from ml_engine.models.trainer import _train_and_predict_single_model
 
     artifacts_root = _resolve_artifacts_root()
@@ -384,15 +341,17 @@ def _obtain_fitted_model_for_inference(
         max_depth=max_depth,
         learning_rate=learning_rate,
     )
+    features_id = derive_features_id(features_dir)
+    dataset_fingerprint = compute_dataset_fingerprint(features_dir)
 
     if not force_retrain and is_persistence_supported(model_name):
         try:
-            features_id = derive_features_id(features_dir)
             loaded = try_load_compatible_artifact(
                 domain=domain,
                 model_key=model_name,
                 target=target,
                 features_id=features_id,
+                dataset_fingerprint=dataset_fingerprint,
                 configuration=expected_config,
                 artifacts_root=artifacts_root,
             )
@@ -442,7 +401,8 @@ def _obtain_fitted_model_for_inference(
                 domain=domain,
                 model_key=model_name,
                 target=target,
-                features_id=derive_features_id(features_dir),
+                features_id=features_id,
+                dataset_fingerprint=dataset_fingerprint,
                 feature_names=trained.get("feature_names") or [],
                 configuration=trained.get("configuration") or expected_config,
                 validation_metrics=val_metrics,
@@ -539,6 +499,7 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
 
 def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
     """Compare candidate forecasting models based strictly on validation metrics."""
+    start_time = time.perf_counter()
     if not isinstance(payload, dict):
         raise MLError("Invalid JSON request body")
 
@@ -588,6 +549,42 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
     if domain == "retail" and "arima" in candidate_models:
         raise MLError("ARIMA model is not supported for retail domain comparison")
 
+    artifacts_root = _resolve_artifacts_root()
+    features_id = derive_features_id(features_dir)
+    dataset_fingerprint = compute_dataset_fingerprint(features_dir)
+
+    configurations = {}
+    for m in candidate_models:
+        configurations[m] = expected_configuration_for_request(
+            model_key=m,
+            domain=domain,
+        )
+
+    cached_benchmark = try_load_benchmark_cache(
+        domain=domain,
+        features_id=features_id,
+        dataset_fingerprint=dataset_fingerprint,
+        candidate_models=candidate_models,
+        selection_metric=selection_metric,
+        configurations=configurations,
+        artifacts_root=artifacts_root,
+    )
+    if cached_benchmark is not None:
+        exec_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        return {
+            "domain": domain,
+            "selection_metric": selection_metric,
+            "selection_split": "validation",
+            "ranking": cached_benchmark["ranking"],
+            "recommended_model": cached_benchmark["recommended_model"],
+            "adaptive_selection": cached_benchmark["adaptive_selection"],
+            "benchmark_execution": {
+                "reused": True,
+                "status": "Benchmark Reused",
+                "execution_time_ms": exec_time_ms,
+            },
+        }
+
     reports = []
     for m in candidate_models:
         try:
@@ -595,6 +592,8 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
                 domain=domain,
                 features_dir=features_dir,
                 model_name=m,
+                save_artifact=is_persistence_supported(m),
+                artifacts_root=artifacts_root,
             )
             reports.append(report)
         except Exception as err:
@@ -607,6 +606,20 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as err:
         raise MLError(f"Model comparison calculation failed: {err}", code=400) from err
 
+    save_benchmark_cache(
+        domain=domain,
+        features_id=features_id,
+        dataset_fingerprint=dataset_fingerprint,
+        candidate_models=candidate_models,
+        selection_metric=selection_metric,
+        ranking=comparison_res["ranking"],
+        recommended_model=comparison_res["recommended_model"],
+        adaptive_selection=selection_res,
+        configurations=configurations,
+        artifacts_root=artifacts_root,
+    )
+
+    exec_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
     return {
         "domain": domain,
         "selection_metric": selection_metric,
@@ -614,6 +627,11 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
         "ranking": comparison_res["ranking"],
         "recommended_model": comparison_res["recommended_model"],
         "adaptive_selection": selection_res,
+        "benchmark_execution": {
+            "reused": False,
+            "status": "Benchmark Computed",
+            "execution_time_ms": exec_time_ms,
+        },
     }
 
 
