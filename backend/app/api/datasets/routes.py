@@ -59,13 +59,20 @@ def upload():
 
 
 @datasets_bp.get("")
-@jwt_required()
+@jwt_required(optional=True)
 def list_all():
     try:
         limit = int(request.args.get("limit", 20))
         offset = int(request.args.get("offset", 0))
-        total, datasets = list_datasets(_authenticated_user().user_id, domain=request.args.get("domain"), limit=limit, offset=offset)
-        return jsonify({"status": "success", "code": 200, "data": {"total": total, "datasets": [list_item(dataset) for dataset in datasets]}})
+        user_id = None
+        identity = get_jwt_identity()
+        if identity:
+            try:
+                user_id = current_user(identity).user_id
+            except AuthError:
+                pass
+        total, datasets = list_datasets(user_id, domain=request.args.get("domain"), limit=limit, offset=offset)
+        return jsonify({"status": "success", "code": 200, "data": {"total": total, "datasets": datasets}})
     except ValueError:
         return _error_response(DatasetError("Invalid pagination parameters"))
     except DatasetError as error:

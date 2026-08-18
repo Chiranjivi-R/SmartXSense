@@ -167,23 +167,66 @@ def upload_dataset(file: FileStorage | None, *, domain: str | None, user_id: str
         raise DatasetError("Unable to store dataset", 500) from exc
 
 
-def list_datasets(user_id: str, *, domain: str | None, limit: int, offset: int) -> tuple[int, list[Dataset]]:
+DEMO_DATASETS = [
+    {
+        "dataset_id": "demo_retail",
+        "filename": "Retail Sales Demo",
+        "domain": "retail",
+        "row_count": 1000,
+        "status": "processed",
+        "created_at": "2026-01-01T00:00:00Z",
+        "features_ready": True,
+        "features_dir": "ml_engine/data/features/retail/features_1c0c92ff-264e-4398-b83c-e0e082b956b4",
+        "is_demo": True,
+    },
+    {
+        "dataset_id": "demo_electricity",
+        "filename": "Electricity Load Demo",
+        "domain": "electricity",
+        "row_count": 2160,
+        "status": "processed",
+        "created_at": "2026-01-01T00:00:00Z",
+        "features_ready": True,
+        "features_dir": "ml_engine/data/features/electricity/features_23889e57-aa6d-4a50-930c-874f6a963a25",
+        "is_demo": True,
+    },
+]
+
+
+def list_datasets(user_id: str | None, *, domain: str | None, limit: int, offset: int) -> tuple[int, list[dict]]:
     if domain is not None and domain.lower() not in ALLOWED_DOMAINS:
         raise DatasetError("Invalid dataset domain", errors={"domain": ["Must be either retail or electricity."]})
     if limit < 1 or limit > 100 or offset < 0:
         raise DatasetError("Invalid pagination parameters", errors={"limit": ["Must be between 1 and 100."], "offset": ["Must be zero or greater."]})
-    try:
-        statement = db.select(Dataset).where(Dataset.user_id == user_id)
-        if domain is not None:
-            statement = statement.where(Dataset.domain == domain.lower())
-        total = db.session.scalar(db.select(func.count()).select_from(statement.subquery())) or 0
-        datasets = list(db.session.scalars(statement.order_by(Dataset.created_at.desc()).limit(limit).offset(offset)))
-        return total, datasets
-    except SQLAlchemyError as exc:
-        raise DatasetError("Unable to retrieve datasets", 500) from exc
+
+    normalized_domain = domain.lower() if domain is not None else None
+    items: list[dict] = []
+
+    for demo in DEMO_DATASETS:
+        if normalized_domain is None or demo["domain"] == normalized_domain:
+            items.append(dict(demo))
+
+    if user_id:
+        try:
+            statement = db.select(Dataset).where(Dataset.user_id == user_id)
+            if normalized_domain is not None:
+                statement = statement.where(Dataset.domain == normalized_domain)
+            db_datasets = list(db.session.scalars(statement.order_by(Dataset.created_at.desc())))
+            for dataset in db_datasets:
+                items.append(list_item(dataset))
+        except SQLAlchemyError as exc:
+            raise DatasetError("Unable to retrieve datasets", 500) from exc
+
+    total = len(items)
+    paginated = items[offset:offset + limit]
+    return total, paginated
 
 
-def owned_dataset(dataset_id: str, user_id: str) -> Dataset:
+def owned_dataset(dataset_id: str, user_id: str) -> Dataset | dict:
+    if dataset_id in ("demo_retail", "demo_electricity"):
+        for demo in DEMO_DATASETS:
+            if demo["dataset_id"] == dataset_id:
+                return dict(demo)
     try:
         dataset = db.session.scalar(db.select(Dataset).where(Dataset.dataset_id == dataset_id, Dataset.user_id == user_id))
     except SQLAlchemyError as exc:
@@ -194,12 +237,27 @@ def owned_dataset(dataset_id: str, user_id: str) -> Dataset:
     return dataset
 
 
-def dataset_detail(dataset: Dataset, preview_rows: int) -> dict:
+def dataset_detail(dataset: Dataset | dict, preview_rows: int) -> dict:
     if preview_rows < 1 or preview_rows > 100:
         raise DatasetError("Invalid preview_rows parameter", errors={"preview_rows": ["Must be between 1 and 100."]})
+    if isinstance(dataset, dict):
+        return {
+            "dataset_id": dataset["dataset_id"],
+            "filename": dataset["filename"],
+            "domain": dataset["domain"],
+            "file_size_bytes": 0,
+            "row_count": dataset["row_count"],
+            "column_count": 0,
+            "status": dataset["status"],
+            "features_ready": dataset.get("features_ready", True),
+            "features_dir": dataset.get("features_dir"),
+            "is_demo": True,
+            "columns": [],
+            "preview": [],
+        }
     path = managed_upload_path(dataset)
     frame = _read_dataset(path, _extension(dataset.filename), preview_rows=preview_rows)
-    return {
+    detail = {
         "dataset_id": dataset.dataset_id,
         "filename": dataset.filename,
         "domain": dataset.domain,
@@ -210,6 +268,21 @@ def dataset_detail(dataset: Dataset, preview_rows: int) -> dict:
         "columns": [str(column) for column in frame.columns],
         "preview": _safe_table_records(frame),
     }
+    features_dir = None
+    features_ready = False
+    if dataset.preprocessing_runs:
+        latest = sorted(dataset.preprocessing_runs, key=lambda r: str(r.processed_at), reverse=True)[0]
+        if latest.lags_generated_json:
+            try:
+                lineage = json.loads(latest.lags_generated_json)
+                if isinstance(lineage, dict):
+                    features_dir = lineage.get("features_dir")
+                    features_ready = bool(lineage.get("features_ready", False))
+            except json.JSONDecodeError:
+                pass
+    detail["features_dir"] = features_dir
+    detail["features_ready"] = features_ready
+    return detail
 
 
 def delete_dataset(dataset: Dataset) -> None:
@@ -356,6 +429,18 @@ def upload_response(dataset: Dataset) -> dict:
 
 
 def list_item(dataset: Dataset) -> dict:
+    features_dir = None
+    features_ready = False
+    if dataset.preprocessing_runs:
+        latest = sorted(dataset.preprocessing_runs, key=lambda r: str(r.processed_at), reverse=True)[0]
+        if latest.lags_generated_json:
+            try:
+                lineage = json.loads(latest.lags_generated_json)
+                if isinstance(lineage, dict):
+                    features_dir = lineage.get("features_dir")
+                    features_ready = bool(lineage.get("features_ready", False))
+            except json.JSONDecodeError:
+                pass
     return {
         "dataset_id": dataset.dataset_id,
         "filename": dataset.filename,
@@ -363,4 +448,6 @@ def list_item(dataset: Dataset) -> dict:
         "row_count": dataset.row_count,
         "status": dataset.status,
         "created_at": _format_timestamp(dataset.created_at),
+        "features_ready": features_ready,
+        "features_dir": features_dir,
     }

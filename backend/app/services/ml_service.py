@@ -157,6 +157,12 @@ def _resolve_artifacts_root() -> Path:
     return default_artifacts_root()
 
 
+DEMO_FEATURE_DIRS = {
+    "demo_retail": "ml_engine/data/features/retail/features_1c0c92ff-264e-4398-b83c-e0e082b956b4",
+    "demo_electricity": "ml_engine/data/features/electricity/features_23889e57-aa6d-4a50-930c-874f6a963a25",
+}
+
+
 def validate_features_directory(features_dir_input: str | Path) -> Path:
     """Validate that features_dir is secure, exists, and contains required split artifacts.
 
@@ -172,6 +178,27 @@ def validate_features_directory(features_dir_input: str | Path) -> Path:
     raw_str = str(features_dir_input).strip()
     if ".." in raw_str:
         raise MLError("Path traversal detected in features_dir", code=400)
+
+    if raw_str in DEMO_FEATURE_DIRS:
+        raw_str = DEMO_FEATURE_DIRS[raw_str]
+    else:
+        try:
+            from flask import has_app_context
+            if has_app_context():
+                import json
+                from ..extensions import db
+                from ..models import DatasetPreprocessing
+                prep = db.session.scalar(
+                    db.select(DatasetPreprocessing)
+                    .where(DatasetPreprocessing.dataset_id == raw_str)
+                    .order_by(DatasetPreprocessing.processed_at.desc())
+                )
+                if prep and prep.lags_generated_json:
+                    lineage = json.loads(prep.lags_generated_json)
+                    if isinstance(lineage, dict) and lineage.get("features_dir"):
+                        raw_str = str(lineage["features_dir"])
+        except Exception:
+            pass
 
     try:
         raw_path = Path(raw_str)

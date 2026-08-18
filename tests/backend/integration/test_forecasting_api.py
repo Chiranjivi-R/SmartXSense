@@ -841,6 +841,22 @@ def test_history_delete_single_run(tmp_path, mock_features_dir):
         db.drop_all()
 
 
+def test_forecast_with_demo_dataset_key(client):
+    response = client.post(
+        "/api/v1/forecasting/forecast",
+        json={
+            "domain": "retail",
+            "features_dir": "demo_retail",
+            "model": "random_forest",
+            "n_estimators": 5,
+        },
+    )
+    assert response.status_code == 200
+    data = response.get_json()["data"]
+    assert data["model"] == "random_forest"
+    assert data["domain"] == "retail"
+
+
 def test_history_corrupted_index_lists_empty(tmp_path, mock_features_dir):
     app = _history_app(tmp_path)
     history_root = Path(tmp_path / "hist_store")

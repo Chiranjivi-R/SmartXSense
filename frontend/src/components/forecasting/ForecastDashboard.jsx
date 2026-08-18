@@ -9,6 +9,7 @@ import {
   explainForecast,
   runFutureForecast,
   fetchForecastHistory,
+  fetchDatasets,
   FUTURE_HORIZON_PRESETS,
   FUTURE_SUPPORTED_MODELS,
   DOMAIN_FEATURE_ARTIFACTS,
@@ -146,15 +147,54 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
   const [uploadValidation, setUploadValidation] = useState(null);
   const [uploadProcess, setUploadProcess] = useState(null);
 
+  // Persistent Dataset Registry State
+  const [datasetsList, setDatasetsList] = useState([]);
+  const [selectedDatasetId, setSelectedDatasetId] = useState(null);
+  const [datasetsLoading, setDatasetsLoading] = useState(false);
+  const [datasetsError, setDatasetsError] = useState(null);
+
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyRuns, setHistoryRuns] = useState([]);
   const [historyError, setHistoryError] = useState(null);
   const [exportStatus, setExportStatus] = useState(null);
   const canManageDatasets = ['admin', 'analyst', 'data_scientist'].includes(String(userRole).toLowerCase());
-  // Domain changes invalidate all response data from the former domain.  This
-  // monotonically increasing token also prevents a slower former request from
-  // repainting the dashboard after the user has switched domains.
   const domainRequestToken = useRef(0);
+
+  const loadDatasets = async (targetDomain = domain, autoSelectId = null) => {
+    setDatasetsLoading(true);
+    setDatasetsError(null);
+    try {
+      const res = await fetchDatasets({ domain: targetDomain, accessToken });
+      const list = Array.isArray(res?.datasets) ? res.datasets : [];
+      setDatasetsList(list);
+
+      let nextSelectedId = autoSelectId;
+      if (!nextSelectedId && selectedDatasetId && list.some((d) => d.dataset_id === selectedDatasetId)) {
+        nextSelectedId = selectedDatasetId;
+      }
+      if (!nextSelectedId && list.length > 0) {
+        nextSelectedId = list[0].dataset_id;
+      }
+      setSelectedDatasetId(nextSelectedId || null);
+      return list;
+    } catch (err) {
+      console.error('Failed to load dataset registry:', err);
+      setDatasetsError(err.message || 'Unable to load dataset registry.');
+      setDatasetsList([]);
+      return [];
+    } finally {
+      setDatasetsLoading(false);
+    }
+  };
+
+  const getActiveFeaturesDir = (override) => {
+    if (override !== undefined) return override;
+    const dsObj = datasetsList.find((d) => d.dataset_id === selectedDatasetId);
+    if (dsObj) {
+      return dsObj.features_dir || dsObj.dataset_id;
+    }
+    return customFeaturesDir || undefined;
+  };
 
   const handleExport = (kind, format) => {
     setExportStatus(null);
@@ -200,12 +240,18 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
 
   // Initial forecast on mount
   useEffect(() => {
-    handleRunForecast('random_forest', initialDomain);
-    loadForecastHistory();
+    const init = async () => {
+      const list = await loadDatasets(initialDomain);
+      const defaultDs = list[0];
+      const targetFeaturesDir = defaultDs?.features_dir || defaultDs?.dataset_id;
+      handleRunForecast('random_forest', initialDomain, targetFeaturesDir);
+      loadForecastHistory();
+    };
+    init();
   }, []);
 
   // Clear stale state when domain changes
-  const handleDomainSwitch = (newDomain) => {
+  const handleDomainSwitch = async (newDomain) => {
     if (!['retail', 'electricity'].includes(newDomain)) return;
     domainRequestToken.current += 1;
     const validModel = newDomain === 'retail' && model === 'arima'
@@ -225,12 +271,12 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     setFutureError(null);
     setFutureModel('random_forest');
     setFutureHorizon(FUTURE_HORIZON_PRESETS[newDomain]?.[0] || 7);
-    // A domain-specific uploaded feature artifact must never be used under a
-    // different domain.  The demo artifact is restored until another upload.
-    if (customFeaturesDir && uploadInfo?.domain !== newDomain) {
-      setCustomFeaturesDir(null);
-    }
-    handleRunForecast(validModel, newDomain, uploadInfo?.domain === newDomain ? undefined : DOMAIN_FEATURE_ARTIFACTS[newDomain]);
+    setCustomFeaturesDir(null);
+
+    const list = await loadDatasets(newDomain);
+    const defaultDs = list[0];
+    const targetFeaturesDir = defaultDs?.features_dir || defaultDs?.dataset_id;
+    handleRunForecast(validModel, newDomain, targetFeaturesDir);
   };
 
   // Primary forecast runner
@@ -248,8 +294,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
 
     let actualModel = targetModel;
     let recModel = null;
-    const activeFeaturesDir =
-      featuresDirOverride !== undefined ? featuresDirOverride : (customFeaturesDir || undefined);
+    const activeFeaturesDir = getActiveFeaturesDir(featuresDirOverride);
 
     try {
       // Auto Select workflow
@@ -309,7 +354,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     try {
       const res = await compareModels({
         domain,
-        featuresDir: customFeaturesDir || undefined,
+        featuresDir: getActiveFeaturesDir(),
       });
       if (requestToken === domainRequestToken.current) setCompareData(res);
     } catch (err) {
@@ -329,7 +374,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       const res = await explainForecast({
         domain: expDomain,
         model: expModel,
-        featuresDir: featuresDirOverride !== undefined ? featuresDirOverride : (customFeaturesDir || undefined),
+        featuresDir: getActiveFeaturesDir(featuresDirOverride),
         explanationType: 'global',
         method: 'shap',
       });
@@ -358,7 +403,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         domain,
         model: futureModel,
         horizon: Number(futureHorizon),
-        featuresDir: customFeaturesDir || undefined,
+        featuresDir: getActiveFeaturesDir(),
       });
       if (requestToken !== domainRequestToken.current) return;
       setFutureData(res);
@@ -378,7 +423,9 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     setUploadProcess(null);
     setUploadError(null);
     setUploadFile(null);
-    handleRunForecast(model, domain, DOMAIN_FEATURE_ARTIFACTS[domain]);
+    const demoId = domain === 'retail' ? 'demo_retail' : 'demo_electricity';
+    setSelectedDatasetId(demoId);
+    handleRunForecast(model, domain, demoId);
   };
 
   const handleUploadAndPrepare = async () => {
@@ -429,7 +476,10 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       setCustomFeaturesDir(processed.features_dir);
       setDomain(uploadDomain);
       setFutureHorizon(FUTURE_HORIZON_PRESETS[uploadDomain]?.[0] || 7);
-      await handleRunForecast(model, uploadDomain, processed.features_dir);
+      const list = await loadDatasets(uploadDomain, uploaded.dataset_id);
+      const newDs = list.find((d) => d.dataset_id === uploaded.dataset_id);
+      const targetFDir = newDs?.features_dir || processed.features_dir;
+      await handleRunForecast(model, uploadDomain, targetFDir);
     } catch (err) {
       console.error('Upload pipeline error:', err);
       setUploadError(err.message || 'Dataset upload/processing failed.');
@@ -582,6 +632,45 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             </div>
           </div>
 
+          {/* Dataset Selector */}
+          <div>
+            <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              Dataset {datasetsLoading && '(Loading...)'}
+            </label>
+            <select
+              value={selectedDatasetId || ''}
+              onChange={(e) => {
+                const selectedId = e.target.value;
+                setSelectedDatasetId(selectedId);
+                const dsObj = datasetsList.find((d) => d.dataset_id === selectedId);
+                const fDir = dsObj?.features_dir || dsObj?.dataset_id;
+                handleRunForecast(model, domain, fDir);
+              }}
+              disabled={datasetsLoading || datasetsList.length === 0}
+              style={{
+                width: '100%',
+                background: COLORS.bg.dark,
+                border: `1px solid ${COLORS.bg.border}`,
+                borderRadius: 10,
+                padding: '12px 16px',
+                color: COLORS.text.primary,
+                fontSize: 14,
+                fontWeight: 600,
+                outline: 'none',
+              }}
+            >
+              {datasetsList.length === 0 ? (
+                <option value="">No datasets available</option>
+              ) : (
+                datasetsList.map((d) => (
+                  <option key={d.dataset_id} value={d.dataset_id}>
+                    {d.filename || d.dataset_id} {d.is_demo ? '(Demo)' : '(Uploaded)'}
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
+
           {/* Model Selector */}
           <div>
             <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
@@ -618,7 +707,13 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
           <div style={{ background: COLORS.bg.dark, borderRadius: 10, padding: '12px 16px', border: `1px solid ${COLORS.bg.border}`, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
             <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Dataset & Artifact Status</div>
             <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary, marginTop: 4, fontFamily: "'Space Mono', monospace" }}>
-              {customFeaturesDir ? 'Uploaded Dataset' : `Demo Dataset: ${domain.toUpperCase()}`}
+              {(() => {
+                const activeDs = datasetsList.find((d) => d.dataset_id === selectedDatasetId);
+                if (activeDs) {
+                  return `${activeDs.filename} ${activeDs.is_demo ? '(Demo)' : '(Uploaded)'}`;
+                }
+                return customFeaturesDir ? 'Uploaded Dataset' : `Demo Dataset: ${domain.toUpperCase()}`;
+              })()}
             </div>
             <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <span>Active Model: <span style={{ color: COLORS.primary, fontWeight: 700, textTransform: 'capitalize' }}>{activeModelDisplay}</span></span>

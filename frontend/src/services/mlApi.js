@@ -54,6 +54,19 @@ export async function login({ email, password }) {
   return parseJsonResponse(response);
 }
 
+export async function fetchDatasets({ domain, accessToken } = {}) {
+  const params = new URLSearchParams();
+  if (domain) params.set('domain', domain);
+  const headers = {};
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  const query = params.toString();
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/datasets${query ? `?${query}` : ''}`,
+    { headers },
+  );
+  return parseJsonResponse(response);
+}
+
 export async function uploadDataset({ file, domain, accessToken }) {
   const form = new FormData();
   form.append('file', file);

@@ -110,10 +110,30 @@ def test_list_and_retrieve_owned_dataset(client):
     listing = test_client.get("/api/v1/datasets", headers=headers)
     detail = test_client.get(f"/api/v1/datasets/{dataset_id}?preview_rows=1", headers=headers)
     assert listing.status_code == 200
-    assert listing.get_json()["data"]["total"] == 1
+    # Includes 2 demo datasets plus 1 uploaded dataset
+    assert listing.get_json()["data"]["total"] == 3
     assert detail.status_code == 200
     assert detail.get_json()["data"]["preview"] == [{"timestamp": "2026-01-01", "store_id": "S01", "item_id": "I01", "sales": 420, "promo": 1}]
     assert "file_path" not in detail.get_json()["data"]
+
+
+def test_dataset_registry_demo_and_domain_filtering(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "registry-filter@example.com")
+    upload(test_client, headers, RETAIL_CSV, "my_retail.csv", "retail")
+    upload(test_client, headers, ELECTRICITY_CSV, "my_load.csv", "electricity")
+
+    # Domain filter = retail
+    retail_list = test_client.get("/api/v1/datasets?domain=retail", headers=headers).get_json()["data"]["datasets"]
+    assert len(retail_list) == 2
+    assert any(d["dataset_id"] == "demo_retail" for d in retail_list)
+    assert any(d["filename"] == "my_retail.csv" for d in retail_list)
+
+    # Domain filter = electricity
+    elec_list = test_client.get("/api/v1/datasets?domain=electricity", headers=headers).get_json()["data"]["datasets"]
+    assert len(elec_list) == 2
+    assert any(d["dataset_id"] == "demo_electricity" for d in elec_list)
+    assert any(d["filename"] == "my_load.csv" for d in elec_list)
 
 
 def test_inaccessible_and_nonexistent_dataset_return_not_found(client):
