@@ -87,6 +87,17 @@ export async function getDatasetDetail({ datasetId, accessToken, previewRows = 5
   return parseJsonResponse(response);
 }
 
+export async function profileDataset({ datasetId, domain, target, accessToken } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  const response = await fetch(`${API_BASE_URL}/api/v1/datasets/${datasetId}/profile`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ domain, target }),
+  });
+  return parseJsonResponse(response);
+}
+
 export async function validateDataset({ datasetId, domain, accessToken }) {
   const response = await fetch(`${API_BASE_URL}/api/v1/datasets/${datasetId}/validate`, {
     method: 'POST',

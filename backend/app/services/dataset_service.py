@@ -22,10 +22,11 @@ from ..models import Dataset, DatasetPreprocessing, DatasetValidation
 from .client_error_sanitize import sanitize_client_error_message
 
 
-ALLOWED_EXTENSIONS = {"csv", "xlsx"}
+ALLOWED_EXTENSIONS = {"csv", "xlsx", "parquet"}
 ALLOWED_MIMETYPES = {
     "csv": {"text/csv", "application/csv", "text/plain"},
     "xlsx": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+    "parquet": {"application/x-parquet", "application/octet-stream", "application/vnd.apache.parquet"},
 }
 ALLOWED_DOMAINS = {"retail", "electricity"}
 
@@ -100,6 +101,9 @@ def _read_dataset(path: Path, extension: str, *, preview_rows: int | None = None
     try:
         if extension == "csv":
             return pd.read_csv(path, nrows=preview_rows)
+        elif extension == "parquet":
+            df = pd.read_parquet(path)
+            return df.head(preview_rows) if preview_rows else df
         return pd.read_excel(path, nrows=preview_rows)
     except (OSError, ValueError, UnicodeDecodeError, zipfile.BadZipFile, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
         raise DatasetError("Dataset file is empty or could not be read", 400) from exc
@@ -113,7 +117,7 @@ def _validate_upload(file: FileStorage | None, domain: str | None) -> tuple[str,
         raise DatasetError("A filename is required", errors={"file": ["Filename must not be empty."]})
     extension = _extension(filename)
     if extension not in ALLOWED_EXTENSIONS:
-        raise DatasetError("Unsupported file format", 415, {"file": ["Only .csv and .xlsx files are supported."]})
+        raise DatasetError("Unsupported file format", 415, {"file": ["Only .csv, .xlsx, and .parquet files are supported."]})
     if file.mimetype and file.mimetype not in ALLOWED_MIMETYPES[extension]:
         raise DatasetError("Invalid file content type", 415)
     normalized_domain = (domain or "").strip().lower()
@@ -451,3 +455,32 @@ def list_item(dataset: Dataset) -> dict:
         "features_ready": features_ready,
         "features_dir": features_dir,
     }
+
+
+def profile_dataset_service(dataset: Dataset | dict, domain: str | None = None, requested_target: str | None = None) -> dict:
+    from ml_engine.preprocessing.intelligence import profile_dataset
+
+    if isinstance(dataset, dict):
+        demo_domain = domain or dataset.get("domain", "retail")
+        features_dir_rel = dataset.get("features_dir")
+        if not features_dir_rel:
+            raise DatasetError("Dataset feature path is unavailable", 404)
+        project_root = Path(__file__).resolve().parents[3]
+        train_path = (project_root / features_dir_rel / "train.parquet").resolve()
+        if not train_path.exists():
+            raise DatasetError("Demo dataset artifact file is unavailable", 404)
+        frame = pd.read_parquet(train_path)
+        profile = profile_dataset(frame, domain=demo_domain, requested_target=requested_target)
+        profile["dataset_id"] = dataset["dataset_id"]
+        profile["filename"] = dataset["filename"]
+        profile["is_demo"] = True
+        return profile
+
+    effective_domain = domain or dataset.domain
+    path = managed_upload_path(dataset)
+    frame = _read_dataset(path, _extension(dataset.filename))
+    profile = profile_dataset(frame, domain=effective_domain, requested_target=requested_target)
+    profile["dataset_id"] = dataset.dataset_id
+    profile["filename"] = dataset.filename
+    profile["is_demo"] = False
+    return profile

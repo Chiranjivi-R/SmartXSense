@@ -12,6 +12,7 @@ from ...services.dataset_service import (
     list_datasets,
     list_item,
     owned_dataset,
+    profile_dataset_service,
     upload_dataset,
     upload_response,
     validate_dataset,
@@ -130,5 +131,28 @@ def preprocess(dataset_id: str):
             "message": "Preprocessing and feature engineering completed",
             "data": result,
         })
+    except DatasetError as error:
+        return _error_response(error)
+
+
+@datasets_bp.route("/<dataset_id>/profile", methods=["GET", "POST"])
+@jwt_required(optional=True)
+def profile(dataset_id: str):
+    try:
+        user_id = None
+        identity = get_jwt_identity()
+        if identity:
+            try:
+                user_id = current_user(identity).user_id
+            except AuthError:
+                pass
+
+        dataset = owned_dataset(dataset_id, user_id or "demo_user")
+        body = request.get_json(silent=True) if request.method == "POST" else {}
+        domain = request.args.get("domain") or (body.get("domain") if isinstance(body, dict) else None)
+        target = request.args.get("target") or (body.get("target") if isinstance(body, dict) else None)
+
+        result = profile_dataset_service(dataset, domain=domain, requested_target=target)
+        return jsonify({"status": "success", "code": 200, "data": result})
     except DatasetError as error:
         return _error_response(error)

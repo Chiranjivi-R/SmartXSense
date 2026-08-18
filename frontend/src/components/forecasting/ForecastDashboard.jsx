@@ -10,6 +10,7 @@ import {
   runFutureForecast,
   fetchForecastHistory,
   fetchDatasets,
+  profileDataset,
   FUTURE_HORIZON_PRESETS,
   FUTURE_SUPPORTED_MODELS,
   DOMAIN_FEATURE_ARTIFACTS,
@@ -153,6 +154,12 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
   const [datasetsLoading, setDatasetsLoading] = useState(false);
   const [datasetsError, setDatasetsError] = useState(null);
 
+  // Dataset Intelligence Profile State
+  const [datasetProfile, setDatasetProfile] = useState(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState(null);
+  const [selectedTargetOverride, setSelectedTargetOverride] = useState(null);
+
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyRuns, setHistoryRuns] = useState([]);
   const [historyError, setHistoryError] = useState(null);
@@ -176,6 +183,9 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         nextSelectedId = list[0].dataset_id;
       }
       setSelectedDatasetId(nextSelectedId || null);
+      if (nextSelectedId) {
+        loadDatasetProfile(nextSelectedId, targetDomain);
+      }
       return list;
     } catch (err) {
       console.error('Failed to load dataset registry:', err);
@@ -184,6 +194,33 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       return [];
     } finally {
       setDatasetsLoading(false);
+    }
+  };
+
+  const loadDatasetProfile = async (dsId = selectedDatasetId, targetDomain = domain, targetOverride = null) => {
+    if (!dsId) {
+      setDatasetProfile(null);
+      return;
+    }
+    setProfileLoading(true);
+    setProfileError(null);
+    try {
+      const res = await profileDataset({
+        datasetId: dsId,
+        domain: targetDomain,
+        target: targetOverride,
+        accessToken,
+      });
+      setDatasetProfile(res);
+      if (res?.selected_target && !targetOverride) {
+        setSelectedTargetOverride(res.selected_target);
+      }
+    } catch (err) {
+      console.error('Dataset profile error:', err);
+      setProfileError(err.message || 'Unable to profile dataset schema.');
+      setDatasetProfile(null);
+    } finally {
+      setProfileLoading(false);
     }
   };
 
@@ -725,6 +762,171 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             </div>
           </div>
         </div>
+
+        {/* Dataset Intelligence Profile Card */}
+        {selectedDatasetId && (
+          <div
+            style={{
+              background: COLORS.bg.dark,
+              border: `1px solid ${COLORS.bg.border}`,
+              borderRadius: 12,
+              padding: 16,
+              marginTop: 4,
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontSize: 18 }}>🧠</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary }}>Dataset Intelligence</span>
+                <span style={{ fontSize: 12, color: COLORS.text.muted }}>Automated schema inspection & suitability score</span>
+              </div>
+              {datasetProfile && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 12, color: COLORS.text.secondary }}>Domain Fit:</span>
+                  <span
+                    style={{
+                      background:
+                        datasetProfile.confidence_label === 'High'
+                          ? `${COLORS.success}22`
+                          : datasetProfile.confidence_label === 'Medium'
+                          ? `${COLORS.warning}22`
+                          : `${COLORS.accent}22`,
+                      color:
+                        datasetProfile.confidence_label === 'High'
+                          ? COLORS.success
+                          : datasetProfile.confidence_label === 'Medium'
+                          ? COLORS.warning
+                          : COLORS.accent,
+                      border: `1px solid ${
+                        datasetProfile.confidence_label === 'High'
+                          ? COLORS.success
+                          : datasetProfile.confidence_label === 'Medium'
+                          ? COLORS.warning
+                          : COLORS.accent
+                      }44`,
+                      borderRadius: 6,
+                      padding: '2px 8px',
+                      fontSize: 11,
+                      fontWeight: 700,
+                      textTransform: 'uppercase',
+                    }}
+                  >
+                    {domain} — {datasetProfile.confidence_label} ({Math.round(datasetProfile.confidence * 100)}%)
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {profileLoading ? (
+              <div style={{ fontSize: 13, color: COLORS.text.muted, padding: '8px 0' }}>
+                Analyzing dataset schema and profiling features...
+              </div>
+            ) : profileError ? (
+              <div style={{ fontSize: 13, color: COLORS.accent, padding: '6px 0' }}>{profileError}</div>
+            ) : datasetProfile ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {/* Metrics Grid */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10 }}>
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Rows & Columns</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.text.primary, marginTop: 2 }}>
+                      {formatNumber(datasetProfile.row_count, 0)} rows × {datasetProfile.column_count} cols
+                    </div>
+                  </div>
+
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Detected Date Column</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.primary, marginTop: 2 }}>
+                      📅 {datasetProfile.time_column || 'None Detected'}
+                    </div>
+                  </div>
+
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Target Column</div>
+                    {datasetProfile.target_candidates && datasetProfile.target_candidates.length > 1 ? (
+                      <select
+                        value={selectedTargetOverride || datasetProfile.selected_target || ''}
+                        onChange={(e) => {
+                          const target = e.target.value;
+                          setSelectedTargetOverride(target);
+                          loadDatasetProfile(selectedDatasetId, domain, target);
+                        }}
+                        style={{
+                          width: '100%',
+                          background: COLORS.bg.dark,
+                          border: `1px solid ${COLORS.primary}`,
+                          color: COLORS.success,
+                          fontWeight: 700,
+                          fontSize: 12,
+                          borderRadius: 6,
+                          padding: '2px 4px',
+                          marginTop: 2,
+                          outline: 'none',
+                        }}
+                      >
+                        {datasetProfile.target_candidates.map((t) => (
+                          <option key={t} value={t}>
+                            🎯 {t}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.success, marginTop: 2 }}>
+                        🎯 {datasetProfile.selected_target || 'None Detected'}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Feature Classifications */}
+                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12 }}>
+                  {datasetProfile.numeric_columns?.length > 0 && (
+                    <div>
+                      <span style={{ color: COLORS.text.muted }}>Numerical: </span>
+                      <span style={{ color: COLORS.text.primary, fontWeight: 600 }}>
+                        {datasetProfile.numeric_columns.join(', ')}
+                      </span>
+                    </div>
+                  )}
+                  {datasetProfile.categorical_columns?.length > 0 && (
+                    <div>
+                      <span style={{ color: COLORS.text.muted }}>Categorical: </span>
+                      <span style={{ color: COLORS.text.primary, fontWeight: 600 }}>
+                        {datasetProfile.categorical_columns.join(', ')}
+                      </span>
+                    </div>
+                  )}
+                  {datasetProfile.geographic_columns?.length > 0 && (
+                    <div>
+                      <span style={{ color: COLORS.text.muted }}>Geographic: </span>
+                      <span style={{ color: COLORS.warning, fontWeight: 700 }}>
+                        🌍 {datasetProfile.geographic_columns.join(', ')}
+                      </span>
+                    </div>
+                  )}
+                  {datasetProfile.ignored_columns?.length > 0 && (
+                    <div>
+                      <span style={{ color: COLORS.text.muted }}>Ignored: </span>
+                      <span style={{ color: COLORS.accent, fontWeight: 600 }}>
+                        🚫 {datasetProfile.ignored_columns.join(', ')}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Explanation */}
+                <div style={{ background: COLORS.bg.card, borderRadius: 8, padding: 10, border: `1px solid ${COLORS.bg.border}`, fontSize: 12, color: COLORS.text.secondary, lineHeight: 1.4 }}>
+                  {datasetProfile.explanation}
+                  {datasetProfile.issues && datasetProfile.issues.length > 0 && (
+                    <div style={{ marginTop: 4, color: COLORS.accent, fontWeight: 600 }}>
+                      ⚠️ Issues: {datasetProfile.issues.join(' | ')}
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        )}
 
         {/* Dataset Upload (optional — demo datasets remain default) */}
         {canManageDatasets && <div style={{ marginTop: 4, background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 12, padding: 16 }}>

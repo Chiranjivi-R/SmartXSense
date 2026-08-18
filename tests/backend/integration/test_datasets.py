@@ -136,6 +136,37 @@ def test_dataset_registry_demo_and_domain_filtering(client):
     assert any(d["filename"] == "my_load.csv" for d in elec_list)
 
 
+RETAIL_MULTI_CSV = (
+    b"timestamp,store_id,item_id,sales,promo\n"
+    + b"\n".join([f"2026-01-{i:02d},S01,I01,{400 + i * 10},{i % 2}".encode() for i in range(1, 13)])
+)
+
+
+def test_dataset_profiling_endpoint(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "profile-test@example.com")
+    dataset_id = upload(test_client, headers, RETAIL_MULTI_CSV, "my_retail.csv", "retail").get_json()["data"]["dataset_id"]
+
+    res = test_client.post(f"/api/v1/datasets/{dataset_id}/profile", headers=headers, json={"domain": "retail"})
+    assert res.status_code == 200
+    data = res.get_json()["data"]
+    assert data["dataset_id"] == dataset_id
+    assert data["suitable"] is True
+    assert data["time_column"] == "timestamp"
+    assert data["selected_target"] == "sales"
+    assert "promo" in data["numeric_columns"]
+
+
+def test_demo_dataset_profiling(client):
+    test_client, _ = client
+    res = test_client.get("/api/v1/datasets/demo_retail/profile?domain=retail")
+    assert res.status_code == 200
+    data = res.get_json()["data"]
+    assert data["dataset_id"] == "demo_retail"
+    assert data["suitable"] is True
+    assert data["is_demo"] is True
+
+
 def test_inaccessible_and_nonexistent_dataset_return_not_found(client):
     test_client, _ = client
     owner_headers = auth_header(test_client, "owner@example.com")
