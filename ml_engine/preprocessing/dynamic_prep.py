@@ -12,6 +12,7 @@ import pandas as pd
 from ml_engine.features.artifacts import materialize_forecasting_features
 from ml_engine.preprocessing.domain import preprocess_frame
 from ml_engine.preprocessing.intelligence import (
+    _is_no_filter_val,
     aggregate_duplicate_timestamps,
     analyze_forecasting_suitability,
     clean_and_impute_missing_values,
@@ -21,9 +22,6 @@ from ml_engine.preprocessing.intelligence import (
     detect_time_column,
     get_geographic_hierarchy,
 )
-
-
-
 
 
 from ml_engine.splitting.time_series import TimeSeriesSplitError
@@ -51,30 +49,34 @@ def filter_df_by_geography(
     - If location does not exist in the dataset, raises 400 error.
     - If 0 rows remain after filtering, raises 400 error.
     """
-    clean_loc = str(location).strip() if location is not None and str(location).strip() and str(location).strip().lower() not in ("all", "all geographies", "none", "null") else None
+    clean_loc = str(location).strip() if not _is_no_filter_val(location) else None
 
-    # If neither location nor active geo_filters are provided, return unfiltered
-    has_active_filters = False
+    # Check if geo_filters has any non-placeholder values
+    valid_filters: dict[str, str] = {}
     if geo_filters and isinstance(geo_filters, dict):
-        has_active_filters = any(bool(str(v).strip()) for v in geo_filters.values() if v is not None)
+        for k, v in geo_filters.items():
+            if not _is_no_filter_val(v):
+                valid_filters[k] = str(v).strip()
 
-    if not clean_loc and not has_active_filters:
+    if not clean_loc and not valid_filters:
         return df, "All Geographies"
 
-    geo_meta = get_geographic_hierarchy(df, geo_filters if has_active_filters else None)
+    geo_meta = get_geographic_hierarchy(df)
     if not geo_meta["has_geography"]:
         raise DynamicPrepError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", 400)
 
+    all_geo_cols = detect_geographic_columns(df)
     col_map = geo_meta["geographic_columns"]
     filtered = df
 
-    # Case 1: Direct location string provided
-    if clean_loc:
-        loc_lower = clean_loc.lower()
+    # Case 1: Direct location string provided (or present in valid_filters)
+    target_loc = clean_loc or valid_filters.get("location")
+    if target_loc:
+        loc_lower = str(target_loc).strip().lower()
         matched_col = None
         
-        # Check hierarchy columns first
-        for col_name in list(col_map.values()) + [c for c in df.columns if c in detect_geographic_columns(df)]:
+        # Check all detected geographic columns
+        for col_name in list(col_map.values()) + [c for c in all_geo_cols if c in df.columns]:
             if col_name in df.columns:
                 unique_vals = [str(v).strip().lower() for v in df[col_name].dropna().unique()]
                 if loc_lower in unique_vals:
@@ -84,31 +86,38 @@ def filter_df_by_geography(
         if not matched_col:
             avail = geo_meta.get("available_locations", [])[:8]
             hint = f" Available locations: {', '.join(avail)}" if avail else ""
-            raise DynamicPrepError(f"Selected location '{clean_loc}' does not exist in dataset.{hint}", 400)
+            raise DynamicPrepError(f"Selected location '{target_loc}' does not exist in dataset.{hint}", 400)
 
         filtered = df[df[matched_col].astype(str).str.strip().str.lower() == loc_lower]
         if len(filtered) == 0:
-            raise DynamicPrepError(f"0 rows selected for location '{clean_loc}'.", 400)
-        return filtered, clean_loc
+            raise DynamicPrepError(f"0 rows selected for location '{target_loc}'.", 400)
+        return filtered, str(target_loc).strip()
 
-    # Case 2: Cascading geo_filters provided
+    # Case 2: Cascading valid_filters provided
     applied_labels: list[str] = []
-    for level in ["location", "city", "district", "region", "state", "country"]:
-        val = geo_filters.get(level)
-        col = col_map.get(level)
-        if val and col and col in filtered.columns:
-            val_str = str(val).strip()
-            unique_vals = [str(v).strip().lower() for v in filtered[col].dropna().unique()]
-            if val_str.lower() not in unique_vals:
-                raise DynamicPrepError(f"0 rows selected: Selected {level} '{val_str}' does not exist in dataset column '{col}'.", 400)
-            filtered = filtered[filtered[col].astype(str).str.strip().str.lower() == val_str.lower()]
-            applied_labels.append(val_str)
+    level_order = ["location", "city", "district", "region", "state", "country"]
+    for k in valid_filters.keys():
+        if k not in level_order:
+            level_order.append(k)
+
+    for level in level_order:
+        if level in valid_filters:
+            val_str = valid_filters[level]
+            col = col_map.get(level) or (level if level in filtered.columns else None)
+            if col and col in filtered.columns:
+                unique_vals = [str(v).strip().lower() for v in filtered[col].dropna().unique()]
+                if val_str.lower() not in unique_vals:
+                    raise DynamicPrepError(f"0 rows selected: Selected {level} '{val_str}' does not exist in dataset column '{col}'.", 400)
+                filtered = filtered[filtered[col].astype(str).str.strip().str.lower() == val_str.lower()]
+                applied_labels.append(val_str)
 
     geo_label = ", ".join(applied_labels) if applied_labels else "All Geographies"
     if len(filtered) == 0:
         raise DynamicPrepError(f"0 rows selected for location scope '{geo_label}'. Select a broader location.", 400)
 
     return filtered, geo_label
+
+
 
 
 

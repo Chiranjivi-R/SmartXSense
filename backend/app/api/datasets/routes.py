@@ -173,14 +173,18 @@ def geography(dataset_id: str):
 
         dataset = owned_dataset(dataset_id, user_id or "demo_user")
         body = request.get_json(silent=True) if request.method == "POST" else {}
+        if not isinstance(body, dict):
+            body = {}
 
+        nested_geo = body.get("geo_filters") if isinstance(body.get("geo_filters"), dict) else {}
         geo_filters = {
-            "country": request.args.get("country") or (body.get("country") if isinstance(body, dict) else None),
-            "state": request.args.get("state") or (body.get("state") if isinstance(body, dict) else None),
-            "district": request.args.get("district") or (body.get("district") if isinstance(body, dict) else None),
-            "region": request.args.get("region") or (body.get("region") if isinstance(body, dict) else None),
-            "city": request.args.get("city") or (body.get("city") if isinstance(body, dict) else None),
-            "location": request.args.get("location") or (body.get("location") if isinstance(body, dict) else None),
+            "country": request.args.get("country") or body.get("country") or nested_geo.get("country"),
+            "state": request.args.get("state") or body.get("state") or nested_geo.get("state"),
+            "district": request.args.get("district") or body.get("district") or nested_geo.get("district"),
+            "region": request.args.get("region") or body.get("region") or nested_geo.get("region"),
+            "city": request.args.get("city") or body.get("city") or nested_geo.get("city"),
+            "city_tier": request.args.get("city_tier") or body.get("city_tier") or nested_geo.get("city_tier"),
+            "location": request.args.get("location") or body.get("location") or nested_geo.get("location"),
         }
 
         result = get_dataset_geography_service(dataset, geo_filters=geo_filters)

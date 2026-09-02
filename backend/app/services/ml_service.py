@@ -352,6 +352,7 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
     """Resolve features directory and construct dataset context (supporting demo, pre-built dirs, and custom uploads)."""
     import hashlib
     import pandas as pd
+    from ml_engine.preprocessing.intelligence import _is_no_filter_val, get_geographic_hierarchy
     from ml_engine.preprocessing.dynamic_prep import DynamicPrepError, prepare_dynamic_dataset
     from .dataset_service import DatasetError, managed_upload_path, _read_dataset, _extension, owned_dataset
 
@@ -366,15 +367,47 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
 
     # Case 1: Demo Datasets
     if raw_key in ("demo_retail", "demo_electricity") or raw_key in DEMO_FEATURE_DIRS:
-        # Check if location filtering is requested on static demo dataset
-        clean_loc = str(location).strip() if location and str(location).strip().lower() not in ("all", "all geographies", "none", "null") else None
-        has_active_geo = bool(geo_filters and isinstance(geo_filters, dict) and any(bool(str(v).strip()) for v in geo_filters.values() if v is not None))
-        if clean_loc or has_active_geo:
-            raise MLError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", code=400)
+        clean_loc = str(location).strip() if not _is_no_filter_val(location) else None
+        valid_filters: dict[str, str] = {}
+        if geo_filters and isinstance(geo_filters, dict):
+            for k, v in geo_filters.items():
+                if not _is_no_filter_val(v):
+                    valid_filters[k] = str(v).strip()
 
         resolved_dir = validate_features_directory(raw_key)
         train_p = resolved_dir / "train.parquet"
         train_df = pd.read_parquet(train_p) if train_p.exists() else pd.DataFrame()
+
+        if clean_loc or valid_filters:
+            geo_meta = get_geographic_hierarchy(train_df) if not train_df.empty else {"has_geography": False}
+            if not geo_meta.get("has_geography"):
+                raise MLError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", code=400)
+
+            try:
+                prep_res = prepare_dynamic_dataset(
+                    train_df,
+                    domain=domain,
+                    target=target,
+                    location=clean_loc,
+                    geo_filters=valid_filters if valid_filters else None,
+                )
+            except DynamicPrepError as err:
+                raise MLError(err.message, code=err.code) from err
+
+            dyn_dir = validate_features_directory(prep_res["features_dir"])
+            ctx = {
+                "dataset_id": raw_key if raw_key in ("demo_retail", "demo_electricity") else f"demo_{domain}",
+                "dataset_name": "Retail Sales Demo" if domain == "retail" else "Electricity Load Demo",
+                "dataset_hash": prep_res["fingerprint"][:12],
+                "target": prep_res["target"],
+                "location": prep_res["geography_label"],
+                "geography_label": prep_res["geography_label"],
+                "rows_used": prep_res["rows_used"],
+                "fingerprint": prep_res["fingerprint"],
+            }
+            return dyn_dir, ctx
+
+
         det_target = target or ("sales" if domain == "retail" or "sales" in train_df.columns else "demand_mw")
         ctx = {
             "dataset_id": raw_key if raw_key in ("demo_retail", "demo_electricity") else f"demo_{domain}",
@@ -407,7 +440,7 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
                         num_cols = [c for c in train_df.select_dtypes(include="number").columns if c != "timestamp"]
                         det_target = num_cols[0] if num_cols else train_df.columns[-1]
 
-                loc_label = str(location).strip() if location and str(location).strip().lower() not in ("all", "all geographies", "none", "null") else "All Geographies"
+                loc_label = str(location).strip() if not _is_no_filter_val(location) else "All Geographies"
                 ctx = {
                     "dataset_id": dataset_id or resolved_dir.name,
                     "dataset_name": dataset_id or resolved_dir.name,
@@ -432,13 +465,41 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
         ds_obj = owned_dataset(lookup_key)
         if isinstance(ds_obj, dict):
             # Demo fallback dict returned by owned_dataset
-            clean_loc = str(location).strip() if location and str(location).strip().lower() not in ("all", "all geographies", "none", "null") else None
-            has_active_geo = bool(geo_filters and isinstance(geo_filters, dict) and any(bool(str(v).strip()) for v in geo_filters.values() if v is not None))
-            if clean_loc or has_active_geo:
-                raise MLError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", code=400)
+            clean_loc = str(location).strip() if not _is_no_filter_val(location) else None
+            valid_filters = {}
+            if geo_filters and isinstance(geo_filters, dict):
+                for k, v in geo_filters.items():
+                    if not _is_no_filter_val(v):
+                        valid_filters[k] = str(v).strip()
 
             resolved_dir = validate_features_directory(f"demo_{domain}")
-            train_df = pd.read_parquet(resolved_dir / "train.parquet")
+            train_df = pd.read_parquet(resolved_dir / "train.parquet") if (resolved_dir / "train.parquet").exists() else pd.DataFrame()
+
+            if clean_loc or valid_filters:
+                geo_meta = get_geographic_hierarchy(train_df) if not train_df.empty else {"has_geography": False}
+                if not geo_meta.get("has_geography"):
+                    raise MLError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", code=400)
+
+                prep_res = prepare_dynamic_dataset(
+                    train_df,
+                    domain=domain,
+                    target=target,
+                    location=clean_loc,
+                    geo_filters=valid_filters if valid_filters else None,
+                )
+                dyn_dir = validate_features_directory(prep_res["features_dir"])
+                ctx = {
+                    "dataset_id": ds_obj.get("dataset_id", lookup_key),
+                    "dataset_name": ds_obj.get("filename", "Demo Dataset"),
+                    "dataset_hash": prep_res["fingerprint"][:12],
+                    "target": prep_res["target"],
+                    "location": prep_res["geography_label"],
+                    "geography_label": prep_res["geography_label"],
+                    "rows_used": prep_res["rows_used"],
+                    "fingerprint": prep_res["fingerprint"],
+                }
+                return dyn_dir, ctx
+
             ctx = {
                 "dataset_id": ds_obj.get("dataset_id", lookup_key),
                 "dataset_name": ds_obj.get("filename", "Demo Dataset"),
@@ -460,12 +521,24 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
                 content_h = hashlib.sha256(path.read_bytes()).hexdigest()
             dataset_hash = (content_h or ds_obj.dataset_id)[:12]
 
+            clean_loc = str(location).strip() if not _is_no_filter_val(location) else None
+            valid_filters = {}
+            if geo_filters and isinstance(geo_filters, dict):
+                for k, v in geo_filters.items():
+                    if not _is_no_filter_val(v):
+                        valid_filters[k] = str(v).strip()
+
+            if clean_loc or valid_filters:
+                geo_meta = get_geographic_hierarchy(frame)
+                if not geo_meta.get("has_geography"):
+                    raise MLError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", code=400)
+
             prep_res = prepare_dynamic_dataset(
                 frame,
                 domain=domain,
                 target=target,
-                geo_filters=geo_filters,
-                location=location,
+                geo_filters=valid_filters if valid_filters else None,
+                location=clean_loc,
             )
             resolved_dir = validate_features_directory(prep_res["features_dir"])
             ctx = {
@@ -479,6 +552,7 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
                 "fingerprint": prep_res["fingerprint"],
             }
             return resolved_dir, ctx
+
     except DatasetError as err:
         raise MLError(err.message, code=err.code) from err
     except DynamicPrepError as err:

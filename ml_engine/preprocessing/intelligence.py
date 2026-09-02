@@ -837,6 +837,34 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
             col_map["state"] = str(col)
         elif clean in {"district", "county", "district_name"} and "district" not in col_map:
             col_map["district"] = str(col)
+def _is_no_filter_val(val: Any) -> bool:
+    """Return True if the filter value represents an unselected / 'All' placeholder."""
+    if val is None:
+        return True
+    s = str(val).strip()
+    if not s:
+        return True
+    s_low = s.lower()
+    if s_low in ("none", "null", "nan", "all", "all data", "all geographies", "all_data", "all_geographies", "undefined"):
+        return True
+    if s_low.startswith("all ") or s_low.startswith("all_"):
+        return True
+    return False
+
+
+def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Inspect dataset geographic columns and return available cascading options, locations list, and row counts."""
+    filters = active_filters or {}
+    all_geo_cols = detect_geographic_columns(df)
+    col_map: dict[str, str] = {}
+    for col in df.columns:
+        clean = _clean_name(col)
+        if clean in {"country", "country_name", "nation"} and "country" not in col_map:
+            col_map["country"] = str(col)
+        elif clean in {"state", "province", "state_name"} and "state" not in col_map:
+            col_map["state"] = str(col)
+        elif clean in {"district", "county", "district_name"} and "district" not in col_map:
+            col_map["district"] = str(col)
         elif clean in {"region", "territory", "zone"} and "region" not in col_map:
             col_map["region"] = str(col)
         elif clean in {"city", "town", "city_name"} and "city" not in col_map:
@@ -844,8 +872,6 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
         elif clean in {"location", "place", "area", "site", "branch", "store_location", "market"} and "location" not in col_map:
             col_map["location"] = str(col)
 
-    # If no specific mapping but geographic columns exist, map first found to location
-    all_geo_cols = detect_geographic_columns(df)
     for g_col in all_geo_cols:
         if g_col not in col_map.values():
             clean = _clean_name(g_col)
@@ -857,10 +883,19 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
                 col_map["district"] = g_col
             elif "region" not in col_map and any(k in clean for k in ("region", "zone")):
                 col_map["region"] = g_col
-            elif "location" not in col_map:
-                col_map["location"] = g_col
+            else:
+                col_map[clean] = g_col
 
-    has_geo = len(col_map) > 0
+    # Compile all unique available individual location values from unfiltered dataset
+    all_locs = set()
+    for col_name in list(col_map.values()) + [c for c in all_geo_cols if c in df.columns]:
+        if col_name in df.columns:
+            for val in df[col_name].dropna().unique():
+                val_str = str(val).strip()
+                if val_str and not _is_no_filter_val(val_str):
+                    all_locs.add(val_str)
+
+    has_geo = len(all_locs) > 0
 
     if not has_geo:
         return {
@@ -877,49 +912,41 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
 
     # Sequential cascading filter
     filtered = df
-    if "country" in col_map and filters.get("country"):
-        c_val = str(filters["country"]).strip()
-        filtered = filtered[filtered[col_map["country"]].astype(str).str.strip().str.lower() == c_val.lower()]
 
-    if "state" in col_map and filters.get("state"):
-        s_val = str(filters["state"]).strip()
-        filtered = filtered[filtered[col_map["state"]].astype(str).str.strip().str.lower() == s_val.lower()]
+    # Direct location matching: if location is given, dynamically find which column contains it
+    loc_val = filters.get("location")
+    if not _is_no_filter_val(loc_val):
+        loc_str = str(loc_val).strip()
+        loc_lower = loc_str.lower()
+        matched_col = None
+        for col_name in list(col_map.values()) + [c for c in all_geo_cols if c in df.columns]:
+            if col_name in df.columns:
+                unique_vals = [str(v).strip().lower() for v in df[col_name].dropna().unique()]
+                if loc_lower in unique_vals:
+                    matched_col = col_name
+                    break
+        if matched_col:
+            filtered = filtered[filtered[matched_col].astype(str).str.strip().str.lower() == loc_lower]
+        else:
+            filtered = filtered.iloc[0:0]
 
-    if "district" in col_map and filters.get("district"):
-        d_val = str(filters["district"]).strip()
-        filtered = filtered[filtered[col_map["district"]].astype(str).str.strip().str.lower() == d_val.lower()]
+    # Specific hierarchy level filters
+    for level_key, col_name in col_map.items():
+        if level_key != "location" and col_name in filtered.columns:
+            f_val = filters.get(level_key) or filters.get(col_name)
+            if not _is_no_filter_val(f_val):
+                filtered = filtered[filtered[col_name].astype(str).str.strip().str.lower() == str(f_val).strip().lower()]
 
-    if "region" in col_map and filters.get("region"):
-        r_val = str(filters["region"]).strip()
-        filtered = filtered[filtered[col_map["region"]].astype(str).str.strip().str.lower() == r_val.lower()]
-
-    if "city" in col_map and filters.get("city"):
-        ci_val = str(filters["city"]).strip()
-        filtered = filtered[filtered[col_map["city"]].astype(str).str.strip().str.lower() == ci_val.lower()]
-
-    if "location" in col_map and filters.get("location"):
-        loc_val = str(filters["location"]).strip()
-        filtered = filtered[filtered[col_map["location"]].astype(str).str.strip().str.lower() == loc_val.lower()]
-
-    countries = sorted([str(v) for v in df[col_map["country"]].dropna().unique() if str(v).strip()]) if "country" in col_map else []
-    states = sorted([str(v) for v in filtered[col_map["state"]].dropna().unique() if str(v).strip()]) if "state" in col_map else []
-    districts = sorted([str(v) for v in filtered[col_map["district"]].dropna().unique() if str(v).strip()]) if "district" in col_map else []
-    regions = sorted([str(v) for v in filtered[col_map["region"]].dropna().unique() if str(v).strip()]) if "region" in col_map else []
-    cities = sorted([str(v) for v in filtered[col_map["city"]].dropna().unique() if str(v).strip()]) if "city" in col_map else []
-    locations = sorted([str(v) for v in filtered[col_map["location"]].dropna().unique() if str(v).strip()]) if "location" in col_map else []
-
-    # Compile all unique available individual location values from unfiltered dataset
-    all_locs = set()
-    for col_name in col_map.values():
-        if col_name in df.columns:
-            for val in df[col_name].dropna().unique():
-                val_str = str(val).strip()
-                if val_str and val_str.lower() not in ("none", "null", "nan"):
-                    all_locs.add(val_str)
+    countries = sorted([str(v) for v in df[col_map["country"]].dropna().unique() if str(v).strip() and not _is_no_filter_val(v)]) if "country" in col_map and col_map["country"] in df.columns else []
+    states = sorted([str(v) for v in filtered[col_map["state"]].dropna().unique() if str(v).strip() and not _is_no_filter_val(v)]) if "state" in col_map and col_map["state"] in filtered.columns else []
+    districts = sorted([str(v) for v in filtered[col_map["district"]].dropna().unique() if str(v).strip() and not _is_no_filter_val(v)]) if "district" in col_map and col_map["district"] in filtered.columns else []
+    regions = sorted([str(v) for v in filtered[col_map["region"]].dropna().unique() if str(v).strip() and not _is_no_filter_val(v)]) if "region" in col_map and col_map["region"] in filtered.columns else []
+    cities = sorted([str(v) for v in filtered[col_map["city"]].dropna().unique() if str(v).strip() and not _is_no_filter_val(v)]) if "city" in col_map and col_map["city"] in filtered.columns else []
+    locations = sorted([str(v) for v in filtered[col_map["location"]].dropna().unique() if str(v).strip() and not _is_no_filter_val(v)]) if "location" in col_map and col_map["location"] in filtered.columns else []
 
     # Dynamic structured hierarchy levels for UI rendering
     hierarchy_levels = []
-    level_order = ["country", "state", "district", "region", "city", "location"]
+    level_order = ["country", "state", "district", "region", "city"]
     for g_key in col_map.keys():
         if g_key not in level_order:
             level_order.append(g_key)
@@ -928,7 +955,7 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
         if l_key in col_map and col_map[l_key] in df.columns:
             col_name = col_map[l_key]
             source_df = df if l_key == "country" else filtered
-            col_vals = sorted([str(v) for v in source_df[col_name].dropna().unique() if str(v).strip() and str(v).strip().lower() not in ("none", "null", "nan")])
+            col_vals = sorted([str(v) for v in source_df[col_name].dropna().unique() if str(v).strip() and not _is_no_filter_val(v)])
             hierarchy_levels.append({
                 "level_key": l_key,
                 "column_name": col_name,
@@ -950,16 +977,10 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
             "locations": locations,
         },
         "available_locations": sorted(list(all_locs)),
-        "active_filters": {
-            "country": filters.get("country"),
-            "state": filters.get("state"),
-            "district": filters.get("district"),
-            "region": filters.get("region"),
-            "city": filters.get("city"),
-            "location": filters.get("location"),
-        },
+        "active_filters": filters,
         "filtered_rows": len(filtered),
         "total_rows": len(df),
     }
+
 
 

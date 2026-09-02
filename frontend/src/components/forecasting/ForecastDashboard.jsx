@@ -301,7 +301,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     }
   };
 
-  const loadDatasetGeography = async (dsId = selectedDatasetId, filters = geoFilters) => {
+  const loadDatasetGeography = async (dsId = selectedDatasetId, filters = geoFilters, loc = selectedLocation) => {
     if (!dsId) {
       setGeoMeta(null);
       return;
@@ -309,13 +309,15 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     setGeoLoading(true);
     setGeoError(null);
     try {
+      const activeLoc = loc !== undefined ? loc : selectedLocation;
       const res = await fetchDatasetGeography({
         datasetId: dsId,
         geoFilters: filters,
-        location: selectedLocation || undefined,
+        location: activeLoc || undefined,
         accessToken,
       });
       setGeoMeta(res);
+      return res;
     } catch (err) {
       console.error('Dataset geography error:', err);
       setGeoError(err.message || 'Unable to fetch geographic metadata.');
@@ -324,6 +326,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       setGeoLoading(false);
     }
   };
+
 
   const getActiveFeaturesDir = (override) => {
     if (override !== undefined) return override;
@@ -421,12 +424,10 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     }
   };
 
-  // Primary dataset change handler: resets prior state, inspects new schema, and auto-selects FIRST available location (or All Data)
-  const handleDatasetChange = async (
-    selectedId,
-    targetDomain = domain,
-    targetModel = model,
-  ) => {
+  // Unified dynamic dataset change handler
+  const handleDatasetChange = async (selectedId) => {
+    const targetDomain = domain;
+    const targetModel = model;
     if (!selectedId) return;
     domainRequestToken.current += 1;
     const requestToken = domainRequestToken.current;
@@ -466,6 +467,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         targetFilters = { ...targetFilters, location: targetLoc };
         setSelectedLocation(targetLoc);
         setGeoFilters(targetFilters);
+        loadDatasetGeography(selectedId, targetFilters, targetLoc);
       } else {
         setSelectedLocation('');
         setGeoFilters(targetFilters);
@@ -490,7 +492,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     setExplainData(null);
     setFutureData(null);
     setForecastError(null);
-    loadDatasetGeography(selectedDatasetId, nextFilters);
+    loadDatasetGeography(selectedDatasetId, nextFilters, locLabel);
     handleRunForecast(model, domain, undefined, false, nextFilters, locLabel);
   };
 
