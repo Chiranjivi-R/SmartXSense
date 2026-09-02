@@ -32,10 +32,14 @@ async function parseJsonResponse(response) {
   }
   if (!response.ok || data.status === 'error') {
     const details = data.errors ? ` ${JSON.stringify(data.errors)}` : '';
-    throw new Error((data.message || `Request failed with status ${response.status}`) + details);
+    const baseMessage = data.message || `Request failed with status ${response.status}`;
+    // Include HTTP status code so the UI can display: "HTTP 500 — ..."
+    const statusPrefix = !response.ok ? `HTTP ${response.status} — ` : '';
+    throw new Error(`${statusPrefix}${baseMessage}${details}`);
   }
   return data.data;
 }
+
 
 export async function fetchAuthenticatedUser(accessToken) {
   if (!accessToken) return null;
@@ -125,9 +129,26 @@ export async function preprocessDataset({ datasetId, accessToken }) {
   return parseJsonResponse(response);
 }
 
+export async function fetchDatasetGeography({ datasetId, geoFilters, location, accessToken } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  const payload = { ...(geoFilters || {}) };
+  if (location) payload.location = location;
+  const response = await fetch(`${API_BASE_URL}/api/v1/datasets/${datasetId}/geography`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+  return parseJsonResponse(response);
+}
+
 export async function runForecast({
   domain,
   model,
+  datasetId,
+  target,
+  location,
+  geoFilters,
   featuresDir,
   predictionLimit = 100,
   selectionMethod,
@@ -137,6 +158,11 @@ export async function runForecast({
   const body = {
     domain,
     model,
+    dataset_id: datasetId,
+    dataset: datasetId,
+    target,
+    location,
+    geo_filters: geoFilters,
     features_dir: targetFeaturesDir,
     prediction_limit: predictionLimit,
     force_retrain: forceRetrain,
@@ -164,7 +190,7 @@ export async function fetchForecastHistory({ domain, model, limit = 20 } = {}) {
   return parseJsonResponse(response);
 }
 
-export async function runFutureForecast({ domain, model, horizon, featuresDir }) {
+export async function runFutureForecast({ domain, model, datasetId, target, location, geoFilters, horizon, featuresDir }) {
   const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
   const response = await fetch(`${API_BASE_URL}/api/v1/forecasting/future`, {
     method: 'POST',
@@ -172,6 +198,11 @@ export async function runFutureForecast({ domain, model, horizon, featuresDir })
     body: JSON.stringify({
       domain,
       model,
+      dataset_id: datasetId,
+      dataset: datasetId,
+      target,
+      location,
+      geo_filters: geoFilters,
       features_dir: targetFeaturesDir,
       horizon,
     }),
@@ -179,10 +210,15 @@ export async function runFutureForecast({ domain, model, horizon, featuresDir })
   return parseJsonResponse(response);
 }
 
-export async function compareModels({ domain, featuresDir, selectionMetric = 'rmse', models }) {
+export async function compareModels({ domain, datasetId, target, location, geoFilters, featuresDir, selectionMetric = 'rmse', models }) {
   const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
   const body = {
     domain,
+    dataset_id: datasetId,
+    dataset: datasetId,
+    target,
+    location,
+    geo_filters: geoFilters,
     features_dir: targetFeaturesDir,
     selection_metric: selectionMetric,
   };
@@ -197,7 +233,7 @@ export async function compareModels({ domain, featuresDir, selectionMetric = 'rm
   return parseJsonResponse(response);
 }
 
-export async function explainForecast({ domain, model, featuresDir, explanationType = 'global', method = 'shap' }) {
+export async function explainForecast({ domain, model, datasetId, target, location, geoFilters, featuresDir, explanationType = 'global', method = 'shap' }) {
   const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
   const response = await fetch(`${API_BASE_URL}/api/v1/explainability/explain`, {
     method: 'POST',
@@ -205,6 +241,11 @@ export async function explainForecast({ domain, model, featuresDir, explanationT
     body: JSON.stringify({
       domain,
       model,
+      dataset_id: datasetId,
+      dataset: datasetId,
+      target,
+      location,
+      geo_filters: geoFilters,
       features_dir: targetFeaturesDir,
       explanation_type: explanationType,
       method,
@@ -212,6 +253,27 @@ export async function explainForecast({ domain, model, featuresDir, explanationT
   });
   return parseJsonResponse(response);
 }
+
+export async function fetchLlmExplanation({ domain, model, datasetId, target, location, geoFilters, featuresDir }) {
+  const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
+  const response = await fetch(`${API_BASE_URL}/api/v1/explainability/llm-explanation`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      domain,
+      model,
+      dataset_id: datasetId,
+      dataset: datasetId,
+      target,
+      location,
+      geo_filters: geoFilters,
+      features_dir: targetFeaturesDir,
+    }),
+  });
+  return parseJsonResponse(response);
+}
+
+
 
 export async function fetchDashboardSummary({ recentLimit = 10 } = {}) {
   const params = new URLSearchParams();

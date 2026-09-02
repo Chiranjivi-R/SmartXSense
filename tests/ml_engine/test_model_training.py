@@ -63,8 +63,10 @@ def test_electricity_naive_pipeline(dummy_electricity_features_dir: Path) -> Non
     assert result["model"] == "naive"
     assert "validation_metrics" in result
     assert "test_metrics" in result
-    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
-    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
+    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
+    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
 
 
 def test_electricity_arima_pipeline(dummy_electricity_features_dir: Path) -> None:

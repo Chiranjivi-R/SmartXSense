@@ -142,8 +142,10 @@ def test_retail_random_forest_pipeline(dummy_retail_features_dir: Path) -> None:
     assert result["model"] == "random_forest"
     assert "feature_importances" in result
     assert result["feature_count"] > 0
-    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
-    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
+    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
+    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
 
 
 def test_retail_xgboost_pipeline(dummy_retail_features_dir: Path) -> None:

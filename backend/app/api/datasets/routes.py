@@ -9,6 +9,7 @@ from ...services.dataset_service import (
     dataset_detail,
     delete_dataset,
     error_payload,
+    get_dataset_geography_service,
     list_datasets,
     list_item,
     owned_dataset,
@@ -156,3 +157,34 @@ def profile(dataset_id: str):
         return jsonify({"status": "success", "code": 200, "data": result})
     except DatasetError as error:
         return _error_response(error)
+
+
+@datasets_bp.route("/<dataset_id>/geography", methods=["GET", "POST"])
+@jwt_required(optional=True)
+def geography(dataset_id: str):
+    try:
+        user_id = None
+        identity = get_jwt_identity()
+        if identity:
+            try:
+                user_id = current_user(identity).user_id
+            except AuthError:
+                pass
+
+        dataset = owned_dataset(dataset_id, user_id or "demo_user")
+        body = request.get_json(silent=True) if request.method == "POST" else {}
+
+        geo_filters = {
+            "country": request.args.get("country") or (body.get("country") if isinstance(body, dict) else None),
+            "state": request.args.get("state") or (body.get("state") if isinstance(body, dict) else None),
+            "district": request.args.get("district") or (body.get("district") if isinstance(body, dict) else None),
+            "region": request.args.get("region") or (body.get("region") if isinstance(body, dict) else None),
+            "city": request.args.get("city") or (body.get("city") if isinstance(body, dict) else None),
+            "location": request.args.get("location") or (body.get("location") if isinstance(body, dict) else None),
+        }
+
+        result = get_dataset_geography_service(dataset, geo_filters=geo_filters)
+        return jsonify({"status": "success", "code": 200, "data": result})
+    except DatasetError as error:
+        return _error_response(error)
+

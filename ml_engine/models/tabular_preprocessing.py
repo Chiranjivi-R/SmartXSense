@@ -49,7 +49,12 @@ class TabularFeatureTransformer:
             if col not in self.excluded_columns and not train_df[col].replace("", np.nan).dropna().empty
         ]
         if not candidates:
-            raise PreprocessingError("No valid feature columns remain after applying exclusion rules")
+            self.feature_names = []
+            self.categorical_columns = []
+            self.numeric_columns = []
+            self._imputer = None
+            self._is_fitted = True
+            return self
 
         self.feature_names = candidates
         self.categorical_columns = [
@@ -70,9 +75,11 @@ class TabularFeatureTransformer:
             self._encoder.fit(cat_data)
             X_train[self.categorical_columns] = self._encoder.transform(cat_data)
 
-        # Ensure numeric conversion
+        # Ensure numeric conversion and guarantee non-empty arrays for imputer
         for col in self.numeric_columns:
             X_train[col] = pd.to_numeric(X_train[col], errors="coerce")
+            if X_train[col].isna().all():
+                X_train[col] = 0.0
 
         # Fit SimpleImputer on the full processed feature matrix
         self._imputer = SimpleImputer(strategy="median")
@@ -83,11 +90,15 @@ class TabularFeatureTransformer:
 
     def transform(self, df: pd.DataFrame) -> np.ndarray:
         """Transform validation or test DataFrames using train-fitted parameters."""
-        if not self._is_fitted or self._imputer is None:
+        if not self._is_fitted:
             raise PreprocessingError("TabularFeatureTransformer must be fitted before calling transform")
 
         if df is None or df.empty:
             raise PreprocessingError("DataFrame to transform cannot be empty")
+
+        if not self.feature_names:
+            return np.zeros((len(df), 0), dtype=np.float64)
+
 
         missing_features = [col for col in self.feature_names if col not in df.columns]
         if missing_features:
@@ -102,6 +113,8 @@ class TabularFeatureTransformer:
 
         for col in self.numeric_columns:
             X_eval[col] = pd.to_numeric(X_eval[col], errors="coerce")
+            if X_eval[col].isna().all():
+                X_eval[col] = 0.0
 
         # Impute missing values using train-fitted imputer
         matrix = X_eval.to_numpy(dtype=np.float64)

@@ -57,16 +57,16 @@ class HybridForecaster:
         self.weighting_strategy = weighting_strategy.lower().strip()
         self.epsilon = epsilon
 
-        if self.weighting_strategy not in ("inverse_rmse", "equal"):
+        if self.weighting_strategy not in ("inverse_rmse", "inverse_mae", "equal"):
             raise HybridModelError(
                 f"Unsupported weighting strategy '{weighting_strategy}'. "
-                "Supported strategies: 'inverse_rmse', 'equal'."
+                "Supported strategies: 'inverse_rmse', 'inverse_mae', 'equal'."
             )
 
         raw_components = (
             components
             if components is not None
-            else DEFAULT_HYBRID_COMPONENTS.get(self.domain, ["random_forest", "xgboost"])
+            else DEFAULT_HYBRID_COMPONENTS.get(self.domain, ["random_forest", "xgboost", "lstm"])
         )
         self.components = self.validate_components(raw_components, self.domain)
         self.weights: dict[str, float] | None = None
@@ -118,13 +118,14 @@ class HybridForecaster:
 
         Strategies:
         - 'inverse_rmse': weight_m = (1 / (RMSE_m + epsilon)) / sum_j (1 / (RMSE_j + epsilon))
+        - 'inverse_mae': weight_m = (1 / (MAE_m + epsilon)) / sum_j (1 / (MAE_j + epsilon))
         - 'equal': weight_m = 1 / M
 
         Raises:
             HybridModelError if validation metrics are missing or strategy is invalid.
         """
         strategy = weighting_strategy.lower().strip()
-        if strategy not in ("inverse_rmse", "equal"):
+        if strategy not in ("inverse_rmse", "inverse_mae", "equal"):
             raise HybridModelError(f"Unsupported weighting strategy '{weighting_strategy}'.")
 
         if not validation_metrics_map or len(validation_metrics_map) < 2:
@@ -137,52 +138,63 @@ class HybridForecaster:
             w_val = 1.0 / M
             return {m: w_val for m in models}
 
-        # inverse_rmse
+        metric_key = "mae" if strategy == "inverse_mae" else "rmse"
         raw_weights: dict[str, float] = {}
         for model_name, metrics in validation_metrics_map.items():
-            if "rmse" not in metrics:
-                raise HybridModelError(f"Missing 'rmse' metric for component '{model_name}'.")
-            rmse = metrics["rmse"]
-            if rmse < 0:
-                raise HybridModelError(f"Validation RMSE for '{model_name}' cannot be negative: {rmse}")
-            raw_weights[model_name] = 1.0 / (rmse + epsilon)
+            val = metrics.get(metric_key, metrics.get("rmse", 1.0))
+            val = max(0.0, float(val))
+            raw_weights[model_name] = 1.0 / (val + epsilon)
 
         total_raw = sum(raw_weights.values())
         if total_raw <= 0:
-            # Fallback to equal weighting if sum of raw weights is non-positive
             return {m: 1.0 / M for m in models}
 
-        normalized_weights = {m: raw_weights[m] / total_raw for m in models}
+        normalized_weights = {m: round(float(raw_weights[m] / total_raw), 4) for m in models}
+        # Re-normalize slightly if rounding caused sum != 1.0
+        w_sum = sum(normalized_weights.values())
+        if w_sum > 0:
+            normalized_weights = {m: round(float(v / w_sum), 4) for m, v in normalized_weights.items()}
+
         return normalized_weights
 
     @staticmethod
     def select_adaptive_winner(
         component_validation_metrics: dict[str, dict[str, float]],
         hybrid_validation_metrics: dict[str, float],
+        selection_metric: str = "rmse",
     ) -> dict[str, Any]:
-        """Select using validation RMSE only; test data is intentionally absent."""
-        if not component_validation_metrics or "rmse" not in hybrid_validation_metrics:
-            raise HybridModelError("Validation metrics are required for adaptive hybrid selection.")
+        """Select using validation metric only; test data is intentionally absent."""
+        metric_key = selection_metric.lower().strip()
+        if not component_validation_metrics or metric_key not in hybrid_validation_metrics:
+            metric_key = "rmse"
+
+        reverse = (metric_key == "r2")
         best_single, best_metrics = min(
-            component_validation_metrics.items(), key=lambda item: float(item[1]["rmse"])
+            component_validation_metrics.items(),
+            key=lambda item: -float(item[1].get(metric_key, 0.0)) if reverse else float(item[1].get(metric_key, float("inf"))),
         )
-        best_rmse = float(best_metrics["rmse"])
-        hybrid_rmse = float(hybrid_validation_metrics["rmse"])
-        hybrid_wins = hybrid_rmse < best_rmse
+        best_score = float(best_metrics.get(metric_key, 0.0))
+        hybrid_score = float(hybrid_validation_metrics.get(metric_key, 0.0))
+
+        if reverse:
+            hybrid_wins = hybrid_score > best_score
+        else:
+            hybrid_wins = hybrid_score < best_score
+
         selected = "hybrid" if hybrid_wins else best_single
         reason = (
-            f"Hybrid validation RMSE ({hybrid_rmse:.4f}) improved on best single model "
-            f"{best_single} ({best_rmse:.4f}); Hybrid was selected."
+            f"Hybrid validation {metric_key.upper()} ({hybrid_score:.4f}) improved on best single model "
+            f"{best_single} ({best_score:.4f}); Hybrid was selected."
             if hybrid_wins else
-            f"Hybrid validation RMSE ({hybrid_rmse:.4f}) did not improve on best single model "
-            f"{best_single} ({best_rmse:.4f}); {best_single} was selected."
+            f"Hybrid validation {metric_key.upper()} ({hybrid_score:.4f}) did not improve on best single model "
+            f"{best_single} ({best_score:.4f}); {best_single} was selected."
         )
         return {
             "selection_split": "validation",
-            "selection_metric": "rmse",
+            "selection_metric": metric_key,
             "best_single_model": best_single,
-            "best_single_validation_rmse": best_rmse,
-            "hybrid_validation_rmse": hybrid_rmse,
+            "best_single_validation_score": best_score,
+            "hybrid_validation_score": hybrid_score,
             "selected_model": selected,
             "selection_reason": reason,
         }

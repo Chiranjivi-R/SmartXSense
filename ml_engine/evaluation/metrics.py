@@ -100,6 +100,20 @@ def r2_score(y_true: Any, y_pred: Any) -> float:
     return float(1.0 - (ss_res / ss_tot))
 
 
+def symmetric_mean_absolute_percentage_error(y_true: Any, y_pred: Any, *, epsilon: float = 1e-8) -> float:
+    """Compute Symmetric Mean Absolute Percentage Error (SMAPE) as a fraction (0.0 to 2.0)."""
+    true_arr, pred_arr = _validate_pair(y_true, y_pred)
+    denom = (np.abs(true_arr) + np.abs(pred_arr)) / 2.0 + epsilon
+    return float(np.mean(np.abs(true_arr - pred_arr) / denom))
+
+
+def weighted_absolute_percentage_error(y_true: Any, y_pred: Any, *, epsilon: float = 1e-8) -> float:
+    """Compute Weighted Absolute Percentage Error (WAPE) as a fraction."""
+    true_arr, pred_arr = _validate_pair(y_true, y_pred)
+    denom = np.sum(np.abs(true_arr)) + epsilon
+    return float(np.sum(np.abs(true_arr - pred_arr)) / denom)
+
+
 def evaluate_forecast(y_true: Any, y_pred: Any) -> dict[str, float]:
     """Compute all forecasting evaluation metrics and return standard metrics dictionary."""
     true_arr, pred_arr = _validate_pair(y_true, y_pred)
@@ -107,5 +121,7 @@ def evaluate_forecast(y_true: Any, y_pred: Any) -> dict[str, float]:
         "mae": mean_absolute_error(true_arr, pred_arr),
         "rmse": root_mean_squared_error(true_arr, pred_arr),
         "mape": mean_absolute_percentage_error(true_arr, pred_arr),
+        "smape": symmetric_mean_absolute_percentage_error(true_arr, pred_arr),
+        "wape": weighted_absolute_percentage_error(true_arr, pred_arr),
         "r2": r2_score(true_arr, pred_arr),
     }

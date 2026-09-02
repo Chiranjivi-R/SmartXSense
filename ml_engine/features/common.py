@@ -27,13 +27,14 @@ def add_history_features(
     frame: pd.DataFrame,
     *,
     target: str,
-    lags: tuple[int, ...],
-    rolling_windows: tuple[int, ...],
+    lags: tuple[int, ...] = (1, 7, 14, 28),
+    rolling_windows: tuple[int, ...] = (7, 14, 28),
     group_columns: list[str] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Add lag/rolling features from a target shifted one observation backward."""
     result = frame.copy()
     feature_names: list[str] = []
+
     if group_columns:
         grouped = result.groupby(group_columns, dropna=False, sort=False)[target]
         for lag in lags:

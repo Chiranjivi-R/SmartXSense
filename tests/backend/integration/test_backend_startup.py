@@ -23,9 +23,11 @@ def test_run_module_creates_app_from_backend_directory_without_pythonpath():
         [sys.executable, "-c", command],
         cwd=BACKEND_DIR,
         env=environment,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,
     )
+
     assert result.returncode == 0, result.stderr
     assert "startup-ok" in result.stdout

@@ -28,3 +28,20 @@ def explain_route():
         return _error_response(err)
     except Exception as err:
         return jsonify({"status": "error", "code": 500, "message": "Internal server error"}), 500
+
+
+@explainability_bp.post("/llm-explanation")
+def llm_explanation_route():
+    try:
+        payload = request.get_json(silent=True)
+        if payload is None:
+            raise MLError("Invalid or missing JSON payload")
+
+        from ...services.ml_service import forecast_service
+        fc = forecast_service(payload)
+        llm_data = fc.get("llm_explanation", {})
+        return jsonify({"status": "success", "code": 200, "data": llm_data}), 200
+    except MLError as err:
+        return _error_response(err)
+    except Exception:
+        return jsonify({"status": "error", "code": 500, "message": "Internal server error"}), 500

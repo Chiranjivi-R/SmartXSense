@@ -28,6 +28,7 @@ class Dataset(db.Model):
     file_size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     row_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     column_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default=text("'uploaded'"))
     created_at: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 

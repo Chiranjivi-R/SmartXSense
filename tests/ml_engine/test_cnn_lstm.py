@@ -261,8 +261,10 @@ def test_trainer_cnn_lstm_electricity(electricity_features_dir: Path) -> None:
     assert cfg["cnn_filters"] == 8
     assert cfg["kernel_size"] == 3
     assert result["epochs_trained"] >= 1
-    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
-    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
+    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
+    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
 
 
 def test_trainer_cnn_lstm_retail(retail_features_dir: Path) -> None:

@@ -30,4 +30,11 @@ def create_app(config_class=Config):
     for blueprint in (auth_bp, datasets_bp, forecasting_bp, explainability_bp, dashboard_bp, reports_bp, settings_bp, health_bp):
         app.register_blueprint(blueprint)
 
+    # Ensure the content_hash column exists in the live database.
+    # This auto-migration is safe to call on every startup: it is a no-op when
+    # the column already exists, and it fixes databases that pre-date Phase 7B-6.
+    with app.app_context():
+        from .services.dataset_service import _ensure_content_hash_column
+        _ensure_content_hash_column()
+
     return app

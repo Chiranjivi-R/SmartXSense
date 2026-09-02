@@ -55,6 +55,12 @@ export default function ExplainabilityPage() {
 
   const importances = (() => {
     if (!data) return [];
+    if (Array.isArray(data.features)) {
+      return data.features.map((item) => ({
+        feature: formatFeature(item.feature || item.name),
+        importance: Math.abs(Number(item.importance ?? item.shap_value ?? item.value ?? 0)),
+      }));
+    }
     if (data.feature_importance) {
       return Object.entries(data.feature_importance).map(([feature, importance]) => ({
         feature: formatFeature(feature),
@@ -75,6 +81,7 @@ export default function ExplainabilityPage() {
     }
     return [];
   })();
+
 
   const top = importances.slice(0, 12);
   const explanationSummary = top.length
@@ -105,7 +112,8 @@ export default function ExplainabilityPage() {
             <select value={model} onChange={(e) => setModel(e.target.value)} style={selectStyle}>
               <option value="random_forest">Random Forest</option>
               <option value="xgboost">XGBoost</option>
-              <option value="lstm">LSTM (unsupported)</option>
+              <option value="lstm">LSTM</option>
+              <option value="hybrid">Hybrid</option>
             </select>
           </label>
           <label style={{ fontSize: 12, color: COLORS.text.secondary }}>

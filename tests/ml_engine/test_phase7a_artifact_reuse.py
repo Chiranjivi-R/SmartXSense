@@ -356,3 +356,46 @@ def test_L_benchmark_cache_saving_and_loading(sample_retail_dir: Path, artifacts
     )
     assert loaded_corrupt is None
 
+
+def test_different_dataset_contents_produce_different_artifact_keys_and_no_reuse(
+    sample_retail_dir: Path, sample_retail_dir_b: Path, artifacts_dir: Path
+) -> None:
+    """Requirement 12 B & C: Dataset A vs Dataset B isolation.
+    Different dataset contents must produce different content hashes/fingerprints and MUST NOT reuse artifacts.
+    """
+    res_a = run_training_pipeline(
+        domain="retail",
+        features_dir=sample_retail_dir,
+        model_name="random_forest",
+        n_estimators=10,
+        save_artifact=True,
+        artifacts_root=artifacts_dir,
+    )
+    assert res_a["artifact_persistence"]["saved"] is True
+    assert res_a["artifact_persistence"]["reused"] is False
+
+    # Train on dataset B with identical model configuration
+    res_b = run_training_pipeline(
+        domain="retail",
+        features_dir=sample_retail_dir_b,
+        model_name="random_forest",
+        n_estimators=10,
+        save_artifact=True,
+        artifacts_root=artifacts_dir,
+    )
+
+    # Dataset B MUST NOT reuse artifact from dataset A
+    assert res_b["artifact_persistence"]["reused"] is False
+    assert res_a["artifact_key"] != res_b["artifact_key"]
+
+    # Re-running dataset A MUST reuse artifact A
+    res_a_repeat = run_training_pipeline(
+        domain="retail",
+        features_dir=sample_retail_dir,
+        model_name="random_forest",
+        n_estimators=10,
+        save_artifact=True,
+        artifacts_root=artifacts_dir,
+    )
+    assert res_a_repeat["artifact_persistence"]["reused"] is True
+    assert res_a_repeat["artifact_key"] == res_a["artifact_key"]

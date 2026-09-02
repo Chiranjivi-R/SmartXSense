@@ -131,6 +131,9 @@ class LSTMForecaster:
 
         self.target_column = target_column
 
+        if len(train_df) <= self.lookback:
+            self.lookback = max(1, len(train_df) - 1)
+
         # Fit sequence preprocessor on TRAIN only
         self._preprocessor = SequencePreprocessor(target_column=target_column)
         self._preprocessor.fit(train_df)
@@ -139,6 +142,7 @@ class LSTMForecaster:
         X_train, y_train = self._preprocessor.build_sequences(
             train_df, lookback=self.lookback
         )
+
         # Record actual count from the training array; used by trainer for reporting
         self.n_training_sequences = len(X_train)
 
@@ -245,14 +249,26 @@ class LSTMForecaster:
         else:
             context = None
 
-        X_eval, _ = self._preprocessor.build_sequences(
-            eval_df, lookback=self.lookback, history_df=context
-        )
+        try:
+            X_eval, _ = self._preprocessor.build_sequences(
+                eval_df, lookback=self.lookback, history_df=context
+            )
+        except Exception as err:
+            raise LSTMModelError(f"Sequence preprocessing failed: {err}") from err
+
+        expected_input_size = self._net.lstm.input_size
+        if X_eval.shape[-1] != expected_input_size:
+            raise LSTMModelError(
+                f"Input feature dimension mismatch: dataset feature matrix has {X_eval.shape[-1]} features, "
+                f"but fitted LSTM model expects input_size={expected_input_size}"
+            )
+
 
         self._net.eval()
         with torch.no_grad():
             X_t = torch.tensor(X_eval, dtype=torch.float32)
             preds_scaled = self._net(X_t).numpy()
+
 
         # Inverse-scale predictions back to original units
         preds_original = self._preprocessor.inverse_scale_target(preds_scaled)

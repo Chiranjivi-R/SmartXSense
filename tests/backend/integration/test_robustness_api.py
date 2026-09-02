@@ -368,7 +368,7 @@ def test_explain_rejects_invalid_inputs(tmp_path, mock_features_dir):
             json={
                 "domain": "electricity",
                 "features_dir": str(mock_features_dir),
-                "model": "lstm",
+                "model": "invalid_model_xyz",
                 "explanation_type": "global",
                 "method": "shap",
             },

@@ -240,8 +240,10 @@ def test_trainer_hybrid_electricity_fast(electricity_features_dir: Path) -> None
     assert set(result["component_test_metrics"].keys()) == {"arima", "random_forest", "xgboost"}
 
     # Hybrid overall metrics reported
-    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
-    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
+    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
+    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
 
 
 def test_trainer_hybrid_retail_fast(retail_features_dir: Path) -> None:
@@ -271,3 +273,23 @@ def test_trainer_backward_compatibility_standalone_models(electricity_features_d
             n_estimators=5,
         )
         assert res["model"] == m_name
+
+
+def test_hybrid_with_lstm_component(retail_features_dir: Path) -> None:
+    """Hybrid model incorporating LSTM base model."""
+    result = run_training_pipeline(
+        domain="retail",
+        features_dir=retail_features_dir,
+        model_name="hybrid",
+        components=["random_forest", "xgboost", "lstm"],
+        n_estimators=5,
+        epochs=1,
+        batch_size=8,
+        hybrid_weighting="inverse_mae",
+    )
+
+    assert result["model"] == "hybrid"
+    assert "lstm" in result["weights"]
+    assert pytest.approx(sum(result["weights"].values()), abs=1e-3) == 1.0
+    assert "lstm" in result["component_validation_metrics"]
+    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}

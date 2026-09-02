@@ -364,6 +364,10 @@ def run_training_pipeline(
         hybrid_weighting=hybrid_weighting,
     )
 
+    from .tabular_preprocessing import TabularFeatureTransformer
+
+    expected_feature_names = TabularFeatureTransformer(target_column=target_column).fit(train_df).feature_names
+
     # Attempt to reuse existing artifact if force_retrain is False and persistence is supported
     if not force_retrain and is_persistence_supported(model_key):
         loaded = try_load_compatible_artifact(
@@ -372,6 +376,7 @@ def run_training_pipeline(
             target=target_column,
             features_id=features_id,
             dataset_fingerprint=dataset_fingerprint,
+            feature_names=expected_feature_names,
             configuration=expected_config,
             artifacts_root=artifacts_root,
         )
@@ -437,6 +442,7 @@ def run_training_pipeline(
                     target=target_column,
                     features_id=features_id,
                     dataset_fingerprint=dataset_fingerprint,
+                    feature_names=expected_feature_names,
                     configuration=comp_config,
                     artifacts_root=artifacts_root,
                 )
@@ -578,7 +584,8 @@ def run_training_pipeline(
                     target=target_column,
                     features_id=features_id,
                     dataset_fingerprint=dataset_fingerprint,
-                    feature_names=[],
+                    feature_names=expected_feature_names,
+
                     configuration=expected_config,
                     validation_metrics=val_metrics,
                     test_metrics=test_metrics,
@@ -635,6 +642,31 @@ def run_training_pipeline(
     val_metrics = evaluate_forecast(val_targets, val_pred)
     test_metrics = evaluate_forecast(test_targets, test_pred)
 
+    # Naive Baseline Comparison Evaluation
+    try:
+        naive_model = NaiveForecaster(seasonal_period=1)
+        naive_model.fit(train_df, target_column=target_column)
+        n_val_pred = naive_model.predict(val_df, target_column=target_column, history=train_df[target_column])
+        comb_hist = pd.concat([train_df[target_column], val_df[target_column]], ignore_index=True)
+        n_test_pred = naive_model.predict(test_df, target_column=target_column, history=comb_hist)
+        n_val_targets = val_df.loc[n_val_pred.index, target_column] if model_key in ("lstm", "cnn_lstm") else val_df[target_column]
+        n_test_targets = test_df.loc[n_test_pred.index, target_column] if model_key in ("lstm", "cnn_lstm") else test_df[target_column]
+        baseline_test_metrics = evaluate_forecast(n_test_targets, n_test_pred)
+    except Exception:
+        baseline_test_metrics = {"rmse": test_metrics["rmse"], "mae": test_metrics["mae"], "r2": 0.0, "mape": 0.0, "wape": 0.0, "smape": 0.0}
+
+    b_rmse = baseline_test_metrics["rmse"]
+    m_rmse = test_metrics["rmse"]
+    improvement_pct = round(float((b_rmse - m_rmse) / (abs(b_rmse) + 1e-8) * 100), 2)
+    beats_baseline = (m_rmse < b_rmse) and (test_metrics["r2"] > 0)
+
+    if test_metrics["r2"] < 0 or not beats_baseline:
+        forecast_quality = "Needs Improvement"
+    elif improvement_pct > 15.0:
+        forecast_quality = "Good"
+    else:
+        forecast_quality = "Moderate"
+
     predictions_list, pred_count, total_test_preds = format_chart_predictions(
         test_df=test_df,
         test_pred=test_pred,
@@ -654,10 +686,15 @@ def run_training_pipeline(
         "test_rows": len(test_df),
         "validation_metrics": val_metrics,
         "test_metrics": test_metrics,
+        "baseline_metrics": baseline_test_metrics,
+        "improvement_pct": improvement_pct,
+        "beats_baseline": beats_baseline,
+        "forecast_quality": forecast_quality,
         "predictions": predictions_list,
         "prediction_count": pred_count,
         "total_test_predictions": total_test_preds,
     }
+
 
     if model_key in ("lstm", "cnn_lstm"):
         result["training_sequences"] = res["training_sequences"]
@@ -726,6 +763,16 @@ def evaluate_fitted_model_on_splits(
     train_df = pd.read_parquet(features_dir / "train.parquet")
     val_df = pd.read_parquet(features_dir / "validation.parquet")
     test_df = pd.read_parquet(features_dir / "test.parquet")
+    from .tabular_preprocessing import TabularFeatureTransformer
+
+
+    expected_feature_names = TabularFeatureTransformer(target_column=target_column).fit(train_df).feature_names
+    if hasattr(model, "feature_names") and model.feature_names:
+        if list(model.feature_names) != list(expected_feature_names):
+            raise TrainerError(
+                f"Model feature schema mismatch: model expects {len(model.feature_names)} features, "
+                f"dataset evaluation split has {len(expected_feature_names)} features"
+            )
 
     try:
         pred_res = predict_with_fitted_model(
@@ -815,6 +862,30 @@ def evaluate_fitted_model_on_splits(
 
     val_metrics = evaluate_forecast(val_targets, val_pred)
     test_metrics = evaluate_forecast(test_targets, test_pred)
+
+    # Calculate baseline metrics for loaded artifact
+    try:
+        naive_model = NaiveForecaster(seasonal_period=1)
+        naive_model.fit(train_df, target_column=target_column)
+        comb_hist = pd.concat([train_df[target_column], val_df[target_column]], ignore_index=True)
+        n_test_pred = naive_model.predict(test_df, target_column=target_column, history=comb_hist)
+        n_test_targets = test_df.loc[n_test_pred.index, target_column] if model_key in ("lstm", "cnn_lstm") else test_df[target_column]
+        baseline_test_metrics = evaluate_forecast(n_test_targets, n_test_pred)
+    except Exception:
+        baseline_test_metrics = {"rmse": test_metrics["rmse"], "mae": test_metrics["mae"], "r2": 0.0, "mape": 0.0, "wape": 0.0, "smape": 0.0}
+
+    b_rmse = baseline_test_metrics["rmse"]
+    m_rmse = test_metrics["rmse"]
+    improvement_pct = round(float((b_rmse - m_rmse) / (abs(b_rmse) + 1e-8) * 100), 2)
+    beats_baseline = (m_rmse < b_rmse) and (test_metrics["r2"] > 0)
+
+    if test_metrics["r2"] < 0 or not beats_baseline:
+        forecast_quality = "Needs Improvement"
+    elif improvement_pct > 15.0:
+        forecast_quality = "Good"
+    else:
+        forecast_quality = "Moderate"
+
     predictions_list, pred_count, total_test_preds = format_chart_predictions(
         test_df=test_df,
         test_pred=test_pred,
@@ -834,10 +905,15 @@ def evaluate_fitted_model_on_splits(
         "test_rows": len(test_df),
         "validation_metrics": val_metrics,
         "test_metrics": test_metrics,
+        "baseline_metrics": baseline_test_metrics,
+        "improvement_pct": improvement_pct,
+        "beats_baseline": beats_baseline,
+        "forecast_quality": forecast_quality,
         "predictions": predictions_list,
         "prediction_count": pred_count,
         "total_test_predictions": total_test_preds,
     }
+
 
     if model_key in ("lstm", "cnn_lstm"):
         result["training_sequences"] = pred_res["training_sequences"]

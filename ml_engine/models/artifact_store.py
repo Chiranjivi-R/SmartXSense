@@ -256,12 +256,33 @@ def check_compatibility(
     if saved_count != len(saved_names):
         raise ArtifactError("Artifact feature metadata is inconsistent")
 
-    if feature_names is not None and list(feature_names) != saved_names:
-        raise ArtifactError("Artifact feature names mismatch")
+    FORBIDDEN_KEYWORDS_IN_ARTIFACT = {
+        "customer_id", "customer_name", "first_name", "last_name", "date_of_birth", "dob",
+        "postal_code", "ssn", "credit_card", "customerid"
+    }
+
+
+
+    saved_names_lower = [str(n).lower().replace(" ", "_") for n in saved_names]
+    for forbidden in FORBIDDEN_KEYWORDS_IN_ARTIFACT:
+        if any(forbidden in n or forbidden == n for n in saved_names_lower):
+            raise ArtifactError(f"Artifact contains forbidden feature '{forbidden}'; invalidating stale artifact for fresh re-training.")
+
+    if feature_names is not None:
+        req_names = list(feature_names)
+        if req_names != saved_names:
+            raise ArtifactError(
+                f"Artifact feature schema mismatch (feature names mismatch): expected {len(req_names)} features ({req_names[:3]}...), "
+                f"got {len(saved_names)} features ({saved_names[:3]}...)"
+            )
+
+
+
 
     if configuration is not None:
         if _canonical_config(metadata.get("configuration")) != _canonical_config(configuration):
             raise ArtifactError("Artifact configuration mismatch")
+
 
 
 def _serialize_torch_forecaster(model: Any, model_key: str) -> dict[str, Any]:

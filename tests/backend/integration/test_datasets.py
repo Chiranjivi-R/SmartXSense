@@ -167,6 +167,24 @@ def test_demo_dataset_profiling(client):
     assert data["is_demo"] is True
 
 
+def test_dataset_geography_endpoint(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "geo-test@example.com")
+    geo_csv = (
+        b"timestamp,Country,State,City,sales\n"
+        + b"\n".join([f"2026-01-{i:02d},India,Karnataka,Bengaluru,{100 + i}".encode() for i in range(1, 15)])
+    )
+    dataset_id = upload(test_client, headers, geo_csv, "geo_retail.csv", "retail").get_json()["data"]["dataset_id"]
+
+    res = test_client.get(f"/api/v1/datasets/{dataset_id}/geography", headers=headers)
+    assert res.status_code == 200
+    data = res.get_json()["data"]
+    assert data["has_geography"] is True
+    assert "India" in data["levels"]["countries"]
+    assert "Karnataka" in data["levels"]["states"]
+    assert "Bengaluru" in data["levels"]["cities"]
+
+
 def test_inaccessible_and_nonexistent_dataset_return_not_found(client):
     test_client, _ = client
     owner_headers = auth_header(test_client, "owner@example.com")
@@ -410,3 +428,59 @@ def test_preprocess_small_dataset_reports_features_not_ready(client):
     assert body["data"]["features_ready"] is False
     assert "features_error" in body["data"]
     assert body["data"]["processed_rows"] == 2
+
+
+def test_online_retail_csv_upload_and_validation(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "online-retail@example.com")
+    online_retail_csv = (
+        b"InvoiceNo,StockCode,Description,Quantity,InvoiceDate,UnitPrice,CustomerID,Country\n"
+        b"536365,85123A,WHITE HANGING HEART T-LIGHT HOLDER,6,2026-01-01 08:26:00,2.55,17850,United Kingdom\n"
+        b"536365,71053,WHITE METAL LANTERN,6,2026-01-01 08:26:00,3.39,17850,United Kingdom\n"
+        b"536365,84406B,CREAM CUPID HEARTS COAT HANGER,8,2026-01-01 08:26:00,2.75,17850,United Kingdom\n"
+        b"536365,84029G,KNITTED UNION FLAG HOT WATER BOTTLE,6,2026-01-01 08:26:00,3.39,17850,United Kingdom\n"
+        b"536365,84029E,RED WOOLLY HOTTIE WHITE HEART.,6,2026-01-01 08:26:00,3.39,17850,United Kingdom\n"
+        b"536365,22752,SET 7 BABUSHKA NESTING BOXES,2,2026-01-01 08:26:00,7.65,17850,United Kingdom\n"
+        b"536365,21730,GLASS STAR FROSTED T-LIGHT HOLDER,6,2026-01-01 08:26:00,4.25,17850,United Kingdom\n"
+        b"536366,22633,HAND WARMER UNION JACK,6,2026-01-01 08:28:00,1.85,17850,United Kingdom\n"
+        b"536366,22632,HAND WARMER RED RETROSPOT,6,2026-01-01 08:28:00,1.85,17850,United Kingdom\n"
+        b"536367,84879,ASSORTED COLOUR BIRD ORNAMENT,32,2026-01-01 08:34:00,1.69,13047,United Kingdom\n"
+    )
+    upload_res = upload(test_client, headers, online_retail_csv, "online_retail.csv", "retail")
+    assert upload_res.status_code == 201
+    dataset_id = upload_res.get_json()["data"]["dataset_id"]
+
+    validate_res = test_client.post(
+        f"/api/v1/datasets/{dataset_id}/validate",
+        headers=headers,
+        json={"schema_type": "retail_v1", "strict_mode": True},
+    )
+    assert validate_res.status_code == 200
+    val_body = validate_res.get_json()
+    assert val_body["data"]["is_valid"] is True
+
+    profile_res = test_client.get(f"/api/v1/datasets/{dataset_id}/profile", headers=headers)
+    assert profile_res.status_code == 200
+    prof_body = profile_res.get_json()["data"]
+    assert prof_body["time_column"] == "InvoiceDate"
+    assert prof_body["selected_target"] == "Quantity"
+    assert prof_body["geographic_columns"] == ["Country"]
+    assert prof_body["suitable"] is True
+
+
+def test_duplicate_dataset_upload_returns_existing_record(client):
+    test_client, _ = client
+    headers = auth_header(test_client, "dedup@example.com")
+    data_smart_csv = b"timestamp,sales,store_id\n2026-01-01,100,S01\n2026-01-02,150,S01\n"
+
+    # Upload exact same file twice
+    res1 = upload(test_client, headers, data_smart_csv, "data_smart.csv", "retail")
+    assert res1.status_code == 201
+    id1 = res1.get_json()["data"]["dataset_id"]
+
+    res2 = upload(test_client, headers, data_smart_csv, "data_smart.csv", "retail")
+    assert res2.status_code == 201
+    id2 = res2.get_json()["data"]["dataset_id"]
+
+    # Exact content hash matching must reuse existing record without duplicates
+    assert id1 == id2

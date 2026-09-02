@@ -198,6 +198,11 @@ class CNNLSTMForecaster:
 
         self.target_column = target_column
 
+        if len(train_df) <= self.lookback:
+            self.lookback = max(1, len(train_df) - 1)
+            if self.kernel_size > self.lookback:
+                self.kernel_size = self.lookback
+
         # ------------------------------------------------------------------ #
         # Step 1: Fit shared SequencePreprocessor on TRAIN only               #
         # ------------------------------------------------------------------ #
@@ -210,6 +215,7 @@ class CNNLSTMForecaster:
         X_train, y_train = self._preprocessor.build_sequences(
             train_df, lookback=self.lookback
         )
+
         # Record actual count from the array — used by trainer for reporting
         self.n_training_sequences = len(X_train)
 
@@ -341,10 +347,19 @@ class CNNLSTMForecaster:
             eval_df, lookback=self.lookback, history_df=context
         )
 
+        expected_input_size = self._net.conv1.in_channels
+        if X_eval.shape[-1] != expected_input_size:
+            raise CNNLSTMModelError(
+                f"Input feature dimension mismatch: dataset feature matrix has {X_eval.shape[-1]} features, "
+                f"but fitted CNN-LSTM model expects in_channels={expected_input_size}"
+            )
+
+
         self._net.eval()
         with torch.no_grad():
             X_t = torch.tensor(X_eval, dtype=torch.float32)
             preds_scaled = self._net(X_t).numpy()
+
 
         # Inverse-scale predictions back to original target units
         preds_original = self._preprocessor.inverse_scale_target(preds_scaled)

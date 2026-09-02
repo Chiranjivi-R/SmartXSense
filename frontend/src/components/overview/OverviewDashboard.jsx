@@ -14,7 +14,7 @@ const COLORS = {
 const formatMape = (val) => {
   if (val === undefined || val === null || Number.isNaN(Number(val))) return '—';
   const num = Number(val);
-  const pct = num > 1 ? num : num * 100;
+  const pct = num < 50 ? num * 100 : num;
   return `${pct.toFixed(2)}%`;
 };
 

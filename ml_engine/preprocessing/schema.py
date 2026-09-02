@@ -9,19 +9,29 @@ import pandas as pd
 
 
 RETAIL_ALIASES = {
-    "timestamp": {"date", "invoice_date", "datetime", "date_time", "transaction_date", "order_date"},
-    "sales": {"units_sold", "units", "quantity", "qty", "demand", "sales_units"},
-    "product_id": {"product_name", "product", "item_id", "item", "sku", "brand"},
+    "timestamp": {
+        "date", "invoice_date", "datetime", "date_time", "transaction_date", "order_date",
+        "invoicedate", "orderdate", "transactiondate", "purchase_date", "sales_date",
+        "created_at", "updated_at", "event_time", "event_date", "timestamp_utc",
+    },
+    "sales": {
+        "units_sold", "units", "quantity", "qty", "demand", "sales_units",
+        "quantity_sold", "demand_units", "orders", "order_count", "revenue",
+        "amount", "volume", "sales_revenue", "total_sales",
+    },
+    "product_id": {"item_id", "sku", "brand", "stock_code", "stockcode"},
     "store_id": {"store", "store_code", "store_format", "location"},
-    "price": {"selling_price", "base_price_inr", "base_price", "price_inr"},
+
+    "price": {"selling_price", "base_price_inr", "base_price", "price_inr", "unit_price", "unitprice"},
     "revenue": {"revenue_inr", "sales_revenue"},
     "holiday_flag": {"holiday", "is_holiday"},
     "festival_flag": {"festival", "is_festival"},
     "temperature_c": {"temperature", "temperature_celsius"},
 }
 
+
 ELECTRICITY_ALIASES = {
-    "timestamp": {"date_time", "datetime", "date", "time", "datehour", "date_hour"},
+    "timestamp": {"date_time", "datetime", "date", "time", "datehour", "date_hour", "timestamp_utc"},
     "demand_mw": {
         "hourly_demand_met_mw",
         "hourly_demand_met_in_mw",
@@ -32,6 +42,10 @@ ELECTRICITY_ALIASES = {
         "load_mw",
         "load",
         "demand",
+        "power",
+        "consumption",
+        "energy",
+        "usage",
     },
 }
 
@@ -41,6 +55,7 @@ DOMAIN_TARGETS = {"retail": "sales", "electricity": "demand_mw"}
 def normalise_column_name(name: object) -> str:
     """Convert source-specific headings to stable snake_case names."""
     text = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
     text = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_").lower()
     return re.sub(r"_+", "_", text)
 

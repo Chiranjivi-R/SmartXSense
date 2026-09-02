@@ -146,8 +146,10 @@ def test_trainer_lstm_electricity(electricity_features_dir: Path) -> None:
     assert result["target"] == "demand_mw"
     assert result["configuration"]["lookback"] == 5
     assert result["epochs_trained"] >= 1
-    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
-    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2"}
+    assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
+    assert set(result["test_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
 
 
 def test_trainer_lstm_retail(retail_features_dir: Path) -> None:
@@ -239,3 +241,26 @@ def test_trainer_reports_correct_training_sequences(electricity_features_dir: Pa
         "training_sequences must not equal validation_sequences "
         "(they reflect different partition sizes)"
     )
+
+
+def test_lstm_dynamic_feature_dimensions() -> None:
+    """LSTM input size must dynamically adapt to any number of feature columns."""
+    rng = np.random.default_rng(42)
+    n_rows = 50
+    timestamps = pd.date_range("2026-01-01", periods=n_rows, freq="h")
+
+    # Test with 15 features (e.g. got 15, expected 15, not hardcoded 20)
+    feats_15 = {f"feat_{i}": rng.standard_normal(n_rows) for i in range(15)}
+    df15 = pd.DataFrame({"timestamp": timestamps, "sales": rng.standard_normal(n_rows), **feats_15})
+    m15 = LSTMForecaster(lookback=5, lstm_units=8, epochs=1, batch_size=8, random_seed=42)
+    m15.fit(df15.iloc[:35], target_column="sales", val_df=df15.iloc[35:45])
+    preds15 = m15.predict(df15.iloc[45:], target_column="sales", history_df=df15.iloc[:45])
+    assert len(preds15) == 5
+
+    # Test with 25 features
+    feats_25 = {f"feat_{i}": rng.standard_normal(n_rows) for i in range(25)}
+    df25 = pd.DataFrame({"timestamp": timestamps, "sales": rng.standard_normal(n_rows), **feats_25})
+    m25 = LSTMForecaster(lookback=5, lstm_units=8, epochs=1, batch_size=8, random_seed=42)
+    m25.fit(df25.iloc[:35], target_column="sales", val_df=df25.iloc[35:45])
+    preds25 = m25.predict(df25.iloc[45:], target_column="sales", history_df=df25.iloc[:45])
+    assert len(preds25) == 5

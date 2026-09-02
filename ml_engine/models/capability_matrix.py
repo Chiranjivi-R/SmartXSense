@@ -20,8 +20,8 @@ SUPPORTED_DOMAINS = sorted(DOMAIN_TARGET_MAP.keys())
 
 # Models included in default Compare / Auto Select candidate lists.
 DEFAULT_COMPARE_MODELS: dict[str, list[str]] = {
-    "electricity": ["arima", "random_forest", "xgboost", "hybrid"],
-    "retail": ["random_forest", "xgboost", "hybrid"],
+    "electricity": ["naive", "arima", "random_forest", "xgboost", "lstm", "hybrid"],
+    "retail": ["naive", "random_forest", "xgboost", "lstm", "hybrid"],
 }
 
 # Base catalog entries (domains + type). Runtime flags are derived.
@@ -77,8 +77,8 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "model_type": "deep_sequence",
         "domains": ["retail", "electricity"],
         "test_forecast": True,
-        "compare_default": False,
-        "notes": "Supported for held-out test evaluation; future forecasting is not enabled.",
+        "compare_default": True,
+        "notes": "Supported for held-out test evaluation.",
     },
     {
         "key": "cnn_lstm",

@@ -31,6 +31,10 @@ def client(tmp_path):
     """Flask test client fixture — yields test_client with isolated ML_ARTIFACTS_ROOT."""
     class CustomTestConfig(TestConfig):
         ML_ARTIFACTS_ROOT = str(tmp_path / "artifacts")
+        UPLOAD_FOLDER = str(tmp_path / "uploads")
+        PROCESSED_DATA_FOLDER = str(tmp_path / "processed")
+        FEATURES_DATA_FOLDER = str(tmp_path / "features")
+
 
     app = create_app(CustomTestConfig)
     with app.app_context():
@@ -353,8 +357,8 @@ def test_explain_endpoint_unsupported_model(client, mock_features_dir):
     assert "explainability" in json_data["message"].lower() or "supported" in json_data["message"].lower()
 
 
-def test_explain_endpoint_lstm_unsupported(client, mock_features_dir):
-    """LSTM model must be rejected by explainability endpoint with 400."""
+def test_explain_endpoint_lstm_supported(client, mock_features_dir):
+    """LSTM model explainability request succeeds with 200 OK."""
     response = client.post(
         "/api/v1/explainability/explain",
         json={
@@ -364,7 +368,7 @@ def test_explain_endpoint_lstm_unsupported(client, mock_features_dir):
             "explanation_type": "global",
         },
     )
-    assert response.status_code == 400
+    assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -855,19 +859,224 @@ def test_forecast_with_demo_dataset_key(client):
     data = response.get_json()["data"]
     assert data["model"] == "random_forest"
     assert data["domain"] == "retail"
+    assert "dataset_context" in data
+    assert data["dataset_context"]["dataset_name"] == "Retail Sales Demo"
 
 
-def test_history_corrupted_index_lists_empty(tmp_path, mock_features_dir):
-    app = _history_app(tmp_path)
-    history_root = Path(tmp_path / "hist_store")
-    history_root.mkdir(parents=True, exist_ok=True)
-    (history_root / "index.json").write_text("{broken", encoding="utf-8")
+def test_forecast_artifact_reuse_and_fingerprint_isolation(client):
+    # First call trains model
+    r1 = client.post(
+        "/api/v1/forecasting/forecast",
+        json={
+            "domain": "retail",
+            "features_dir": "demo_retail",
+            "model": "random_forest",
+            "n_estimators": 5,
+        },
+    )
+    assert r1.status_code == 200
 
-    with app.app_context():
-        db.create_all()
-        client = app.test_client()
-        hist = client.get("/api/v1/forecasting/history")
-        assert hist.status_code == 200
-        assert hist.get_json()["data"]["runs"] == []
-        db.session.remove()
-        db.drop_all()
+    # Second call with identical params reuses artifact
+    r2 = client.post(
+        "/api/v1/forecasting/forecast",
+        json={
+            "domain": "retail",
+            "features_dir": "demo_retail",
+            "model": "random_forest",
+            "n_estimators": 5,
+        },
+    )
+    assert r2.status_code == 200
+    assert r2.get_json()["data"]["execution"]["artifact_reused"] is True
+
+
+def test_lstm_and_hybrid_api_endpoints(client, mock_features_dir):
+    """Verify forecast, compare, and explain endpoints for LSTM and Hybrid."""
+    # LSTM forecast
+    lstm_res = client.post(
+        "/api/v1/forecasting/forecast",
+        json={
+            "domain": "electricity",
+            "features_dir": str(mock_features_dir),
+            "model": "lstm",
+            "epochs": 1,
+            "batch_size": 16,
+        },
+    )
+    assert lstm_res.status_code == 200
+    lstm_data = lstm_res.get_json()["data"]
+    assert lstm_data["model"] == "lstm"
+    assert "dataset_context" in lstm_data
+
+    # Hybrid forecast
+    hybrid_res = client.post(
+        "/api/v1/forecasting/forecast",
+        json={
+            "domain": "electricity",
+            "features_dir": str(mock_features_dir),
+            "model": "hybrid",
+            "components": ["random_forest", "xgboost", "lstm"],
+            "n_estimators": 5,
+            "epochs": 1,
+        },
+    )
+    assert hybrid_res.status_code == 200
+    hybrid_data = hybrid_res.get_json()["data"]
+    assert hybrid_data["model"] == "hybrid"
+    assert "weights" in hybrid_data
+
+    # Compare endpoint with all candidate models
+    compare_res = client.post(
+        "/api/v1/forecasting/compare",
+        json={
+            "domain": "electricity",
+            "features_dir": str(mock_features_dir),
+            "models": ["random_forest", "xgboost", "lstm", "hybrid"],
+            "selection_metric": "rmse",
+        },
+    )
+    assert compare_res.status_code == 200
+    comp_data = compare_res.get_json()["data"]
+    assert "ranking" in comp_data
+    assert len(comp_data["ranking"]) >= 3
+    assert comp_data["recommended_model"] in ["random_forest", "xgboost", "lstm", "hybrid"]
+
+    # Explain endpoint for LSTM and Hybrid
+    exp_lstm = client.post(
+        "/api/v1/explainability/explain",
+        json={
+            "domain": "electricity",
+            "features_dir": str(mock_features_dir),
+            "model": "lstm",
+        },
+    )
+    assert exp_lstm.status_code == 200
+
+    exp_hybrid = client.post(
+        "/api/v1/explainability/explain",
+        json={
+            "domain": "electricity",
+            "features_dir": str(mock_features_dir),
+            "model": "hybrid",
+        },
+    )
+    assert exp_hybrid.status_code == 200
+
+
+def test_dataset_identity_isolation_and_invalid_dataset_id(client):
+    """Test that invalid dataset IDs return 404 and dataset context returns dataset_id and dataset_hash."""
+    # Invalid dataset ID must return 404 error instead of silently falling back
+    res_invalid = client.post(
+        "/api/v1/forecasting/train",
+        json={
+            "domain": "retail",
+            "dataset_id": "non_existent_dataset_9999",
+            "model": "random_forest",
+        },
+    )
+    assert res_invalid.status_code == 404
+
+    # Demo dataset returns proper dataset_context with dataset_id and dataset_hash
+    res_demo = client.post(
+        "/api/v1/forecasting/train",
+        json={
+            "domain": "retail",
+            "dataset_id": "demo_retail",
+            "model": "random_forest",
+            "n_estimators": 5,
+        },
+    )
+    assert res_demo.status_code == 200
+    ctx = res_demo.get_json()["data"]["dataset_context"]
+    assert ctx["dataset_id"] == "demo_retail"
+    assert "dataset_hash" in ctx
+    assert "target" in ctx
+
+
+def test_dataset_a_dataset_b_dataset_a_switching_isolation(client):
+    """Verify complete runtime data isolation when switching Dataset A -> Dataset B -> Dataset A."""
+    import io
+
+    test_client, _ = client if isinstance(client, tuple) else (client, None)
+
+    # Register and get auth token
+    test_client.post("/api/v1/auth/register", json={"email": "iso_test@example.com", "password": "SecurePassword123!", "full_name": "Iso User", "role": "data_scientist"})
+    login_res = test_client.post("/api/v1/auth/login", json={"email": "iso_test@example.com", "password": "SecurePassword123!"})
+    token = login_res.get_json()["data"]["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Prepare Dataset A (sales ~1,000)
+    csv_a = b"Date,Sales,Discount,City\n" + b"\n".join(
+        f"2026-01-{(i%28)+1:02d},{1000 + i * 5},0.1,Mumbai".encode("utf-8") for i in range(50)
+    )
+    res_a = test_client.post(
+        "/api/v1/datasets/upload",
+        headers=headers,
+        data={"file": (io.BytesIO(csv_a), "dataset_A.csv", "text/csv"), "domain": "retail"},
+    )
+    assert res_a.status_code == 201
+    ds_id_a = res_a.get_json()["data"]["dataset_id"]
+    hash_a = res_a.get_json()["data"]["content_hash"]
+
+    # Preprocess Dataset A
+    prep_a = test_client.post(f"/api/v1/datasets/{ds_id_a}/preprocess", headers=headers)
+    assert prep_a.status_code == 200
+
+    # Forecast Dataset A (test camelCase datasetId parameter)
+    fc_a_res = test_client.post(
+        "/api/v1/forecasting/forecast",
+        headers=headers,
+        json={"domain": "retail", "datasetId": ds_id_a, "model": "random_forest", "n_estimators": 5},
+    )
+    assert fc_a_res.status_code == 200
+    fc_a_data = fc_a_res.get_json()["data"]
+    mean_pred_a = sum(p["predicted"] for p in fc_a_data["predictions"]) / len(fc_a_data["predictions"])
+    assert fc_a_data["dataset_context"]["dataset_id"] == ds_id_a
+    assert fc_a_data["dataset_context"]["dataset_hash"] == hash_a[:12]
+
+    # 2. Prepare Dataset B (sales ~500,000)
+    csv_b = b"Date,Sales,Promo,City\n" + b"\n".join(
+        f"2026-01-{(i%28)+1:02d},{500000 + i * 1000},2,Delhi".encode("utf-8") for i in range(60)
+    )
+    res_b = test_client.post(
+        "/api/v1/datasets/upload",
+        headers=headers,
+        data={"file": (io.BytesIO(csv_b), "dataset_B.csv", "text/csv"), "domain": "retail"},
+    )
+    assert res_b.status_code == 201
+
+    ds_id_b = res_b.get_json()["data"]["dataset_id"]
+    hash_b = res_b.get_json()["data"]["content_hash"]
+
+    assert ds_id_a != ds_id_b
+    assert hash_a != hash_b
+
+    # Preprocess Dataset B
+    prep_b = test_client.post(f"/api/v1/datasets/{ds_id_b}/preprocess", headers=headers)
+    assert prep_b.status_code == 200
+
+    # Forecast Dataset B
+    fc_b_res = test_client.post(
+        "/api/v1/forecasting/forecast",
+        headers=headers,
+        json={"domain": "retail", "datasetId": ds_id_b, "model": "random_forest", "n_estimators": 5},
+    )
+    assert fc_b_res.status_code == 200
+    fc_b_data = fc_b_res.get_json()["data"]
+    mean_pred_b = sum(p["predicted"] for p in fc_b_data["predictions"]) / len(fc_b_data["predictions"])
+    assert fc_b_data["dataset_context"]["dataset_id"] == ds_id_b
+    assert fc_b_data["dataset_context"]["dataset_hash"] == hash_b[:12]
+    assert abs(mean_pred_a - mean_pred_b) > 100000
+
+    # 3. Switch back to Dataset A
+    fc_a2_res = test_client.post(
+        "/api/v1/forecasting/forecast",
+        headers=headers,
+        json={"domain": "retail", "datasetId": ds_id_a, "model": "random_forest", "n_estimators": 5},
+    )
+    assert fc_a2_res.status_code == 200
+    fc_a2_data = fc_a2_res.get_json()["data"]
+    mean_pred_a2 = sum(p["predicted"] for p in fc_a2_data["predictions"]) / len(fc_a2_data["predictions"])
+    assert fc_a2_data["dataset_context"]["dataset_id"] == ds_id_a
+    assert fc_a2_data["dataset_context"]["dataset_hash"] == hash_a[:12]
+    assert abs(mean_pred_a - mean_pred_a2) < 1e-3

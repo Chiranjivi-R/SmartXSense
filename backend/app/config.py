@@ -7,7 +7,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
-load_dotenv()
+# Load .env from the backend directory (works regardless of CWD)
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_ENV_FILE)
+
 
 
 class Config:
@@ -31,3 +34,9 @@ class Config:
         str(Path(__file__).resolve().parents[2] / "ml_engine" / "artifacts" / "history"),
     )
     MAX_CONTENT_LENGTH = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+
+    # LLM Explanation Layer Configuration
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")

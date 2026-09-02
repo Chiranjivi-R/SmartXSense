@@ -88,8 +88,24 @@ def test_shap_preprocessing_consistency_no_refit(synthetic_data):
 
 
 def test_shap_unsupported_model_rejection():
-    with pytest.raises(ExplainabilityError, match="Explainability is currently supported for Random Forest and XGBoost"):
+    with pytest.raises(ExplainabilityError, match="Explainability is supported for"):
         ForecastExplainer(None, model_name="arima")
 
-    with pytest.raises(ExplainabilityError, match="Explainability is currently supported for Random Forest and XGBoost"):
-        ForecastExplainer(None, model_name="lstm")
+
+def test_forecast_explainer_non_empty_feature_importance(synthetic_data):
+    train_df, val_df = synthetic_data
+    rf = RandomForestForecaster(n_estimators=10, random_state=42)
+    rf.fit(train_df, target_column="demand_mw")
+
+    explainer = ForecastExplainer(rf, model_name="random_forest")
+    exp = explainer.explain_global(val_df)
+
+    assert exp["status"] == "success"
+    assert exp["model"] == "random_forest"
+    assert "feature_importance" in exp
+    assert len(exp["feature_importance"]) > 0
+    assert "features" in exp
+    assert len(exp["features"]) > 0
+    assert isinstance(exp["features"], list)
+    assert "feature" in exp["features"][0]
+    assert "importance" in exp["features"][0]

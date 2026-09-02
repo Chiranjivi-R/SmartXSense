@@ -112,3 +112,97 @@ def test_ambiguous_multiple_target_candidates():
     # Request explicit target override
     override_profile = profile_dataset(df, domain="retail", requested_target="sales_revenue")
     assert override_profile["selected_target"] == "sales_revenue"
+
+
+def test_online_retail_dataset_intelligence():
+    # Online Retail CSV schema: index, InvoiceNo, StockCode, Description, Quantity, InvoiceDate, UnitPrice, CustomerID, Country
+    dates = [f"2026-01-{i:02d} 12:00:00" for i in range(1, 15)]
+    df = pd.DataFrame({
+        "index": list(range(14)),
+        "InvoiceNo": [f"5363{i}" for i in range(14)],
+        "StockCode": [f"85123{i}" for i in range(14)],
+        "Description": ["WHITE HANGING HEART T-LIGHT HOLDER"] * 14,
+        "Quantity": [6, 6, 8, 6, 6, 2, 6, 6, 6, 32, 6, 6, 8, 6],
+        "InvoiceDate": dates,
+        "UnitPrice": [2.55] * 14,
+        "CustomerID": [17850.0 + i for i in range(14)],
+        "Country": ["United Kingdom"] * 14,
+    })
+
+    time_col, time_candidates, _ = detect_time_column(df)
+    target_col, target_candidates, _ = detect_target_column(df, domain="retail")
+    geo_cols = detect_geographic_columns(df)
+    profile = profile_dataset(df, domain="retail")
+
+    assert time_col == "InvoiceDate"
+    assert "InvoiceDate" in time_candidates
+    assert target_col == "Quantity"
+    assert "Quantity" in target_candidates
+    assert "Country" in geo_cols
+    assert profile["suitable"] is True
+    assert profile["selected_target"] == "Quantity"
+    assert profile["time_column"] == "InvoiceDate"
+    assert profile["geographic_columns"] == ["Country"]
+
+
+def test_alternative_naming_and_casing_variations():
+    # Test alternative column names: order_date, qty, country_name
+    dates = [f"2026-02-{i:02d}" for i in range(1, 15)]
+    df1 = pd.DataFrame({
+        "order_date": dates,
+        "qty": [10, 20, 15, 25, 30, 12, 18, 22, 19, 31, 24, 28, 14, 16],
+        "country_name": ["France"] * 14,
+    })
+    time_col, _, _ = detect_time_column(df1)
+    target_col, _, _ = detect_target_column(df1, domain="retail")
+    geo_cols = detect_geographic_columns(df1)
+
+    assert time_col == "order_date"
+    assert target_col == "qty"
+    assert geo_cols == ["country_name"]
+
+    # Test casing variations: invoicedate, INVOICE_DATE, COUNTRY
+    df2 = pd.DataFrame({
+        "INVOICE_DATE": dates,
+        "QUANTITY_SOLD": [100 + i for i in range(14)],
+        "COUNTRY": ["Germany"] * 14,
+    })
+    time_col2, _, _ = detect_time_column(df2)
+    target_col2, _, _ = detect_target_column(df2, domain="retail")
+    geo_cols2 = detect_geographic_columns(df2)
+
+    assert time_col2 == "INVOICE_DATE"
+    assert target_col2 == "QUANTITY_SOLD"
+    assert geo_cols2 == ["COUNTRY"]
+
+
+def test_electricity_dataset_intelligence():
+    dates = [f"2026-03-01 {i:02d}:00:00" for i in range(15)]
+    df = pd.DataFrame({
+        "timestamp": dates,
+        "load": [1200 + i * 10 for i in range(15)],
+        "region": ["Northern"] * 15,
+    })
+    time_col, _, _ = detect_time_column(df)
+    target_col, _, _ = detect_target_column(df, domain="electricity")
+    geo_cols = detect_geographic_columns(df)
+    profile = profile_dataset(df, domain="electricity")
+
+    assert time_col == "timestamp"
+    assert target_col == "load"
+    assert "region" in geo_cols
+    assert profile["suitable"] is True
+
+
+def test_dataset_without_geography():
+    dates = [f"2026-04-{i:02d}" for i in range(1, 15)]
+    df = pd.DataFrame({
+        "date": dates,
+        "sales": [50 + i for i in range(14)],
+    })
+    geo_cols = detect_geographic_columns(df)
+    profile = profile_dataset(df, domain="retail")
+
+    assert geo_cols == []
+    assert profile["geographic_columns"] == []
+    assert profile["suitable"] is True

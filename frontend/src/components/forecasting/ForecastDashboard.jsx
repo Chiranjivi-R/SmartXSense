@@ -11,6 +11,7 @@ import {
   fetchForecastHistory,
   fetchDatasets,
   profileDataset,
+  fetchDatasetGeography,
   FUTURE_HORIZON_PRESETS,
   FUTURE_SUPPORTED_MODELS,
   DOMAIN_FEATURE_ARTIFACTS,
@@ -76,7 +77,8 @@ const formatNumber = (val, decimals = 2) => {
 
 const formatMape = (val) => {
   if (val === undefined || val === null || isNaN(val)) return '—';
-  const pct = val > 1 ? val : val * 100;
+  const num = Number(val);
+  const pct = num < 50 ? num * 100 : num;
   return `${pct.toFixed(2)}%`;
 };
 
@@ -112,14 +114,81 @@ const DOMAIN_CONTEXTS = {
   electricity: 'Forecasting electricity grid demand using temporal patterns, historical load, and rolling aggregate features.',
 };
 
+/**
+ * Render a markdown-formatted LLM explanation (with ### headings) as styled React elements.
+ * Prevents ### characters from appearing literally in the UI.
+ */
+function renderMarkdownExplanation(text) {
+  if (!text) return null;
+  const lines = text.split('\n');
+  const elements = [];
+  let currentParagraphLines = [];
+
+  const flushParagraph = (key) => {
+    if (currentParagraphLines.length > 0) {
+      const joined = currentParagraphLines.join(' ').trim();
+      if (joined) {
+        elements.push(
+          <p key={`p-${key}`} style={{ margin: '0 0 6px 0', lineHeight: 1.65, color: COLORS.text.primary }}>
+            {joined}
+          </p>
+        );
+      }
+      currentParagraphLines = [];
+    }
+  };
+
+  lines.forEach((line, idx) => {
+    const h3Match = line.match(/^###\s+(.+)/);
+    const h2Match = line.match(/^##\s+(.+)/);
+    const h1Match = line.match(/^#\s+(.+)/);
+    const bulletMatch = line.match(/^[-*]\s+(.+)/);
+
+    if (h1Match || h2Match || h3Match) {
+      flushParagraph(idx);
+      const headingText = (h3Match || h2Match || h1Match)[1];
+      elements.push(
+        <div key={`h-${idx}`} style={{
+          fontSize: 13,
+          fontWeight: 800,
+          color: COLORS.primary,
+          marginTop: elements.length > 0 ? 14 : 0,
+          marginBottom: 6,
+          fontFamily: "'Space Grotesk', sans-serif",
+          letterSpacing: '0.01em',
+        }}>
+          {headingText}
+        </div>
+      );
+    } else if (bulletMatch) {
+      flushParagraph(idx);
+      elements.push(
+        <div key={`b-${idx}`} style={{ display: 'flex', gap: 6, marginBottom: 4, color: COLORS.text.primary, fontSize: 14, lineHeight: 1.6 }}>
+          <span style={{ color: COLORS.primary, flexShrink: 0 }}>•</span>
+          <span>{bulletMatch[1]}</span>
+        </div>
+      );
+    } else if (line.trim() === '') {
+      flushParagraph(idx);
+    } else {
+      currentParagraphLines.push(line.trim());
+    }
+  });
+  flushParagraph('end');
+  return elements;
+}
+
+
 export default function ForecastDashboard({ initialDomain = 'retail', userRole = 'viewer', accessToken = null }) {
   const [domain, setDomain] = useState(initialDomain);
-  const [model, setModel] = useState('random_forest');
+  const [model, setModel] = useState('auto_select');
 
   // State Management
   const [forecastLoading, setForecastLoading] = useState(false);
+  const [forecastStage, setForecastStage] = useState('');
   const [forecastData, setForecastData] = useState(null);
   const [forecastError, setForecastError] = useState(null);
+
 
   const [compareLoading, setCompareLoading] = useState(false);
   const [compareData, setCompareData] = useState(null);
@@ -160,6 +229,13 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
   const [profileError, setProfileError] = useState(null);
   const [selectedTargetOverride, setSelectedTargetOverride] = useState(null);
 
+  // Geographic Scope State
+  const [geoMeta, setGeoMeta] = useState(null);
+  const [geoFilters, setGeoFilters] = useState({ country: '', state: '', district: '', region: '', city: '', location: '' });
+  const [selectedLocation, setSelectedLocation] = useState('');
+  const [geoLoading, setGeoLoading] = useState(false);
+  const [geoError, setGeoError] = useState(null);
+
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyRuns, setHistoryRuns] = useState([]);
   const [historyError, setHistoryError] = useState(null);
@@ -185,6 +261,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       setSelectedDatasetId(nextSelectedId || null);
       if (nextSelectedId) {
         loadDatasetProfile(nextSelectedId, targetDomain);
+        loadDatasetGeography(nextSelectedId, { country: '', state: '', district: '', region: '', city: '', location: '' });
       }
       return list;
     } catch (err) {
@@ -221,6 +298,30 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       setDatasetProfile(null);
     } finally {
       setProfileLoading(false);
+    }
+  };
+
+  const loadDatasetGeography = async (dsId = selectedDatasetId, filters = geoFilters) => {
+    if (!dsId) {
+      setGeoMeta(null);
+      return;
+    }
+    setGeoLoading(true);
+    setGeoError(null);
+    try {
+      const res = await fetchDatasetGeography({
+        datasetId: dsId,
+        geoFilters: filters,
+        location: selectedLocation || undefined,
+        accessToken,
+      });
+      setGeoMeta(res);
+    } catch (err) {
+      console.error('Dataset geography error:', err);
+      setGeoError(err.message || 'Unable to fetch geographic metadata.');
+      setGeoMeta(null);
+    } finally {
+      setGeoLoading(false);
     }
   };
 
@@ -275,13 +376,14 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     handleDomainSwitch(initialDomain);
   }, [initialDomain]);
 
-  // Initial forecast on mount
+  // Initial forecast on mount: loads datasets and automatically triggers handleDatasetChange for default dataset
   useEffect(() => {
     const init = async () => {
       const list = await loadDatasets(initialDomain);
       const defaultDs = list[0];
-      const targetFeaturesDir = defaultDs?.features_dir || defaultDs?.dataset_id;
-      handleRunForecast('random_forest', initialDomain, targetFeaturesDir);
+      if (defaultDs?.dataset_id) {
+        await handleDatasetChange(defaultDs.dataset_id, initialDomain, 'random_forest');
+      }
       loadForecastHistory();
     };
     init();
@@ -297,6 +399,8 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     setDomain(newDomain);
     setModel(validModel);
     setUploadDomain(newDomain);
+    setGeoFilters({ country: '', state: '', district: '', region: '', city: '', location: '' });
+    setSelectedLocation('');
     setForecastData(null);
     setCompareData(null);
     setExplainData(null);
@@ -312,9 +416,84 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
 
     const list = await loadDatasets(newDomain);
     const defaultDs = list[0];
-    const targetFeaturesDir = defaultDs?.features_dir || defaultDs?.dataset_id;
-    handleRunForecast(validModel, newDomain, targetFeaturesDir);
+    if (defaultDs?.dataset_id) {
+      await handleDatasetChange(defaultDs.dataset_id, newDomain, validModel);
+    }
   };
+
+  // Primary dataset change handler: resets prior state, inspects new schema, and auto-selects FIRST available location (or All Data)
+  const handleDatasetChange = async (
+    selectedId,
+    targetDomain = domain,
+    targetModel = model,
+  ) => {
+    if (!selectedId) return;
+    domainRequestToken.current += 1;
+    const requestToken = domainRequestToken.current;
+
+    // Step 1: Wipe all old state and graph immediately
+    setSelectedDatasetId(selectedId);
+    setForecastData(null);
+    setCompareData(null);
+    setExplainData(null);
+    setFutureData(null);
+    setForecastError(null);
+    setCompareError(null);
+    setExplainError(null);
+    setFutureError(null);
+    setGeoFilters({ country: '', state: '', district: '', region: '', city: '', location: '' });
+    setSelectedLocation('');
+    setForecastLoading(true);
+
+    // Step 2: Load profile & geography for new dataset
+    loadDatasetProfile(selectedId, targetDomain);
+
+    try {
+      const geoRes = await fetchDatasetGeography({
+        datasetId: selectedId,
+        geoFilters: {},
+        accessToken,
+      });
+      if (requestToken !== domainRequestToken.current) return;
+      setGeoMeta(geoRes);
+
+      let targetLoc = '';
+      let targetFilters = { country: '', state: '', district: '', region: '', city: '', location: '' };
+
+      if (geoRes?.has_geography && geoRes?.available_locations?.length > 0) {
+        // Automatically select the FIRST available location from the newly selected dataset
+        targetLoc = geoRes.available_locations[0];
+        targetFilters = { ...targetFilters, location: targetLoc };
+        setSelectedLocation(targetLoc);
+        setGeoFilters(targetFilters);
+      } else {
+        setSelectedLocation('');
+        setGeoFilters(targetFilters);
+      }
+
+      // Step 3: Run forecast for the new dataset and automatically selected location (or All Data)
+      handleRunForecast(targetModel, targetDomain, selectedId, false, targetFilters, targetLoc);
+    } catch (err) {
+      console.error('Failed to resolve geography on dataset change:', err);
+      if (requestToken !== domainRequestToken.current) return;
+      setSelectedLocation('');
+      handleRunForecast(targetModel, targetDomain, selectedId, false, {}, '');
+    }
+  };
+
+  // Location switch runner: immediately clears old location forecast and runs new forecast
+  const handleLocationChange = (nextFilters, locLabel = '') => {
+    setGeoFilters(nextFilters);
+    setSelectedLocation(locLabel);
+    setForecastData(null);
+    setCompareData(null);
+    setExplainData(null);
+    setFutureData(null);
+    setForecastError(null);
+    loadDatasetGeography(selectedDatasetId, nextFilters);
+    handleRunForecast(model, domain, undefined, false, nextFilters, locLabel);
+  };
+
 
   // Primary forecast runner
   const handleRunForecast = async (
@@ -322,12 +501,18 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     targetDomain = domain,
     featuresDirOverride = undefined,
     forceRetrain = false,
+    overrideGeoFilters = undefined,
+    overrideLocation = undefined,
   ) => {
     const requestToken = domainRequestToken.current;
+    const activeGeo = overrideGeoFilters !== undefined ? overrideGeoFilters : geoFilters;
+    const activeLoc = overrideLocation !== undefined ? overrideLocation : selectedLocation;
+
     setForecastLoading(true);
     setForecastError(null);
     setExplainData(null);
     setExplainError(null);
+    setForecastData(null); // Clear previous graph immediately
 
     let actualModel = targetModel;
     let recModel = null;
@@ -340,6 +525,10 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         try {
           const compResult = await compareModels({
             domain: targetDomain,
+            datasetId: selectedDatasetId,
+            target: selectedTargetOverride,
+            location: activeLoc || undefined,
+            geoFilters: activeGeo,
             featuresDir: activeFeaturesDir,
           });
           if (requestToken !== domainRequestToken.current) return;
@@ -361,6 +550,10 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       const res = await runForecast({
         domain: targetDomain,
         model: actualModel,
+        datasetId: selectedDatasetId,
+        target: selectedTargetOverride,
+        location: activeLoc || undefined,
+        geoFilters: activeGeo,
         featuresDir: activeFeaturesDir,
         predictionLimit: 100,
         selectionMethod: targetModel === 'auto_select' ? 'validation_rmse' : undefined,
@@ -373,11 +566,11 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
 
       // Trigger SHAP explainability for supported tree models
       if (['random_forest', 'xgboost'].includes(actualModel)) {
-        fetchExplainability(targetDomain, actualModel, activeFeaturesDir);
+        fetchExplainability(targetDomain, actualModel, activeFeaturesDir, activeGeo, activeLoc);
       }
     } catch (err) {
       console.error('Forecast error:', err);
-      setForecastError('Forecast request failed. Please verify that the SmartXSense backend server is running.');
+      setForecastError(err.message || 'Forecast request failed. Please verify backend service.');
     } finally {
       setForecastLoading(false);
     }
@@ -391,19 +584,29 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     try {
       const res = await compareModels({
         domain,
+        datasetId: selectedDatasetId,
+        target: selectedTargetOverride,
+        location: selectedLocation || undefined,
+        geoFilters,
         featuresDir: getActiveFeaturesDir(),
       });
       if (requestToken === domainRequestToken.current) setCompareData(res);
     } catch (err) {
       console.error('Comparison error:', err);
-      setCompareError('Model comparison request failed. Please verify backend service.');
+      setCompareError(err.message || 'Model comparison request failed. Please verify backend service.');
     } finally {
       setCompareLoading(false);
     }
   };
 
   // Explainability runner
-  const fetchExplainability = async (expDomain, expModel, featuresDirOverride = undefined) => {
+  const fetchExplainability = async (
+    expDomain,
+    expModel,
+    featuresDirOverride = undefined,
+    expGeo = geoFilters,
+    expLoc = selectedLocation,
+  ) => {
     const requestToken = domainRequestToken.current;
     setExplainLoading(true);
     setExplainError(null);
@@ -411,6 +614,10 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       const res = await explainForecast({
         domain: expDomain,
         model: expModel,
+        datasetId: selectedDatasetId,
+        target: selectedTargetOverride,
+        location: expLoc || undefined,
+        geoFilters: expGeo,
         featuresDir: getActiveFeaturesDir(featuresDirOverride),
         explanationType: 'global',
         method: 'shap',
@@ -439,6 +646,10 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       const res = await runFutureForecast({
         domain,
         model: futureModel,
+        datasetId: selectedDatasetId,
+        target: selectedTargetOverride,
+        location: selectedLocation || undefined,
+        geoFilters,
         horizon: Number(futureHorizon),
         featuresDir: getActiveFeaturesDir(),
       });
@@ -452,6 +663,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       setFutureLoading(false);
     }
   };
+
 
   const handleUseDemoDataset = () => {
     setCustomFeaturesDir(null);
@@ -514,9 +726,11 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       setDomain(uploadDomain);
       setFutureHorizon(FUTURE_HORIZON_PRESETS[uploadDomain]?.[0] || 7);
       const list = await loadDatasets(uploadDomain, uploaded.dataset_id);
-      const newDs = list.find((d) => d.dataset_id === uploaded.dataset_id);
-      const targetFDir = newDs?.features_dir || processed.features_dir;
-      await handleRunForecast(model, uploadDomain, targetFDir);
+      setSelectedDatasetId(uploaded.dataset_id);
+      setForecastData(null);
+      setCompareData(null);
+      setExplainData(null);
+      await handleRunForecast(model, uploadDomain, uploaded.dataset_id);
     } catch (err) {
       console.error('Upload pipeline error:', err);
       setUploadError(err.message || 'Dataset upload/processing failed.');
@@ -676,13 +890,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             </label>
             <select
               value={selectedDatasetId || ''}
-              onChange={(e) => {
-                const selectedId = e.target.value;
-                setSelectedDatasetId(selectedId);
-                const dsObj = datasetsList.find((d) => d.dataset_id === selectedId);
-                const fDir = dsObj?.features_dir || dsObj?.dataset_id;
-                handleRunForecast(model, domain, fDir);
-              }}
+              onChange={(e) => handleDatasetChange(e.target.value)}
               disabled={datasetsLoading || datasetsList.length === 0}
               style={{
                 width: '100%',
@@ -697,14 +905,28 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               }}
             >
               {datasetsList.length === 0 ? (
+
                 <option value="">No datasets available</option>
               ) : (
-                datasetsList.map((d) => (
-                  <option key={d.dataset_id} value={d.dataset_id}>
-                    {d.filename || d.dataset_id} {d.is_demo ? '(Demo)' : '(Uploaded)'}
-                  </option>
-                ))
+                datasetsList.map((d) => {
+                  // Build a meaningful identity suffix for uploaded datasets.
+                  // Prefer content_hash prefix (6 hex chars) so identical files
+                  // resolve to the same label; fall back to dataset_id prefix.
+                  let suffix = d.is_demo ? '(Demo)' : '';
+                  if (!d.is_demo && d.dataset_id) {
+                    const hashPrefix = d.content_hash
+                      ? `#${d.content_hash.slice(0, 6)}`
+                      : d.dataset_id.slice(0, 8);
+                    suffix = `(Uploaded ${hashPrefix})`;
+                  }
+                  return (
+                    <option key={d.dataset_id} value={d.dataset_id}>
+                      {d.filename || d.dataset_id} {suffix}
+                    </option>
+                  );
+                })
               )}
+
             </select>
           </div>
 
@@ -732,10 +954,11 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
                 outline: 'none',
               }}
             >
+              <option value="auto_select">⚡ Auto Select / Best Model (Validation Recommended)</option>
               <option value="random_forest">Random Forest (Tree Ensemble)</option>
               <option value="xgboost">XGBoost (Gradient Boosted Trees)</option>
               <option value="hybrid">Hybrid Ensemble (Validation-Weighted)</option>
-              <option value="auto_select">⚡ Auto Select (Validation Recommended)</option>
+              <option value="lstm">LSTM (PyTorch Deep Sequence)</option>
               {domain === 'electricity' && <option value="arima">ARIMA (Time Series)</option>}
             </select>
           </div>
@@ -825,8 +1048,8 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               <div style={{ fontSize: 13, color: COLORS.accent, padding: '6px 0' }}>{profileError}</div>
             ) : datasetProfile ? (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                {/* Metrics Grid */}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10 }}>
+                {/* Compact Data Quality & Readiness Summary Grid */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10 }}>
                   <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
                     <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Rows & Columns</div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.text.primary, marginTop: 2 }}>
@@ -835,7 +1058,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
                   </div>
 
                   <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
-                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Detected Date Column</div>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Date Column</div>
                     <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.primary, marginTop: 2 }}>
                       📅 {datasetProfile.time_column || 'None Detected'}
                     </div>
@@ -876,57 +1099,313 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
                       </div>
                     )}
                   </div>
+
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Unique Timestamps</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.text.primary, marginTop: 2 }}>
+                      ⏱️ {formatNumber(datasetProfile.unique_timestamps || datasetProfile.suitability?.unique_timestamps || 0, 0)}
+                    </div>
+                  </div>
+
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Duplicates Removed</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.text.primary, marginTop: 2 }}>
+                      🧹 {formatNumber(datasetProfile.duplicate_rows_removed || datasetProfile.duplicate_rows || 0, 0)}
+                    </div>
+                  </div>
+
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Timestamps Handled</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.text.primary, marginTop: 2 }}>
+                      🔄 {formatNumber(datasetProfile.duplicate_timestamps_count || 0, 0)}
+                    </div>
+                  </div>
+
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Missing Imputed</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.text.primary, marginTop: 2 }}>
+                      ✨ {formatNumber(datasetProfile.missing_values_handled || 0, 0)}
+                    </div>
+                  </div>
+
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Excluded Features</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.warning, marginTop: 2 }}>
+                      🛡️ {datasetProfile.excluded_features_count ?? datasetProfile.ignored_columns?.length ?? 0}
+                    </div>
+                  </div>
+
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Forecast Features</div>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.primary, marginTop: 2 }}>
+                      📊 {datasetProfile.final_forecasting_features_count ?? 0}
+                    </div>
+                  </div>
+
+                  <div style={{ background: COLORS.bg.card, padding: 10, borderRadius: 8, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ fontSize: 11, color: COLORS.text.muted, textTransform: 'uppercase' }}>Suitability Status</div>
+                    <div
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 700,
+                        color:
+                          (datasetProfile.suitability?.classification || (datasetProfile.suitable ? 'SUITABLE' : 'UNSUITABLE')) === 'SUITABLE'
+                            ? COLORS.success
+                            : (datasetProfile.suitability?.classification === 'SUITABLE_WITH_WARNINGS' ? COLORS.warning : COLORS.accent),
+                        marginTop: 2,
+                      }}
+                    >
+                      {datasetProfile.suitability?.status_label || (datasetProfile.suitable ? '✓ Fully Suitable' : '⚠️ Unsuitable')}
+                    </div>
+                  </div>
                 </div>
 
-                {/* Feature Classifications */}
-                <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 12 }}>
-                  {datasetProfile.numeric_columns?.length > 0 && (
-                    <div>
-                      <span style={{ color: COLORS.text.muted }}>Numerical: </span>
-                      <span style={{ color: COLORS.text.primary, fontWeight: 600 }}>
-                        {datasetProfile.numeric_columns.join(', ')}
-                      </span>
+                {/* Explanation & Warnings/Reasons */}
+                <div style={{ background: COLORS.bg.card, borderRadius: 8, padding: 12, border: `1px solid ${COLORS.bg.border}`, fontSize: 12, color: COLORS.text.secondary, lineHeight: 1.5 }}>
+                  <div style={{ fontWeight: 600, color: COLORS.text.primary, marginBottom: 4 }}>
+                    {datasetProfile.explanation}
+                  </div>
+                  {datasetProfile.suitability?.warnings?.length > 0 && (
+                    <div style={{ color: COLORS.warning, marginTop: 4 }}>
+                      ⚠️ <strong>Warnings:</strong> {datasetProfile.suitability.warnings.join(' | ')}
                     </div>
                   )}
-                  {datasetProfile.categorical_columns?.length > 0 && (
-                    <div>
-                      <span style={{ color: COLORS.text.muted }}>Categorical: </span>
-                      <span style={{ color: COLORS.text.primary, fontWeight: 600 }}>
-                        {datasetProfile.categorical_columns.join(', ')}
-                      </span>
-                    </div>
-                  )}
-                  {datasetProfile.geographic_columns?.length > 0 && (
-                    <div>
-                      <span style={{ color: COLORS.text.muted }}>Geographic: </span>
-                      <span style={{ color: COLORS.warning, fontWeight: 700 }}>
-                        🌍 {datasetProfile.geographic_columns.join(', ')}
-                      </span>
-                    </div>
-                  )}
-                  {datasetProfile.ignored_columns?.length > 0 && (
-                    <div>
-                      <span style={{ color: COLORS.text.muted }}>Ignored: </span>
-                      <span style={{ color: COLORS.accent, fontWeight: 600 }}>
-                        🚫 {datasetProfile.ignored_columns.join(', ')}
-                      </span>
-                    </div>
-                  )}
-                </div>
-
-                {/* Explanation */}
-                <div style={{ background: COLORS.bg.card, borderRadius: 8, padding: 10, border: `1px solid ${COLORS.bg.border}`, fontSize: 12, color: COLORS.text.secondary, lineHeight: 1.4 }}>
-                  {datasetProfile.explanation}
-                  {datasetProfile.issues && datasetProfile.issues.length > 0 && (
-                    <div style={{ marginTop: 4, color: COLORS.accent, fontWeight: 600 }}>
-                      ⚠️ Issues: {datasetProfile.issues.join(' | ')}
+                  {datasetProfile.suitability?.reasons?.length > 0 && (
+                    <div style={{ color: COLORS.accent, marginTop: 4 }}>
+                      ⛔ <strong>Unsuitability Reasons:</strong> {datasetProfile.suitability.reasons.join(' | ')}
                     </div>
                   )}
                 </div>
               </div>
             ) : null}
+
+
           </div>
         )}
+
+        {/* Geographic Scope Card */}
+        {selectedDatasetId && geoMeta && (
+          <div
+            style={{
+              background: COLORS.bg.dark,
+              border: `1px solid ${COLORS.bg.border}`,
+              borderRadius: 12,
+              padding: 16,
+              marginTop: 4,
+            }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, flexWrap: 'wrap', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ fontSize: 18 }}>🌍</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary }}>Geographic Scope</span>
+                <span style={{ fontSize: 12, color: COLORS.text.muted }}>Cascading location filters</span>
+              </div>
+              {geoMeta.has_geography ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  {selectedLocation && (
+                    <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.success, background: `${COLORS.success}18`, padding: '2px 8px', borderRadius: 6, border: `1px solid ${COLORS.success}44` }}>
+                      📍 Active: {selectedLocation}
+                    </span>
+                  )}
+                  <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.primary, background: `${COLORS.primary}18`, padding: '2px 8px', borderRadius: 6, border: `1px solid ${COLORS.primary}44` }}>
+                    📊 {formatNumber(geoMeta.filtered_rows, 0)} / {formatNumber(geoMeta.total_rows, 0)} rows selected
+                  </div>
+                </div>
+              ) : (
+                <div style={{ fontSize: 12, color: COLORS.text.secondary }}>
+                  ℹ️ Geographic filtering is not applicable for this dataset.
+                </div>
+              )}
+            </div>
+
+            {geoMeta.has_geography ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginTop: 10 }}>
+                {/* Direct / Quick Location Selector */}
+                {geoMeta.available_locations?.length > 0 && (
+                  <div style={{ background: COLORS.bg.card, borderRadius: 10, padding: 12, border: `1px solid ${COLORS.bg.border}` }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexWrap: 'wrap', gap: 6 }}>
+                      <label style={{ fontSize: 11, fontWeight: 800, color: COLORS.primary, letterSpacing: '0.05em', textTransform: 'uppercase' }}>
+                        🎯 SELECT SPECIFIC LOCATION / PLACE
+                      </label>
+                      {selectedLocation && (
+                        <button
+                          type="button"
+                          onClick={() => handleLocationChange({ country: '', state: '', district: '', region: '', city: '', location: '' }, '')}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: COLORS.accent,
+                            fontSize: 11,
+                            fontWeight: 700,
+                            cursor: 'pointer',
+                            textDecoration: 'underline',
+                          }}
+                        >
+                          Reset to All Geographies
+                        </button>
+                      )}
+                    </div>
+                    <select
+                      value={selectedLocation || ''}
+                      onChange={(e) => {
+                        const loc = e.target.value;
+                        if (!loc) {
+                          handleLocationChange({ country: '', state: '', district: '', region: '', city: '', location: '' }, '');
+                        } else {
+                          handleLocationChange({ ...geoFilters, location: loc }, loc);
+                        }
+                      }}
+                      style={{
+                        width: '100%',
+                        background: COLORS.bg.dark,
+                        border: `1px solid ${selectedLocation ? COLORS.primary : COLORS.bg.border}`,
+                        borderRadius: 8,
+                        padding: '8px 12px',
+                        color: COLORS.text.primary,
+                        fontSize: 13,
+                        fontWeight: 700,
+                      }}
+                    >
+                      <option value="">-- All Geographies (Global Dataset) --</option>
+                      {geoMeta.available_locations.map((loc) => (
+                        <option key={loc} value={loc}>📍 {loc}</option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {/* Dynamic Hierarchy Filters derived from dataset schema */}
+                {geoMeta.hierarchy_levels && geoMeta.hierarchy_levels.length > 0 ? (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10 }}>
+                    {geoMeta.hierarchy_levels.map((lvl) => (
+                      <div key={lvl.level_key}>
+                        <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 4, textTransform: 'uppercase' }}>
+                          {lvl.label}
+                        </label>
+                        <select
+                          value={geoFilters[lvl.level_key] || ''}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            const next = { ...geoFilters, [lvl.level_key]: val };
+                            handleLocationChange(next, val || '');
+                          }}
+                          style={{
+                            width: '100%',
+                            background: COLORS.bg.card,
+                            border: `1px solid ${COLORS.bg.border}`,
+                            borderRadius: 8,
+                            padding: '6px 10px',
+                            color: COLORS.text.primary,
+                            fontSize: 12,
+                          }}
+                        >
+                          <option value="">All {lvl.label}s</option>
+                          {lvl.values?.map((v) => (
+                            <option key={v} value={v}>{v}</option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 10 }}>
+                    {geoMeta.levels?.countries?.length > 0 && (
+                      <div>
+                        <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 4 }}>COUNTRY</label>
+                        <select
+                          value={geoFilters.country || ''}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            const next = { country: val, state: '', district: '', region: '', city: '', location: '' };
+                            handleLocationChange(next, val);
+                          }}
+                          style={{ width: '100%', background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 8, padding: '6px 10px', color: COLORS.text.primary, fontSize: 12 }}
+                        >
+                          <option value="">All Countries</option>
+                          {geoMeta.levels.countries.map((c) => (<option key={c} value={c}>{c}</option>))}
+                        </select>
+                      </div>
+                    )}
+                    {geoMeta.levels?.states?.length > 0 && (
+                      <div>
+                        <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 4 }}>STATE</label>
+                        <select
+                          value={geoFilters.state || ''}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            const next = { ...geoFilters, state: val, district: '', region: '', city: '', location: '' };
+                            handleLocationChange(next, val || geoFilters.country || '');
+                          }}
+                          style={{ width: '100%', background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 8, padding: '6px 10px', color: COLORS.text.primary, fontSize: 12 }}
+                        >
+                          <option value="">All States</option>
+                          {geoMeta.levels.states.map((s) => (<option key={s} value={s}>{s}</option>))}
+                        </select>
+                      </div>
+                    )}
+                    {geoMeta.levels?.districts?.length > 0 && (
+                      <div>
+                        <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 4 }}>DISTRICT</label>
+                        <select
+                          value={geoFilters.district || ''}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            const next = { ...geoFilters, district: val, city: '', location: '' };
+                            handleLocationChange(next, val || geoFilters.state || '');
+                          }}
+                          style={{ width: '100%', background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 8, padding: '6px 10px', color: COLORS.text.primary, fontSize: 12 }}
+                        >
+                          <option value="">All Districts</option>
+                          {geoMeta.levels.districts.map((d) => (<option key={d} value={d}>{d}</option>))}
+                        </select>
+                      </div>
+                    )}
+                    {geoMeta.levels?.regions?.length > 0 && (
+                      <div>
+                        <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 4 }}>REGION</label>
+                        <select
+                          value={geoFilters.region || ''}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            const next = { ...geoFilters, region: val, city: '', location: '' };
+                            handleLocationChange(next, val || geoFilters.state || '');
+                          }}
+                          style={{ width: '100%', background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 8, padding: '6px 10px', color: COLORS.text.primary, fontSize: 12 }}
+                        >
+                          <option value="">All Regions</option>
+                          {geoMeta.levels.regions.map((r) => (<option key={r} value={r}>{r}</option>))}
+                        </select>
+                      </div>
+                    )}
+                    {geoMeta.levels?.cities?.length > 0 && (
+                      <div>
+                        <label style={{ display: 'block', fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, marginBottom: 4 }}>CITY / AREA</label>
+                        <select
+                          value={geoFilters.city || ''}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            const next = { ...geoFilters, city: val, location: '' };
+                            handleLocationChange(next, val || geoFilters.district || geoFilters.state || '');
+                          }}
+                          style={{ width: '100%', background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 8, padding: '6px 10px', color: COLORS.text.primary, fontSize: 12 }}
+                        >
+                          <option value="">All Cities</option>
+                          {geoMeta.levels.cities.map((ci) => (<option key={ci} value={ci}>{ci}</option>))}
+                        </select>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{ fontSize: 12, color: COLORS.text.secondary, background: COLORS.bg.card, padding: 12, borderRadius: 8, border: `1px solid ${COLORS.bg.border}`, marginTop: 8 }}>
+                ℹ️ <strong>Dataset contains no geographic columns.</strong> The forecasting pipeline, model selection, SHAP attribution, and charts are computed across the full dataset without geographic subdivision.
+              </div>
+            )}
+          </div>
+        )}
+
+
 
         {/* Dataset Upload (optional — demo datasets remain default) */}
         {canManageDatasets && <div style={{ marginTop: 4, background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 12, padding: 16 }}>
@@ -1049,6 +1528,51 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         </div>
       )}
 
+      {/* ─── Forecast Summary Context Banner ─── */}
+      {forecastData?.dataset_context && (
+        <div
+          style={{
+            background: COLORS.bg.card,
+            border: `1px solid ${COLORS.primary}44`,
+            borderRadius: 12,
+            padding: '12px 16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: 12,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 20 }}>📋</span>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary }}>
+                Forecast Summary Context: {forecastData.dataset_context.dataset_name}
+              </div>
+              <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 2 }}>
+                Dataset ID: <strong style={{ color: COLORS.primary, fontFamily: "'Space Mono', monospace" }}>{forecastData.dataset_context.dataset_id}</strong> | Hash: <strong style={{ color: COLORS.secondary, fontFamily: "'Space Mono', monospace" }}>{forecastData.dataset_context.dataset_hash}</strong> | Target: <strong style={{ color: COLORS.primary }}>{forecastData.dataset_context.target}</strong> | Scope: <strong style={{ color: COLORS.success }}>{forecastData.dataset_context.geography_label}</strong> {forecastData.dataset_context.rows_used > 0 ? `(${formatNumber(forecastData.dataset_context.rows_used, 0)} rows used)` : ''}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span style={{ fontSize: 12, color: COLORS.text.secondary }}>Model: <strong style={{ color: COLORS.text.primary, textTransform: 'capitalize' }}>{forecastData.dataset_context.model}</strong></span>
+            <span
+              style={{
+                background: forecastData.dataset_context.artifact_reused ? `${COLORS.success}22` : `${COLORS.warning}22`,
+                color: forecastData.dataset_context.artifact_reused ? COLORS.success : COLORS.warning,
+                border: `1px solid ${forecastData.dataset_context.artifact_reused ? COLORS.success : COLORS.warning}44`,
+                padding: '2px 8px',
+                borderRadius: 6,
+                fontSize: 11,
+                fontWeight: 700,
+              }}
+            >
+              {forecastData.dataset_context.artifact_reused ? '⚡ Artifact Reused' : '🏋️ Model Trained'}
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* ─── 2. Compact Forecast Summary Header ─── */}
       {forecastData && (
         <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 14, padding: '16px 20px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
@@ -1110,7 +1634,8 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       )}
 
       {/* ─── 3. Metric Cards with Tooltip Explanations ─── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
+      {/* ─── 3. Metric Cards & Baseline Comparison ─── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 14 }}>
         {[
           {
             label: 'MAE',
@@ -1123,6 +1648,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             label: 'RMSE',
             title: 'Root Mean Squared Error',
             value: formatNumber(forecastData?.test_metrics?.rmse),
+            sub: forecastData?.baseline_metrics ? `Baseline: ${formatNumber(forecastData.baseline_metrics.rmse)} (${forecastData.improvement_pct ?? 0}% imp)` : null,
             desc: 'Root mean squared error penalizing larger forecasting deviations.',
             color: COLORS.secondary,
           },
@@ -1131,6 +1657,13 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             title: 'Mean Abs % Error',
             value: formatMape(forecastData?.test_metrics?.mape),
             desc: 'Average percentage forecasting error across test horizon.',
+            color: COLORS.warning,
+          },
+          {
+            label: 'SMAPE / WAPE',
+            title: 'Symmetric & Weighted MAPE',
+            value: `${formatMape(forecastData?.test_metrics?.smape)} / ${formatMape(forecastData?.test_metrics?.wape)}`,
+            desc: 'Symmetric (SMAPE) and Weighted (WAPE) percentage errors (stable near zero).',
             color: COLORS.success,
           },
           {
@@ -1138,7 +1671,14 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             title: 'Coefficient of Determination',
             value: formatNumber(forecastData?.test_metrics?.r2, 4),
             desc: 'Explained variance / goodness of fit (1.0 = perfect fit).',
-            color: COLORS.warning,
+            color: (forecastData?.test_metrics?.r2 ?? 0) < 0 ? COLORS.accent : COLORS.warning,
+          },
+          {
+            label: 'Forecast Quality',
+            title: 'Overall Model Readiness',
+            value: forecastData?.forecast_quality || ((forecastData?.test_metrics?.r2 ?? 0) < 0 ? 'Needs Improvement' : 'Good'),
+            desc: 'Validation-checked model readiness status.',
+            color: (forecastData?.forecast_quality === 'Needs Improvement' || (forecastData?.test_metrics?.r2 ?? 0) < 0) ? COLORS.accent : COLORS.success,
           },
         ].map((m, idx) => (
           <div
@@ -1146,32 +1686,40 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             style={{
               background: COLORS.bg.card,
               border: `1px solid ${COLORS.bg.border}`,
-              borderRadius: 16,
-              padding: '20px',
+              borderRadius: 14,
+              padding: '16px',
               position: 'relative',
-              overflow: 'hidden',
               display: 'flex',
               flexDirection: 'column',
-              justify: 'space-between',
+              justifyContent: 'space-between',
             }}
           >
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.text.secondary, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: COLORS.text.secondary, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
                   {m.label}
                 </span>
                 <span style={{ fontSize: 11, color: COLORS.text.muted }} title={m.desc}>ℹ️</span>
               </div>
-              <div style={{ fontSize: 26, fontWeight: 800, color: m.color, fontFamily: "'Space Mono', monospace", margin: '6px 0' }}>
+              <div style={{ fontSize: 20, fontWeight: 800, color: m.color, fontFamily: "'Space Mono', monospace", margin: '6px 0' }}>
                 {forecastLoading ? '...' : m.value}
               </div>
+              {m.sub && (
+                <div style={{ fontSize: 10, color: COLORS.text.muted, marginTop: 2 }}>
+                  {m.sub}
+                </div>
+              )}
             </div>
-            <div style={{ fontSize: 11, color: COLORS.text.muted, lineHeight: 1.4, marginTop: 4 }}>
+            <div style={{ fontSize: 10, color: COLORS.text.muted, marginTop: 6, lineHeight: 1.3 }}>
               {m.desc}
             </div>
           </div>
         ))}
       </div>
+      <div style={{ fontSize: 11, color: COLORS.text.muted, marginTop: -6, marginBottom: 8, fontStyle: 'italic' }}>
+        * Note: MAPE can become unstable when actual demand values are zero or very small. SMAPE and WAPE are therefore also reported.
+      </div>
+
 
       {/* ─── Performance Interpretation Banner ─── */}
       {forecastData?.test_metrics && (
@@ -1184,6 +1732,139 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
           </span>
         </div>
       )}
+
+      {/* ─── AI Explanation / Explainable AI Section ─── */}
+      {forecastData?.llm_explanation && (
+        <div
+          style={{
+            background: COLORS.bg.card,
+            border: `1px solid ${COLORS.primary}66`,
+            borderRadius: 16,
+            padding: 24,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 16,
+            boxShadow: `0 8px 32px ${COLORS.primary}15`,
+          }}
+        >
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <span style={{ fontSize: 22 }}>🤖</span>
+              <h3 style={{ fontSize: 18, fontWeight: 800, color: COLORS.text.primary, margin: 0, fontFamily: "'Space Grotesk', sans-serif" }}>
+                AI Explanation
+              </h3>
+              <span
+                style={{
+                  background: forecastData.llm_explanation.provider === 'groq'
+                    ? `${COLORS.primary}22`
+                    : forecastData.llm_explanation.provider === 'ollama'
+                    ? `${COLORS.warning}22`
+                    : `${COLORS.text.muted}22`,
+                  color: forecastData.llm_explanation.provider === 'groq'
+                    ? COLORS.primary
+                    : forecastData.llm_explanation.provider === 'ollama'
+                    ? COLORS.warning
+                    : COLORS.text.secondary,
+                  border: `1px solid ${
+                    forecastData.llm_explanation.provider === 'groq'
+                      ? COLORS.primary
+                      : forecastData.llm_explanation.provider === 'ollama'
+                      ? COLORS.warning
+                      : COLORS.text.muted
+                  }44`,
+                  borderRadius: 8,
+                  padding: '4px 10px',
+                  fontSize: 12,
+                  fontWeight: 700,
+                  fontFamily: "'Space Mono', monospace",
+                }}
+              >
+                {forecastData.llm_explanation.provider === 'groq'
+                  ? 'AI Explanation · Groq'
+                  : forecastData.llm_explanation.provider === 'ollama'
+                  ? 'AI Explanation · Ollama fallback'
+                  : 'AI Explanation · Local deterministic fallback'}
+              </span>
+            </div>
+            <div style={{ fontSize: 12, color: COLORS.text.muted }}>
+              Model: <strong style={{ color: COLORS.text.primary }}>{forecastData.llm_explanation.model || 'Local Rule Generator'}</strong>
+            </div>
+          </div>
+
+          {/* Natural Language Explanation Text — rendered as structured sections */}
+          <div
+            style={{
+              background: COLORS.bg.dark,
+              border: `1px solid ${COLORS.bg.border}`,
+              borderRadius: 12,
+              padding: 18,
+              fontSize: 14,
+              color: COLORS.text.primary,
+              lineHeight: 1.6,
+            }}
+          >
+            {renderMarkdownExplanation(forecastData.llm_explanation.explanation)}
+          </div>
+
+
+          {/* Structured Summary Cards */}
+          {forecastData.llm_explanation.structured_summary && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14, marginTop: 4 }}>
+              {/* Selected Forecast Model */}
+              <div style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 10, padding: 14 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.primary, textTransform: 'uppercase', marginBottom: 4 }}>
+                  Selected Forecast Model
+                </div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.text.primary }}>
+                  {forecastData.llm_explanation.structured_summary.selected_model?.replace('_', ' ').toUpperCase()}
+                </div>
+                <div style={{ fontSize: 12, color: COLORS.text.secondary, marginTop: 4 }}>
+                  Basis: {forecastData.llm_explanation.structured_summary.selection_reason}
+                </div>
+              </div>
+
+              {/* Performance Summary */}
+              <div style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 10, padding: 14 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.success, textTransform: 'uppercase', marginBottom: 4 }}>
+                  Performance Summary
+                </div>
+                <div style={{ fontSize: 12, color: COLORS.text.secondary, lineHeight: 1.5 }}>
+                  R²: <strong style={{ color: COLORS.text.primary }}>{forecastData.llm_explanation.structured_summary.performance_summary?.r2_description}</strong>
+                  <br />
+                  Baseline Imp: <strong style={{ color: COLORS.success }}>{forecastData.llm_explanation.structured_summary.performance_summary?.baseline_improvement_pct != null ? `${forecastData.llm_explanation.structured_summary.performance_summary.baseline_improvement_pct}%` : 'N/A'}</strong>
+                </div>
+              </div>
+
+              {/* Important Drivers */}
+              <div style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 10, padding: 14 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.warning, textTransform: 'uppercase', marginBottom: 4 }}>
+                  Important Signals (SHAP)
+                </div>
+                <div style={{ fontSize: 12, color: COLORS.text.secondary, lineHeight: 1.5 }}>
+                  {forecastData.llm_explanation.structured_summary.important_drivers?.length > 0
+                    ? forecastData.llm_explanation.structured_summary.important_drivers.map(formatFeatureName).join(', ')
+                    : (['random_forest', 'xgboost'].includes((forecastData?.model || '').toLowerCase())
+                        ? 'Historical demand signals & lag features'
+                        : 'SHAP feature attribution is available for tree-based models (Random Forest, XGBoost)')}
+                </div>
+              </div>
+
+              {/* Data Quality & Reliability */}
+              <div style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.bg.border}`, borderRadius: 10, padding: 14 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.secondary, textTransform: 'uppercase', marginBottom: 4 }}>
+                  Data Quality & Reliability
+                </div>
+                <div style={{ fontSize: 12, color: COLORS.text.secondary, lineHeight: 1.4 }}>
+                  {forecastData.llm_explanation.structured_summary.data_quality_warnings?.slice(0, 3).map((w, idx) => (
+                    <div key={idx}>✓ {w}</div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
 
       {/* ─── 4. Hybrid Component Weights Visualization ─── */}
       {forecastData?.model === 'hybrid' && forecastData?.weights && (
@@ -1224,8 +1905,13 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       <div style={{ background: COLORS.bg.card, border: `1px solid ${COLORS.bg.border}`, borderRadius: 16, padding: 24 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 10 }}>
           <div>
-            <h3 style={{ fontSize: 16, fontWeight: 700, color: COLORS.text.primary, margin: 0 }}>
-              Actual vs Predicted Demand Series (Held-Out Test Set)
+            <h3 style={{ fontSize: 16, fontWeight: 700, color: COLORS.text.primary, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>Actual vs Predicted Demand Series (Held-Out Test Set)</span>
+              {selectedLocation && (
+                <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.success, background: `${COLORS.success}20`, padding: '2px 8px', borderRadius: 6, border: `1px solid ${COLORS.success}44` }}>
+                  📍 {selectedLocation}
+                </span>
+              )}
             </h3>
             <p style={{ fontSize: 12, color: COLORS.text.secondary, margin: '2px 0 0' }}>
               Comparison of actual ground truth observations against model forecasts
@@ -1237,6 +1923,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             </span>
           )}
         </div>
+
 
         {forecastLoading ? (
           <div style={{ height: 320, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: COLORS.text.secondary }}>
@@ -1378,8 +2065,8 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               <option value="random_forest">Random Forest</option>
               <option value="xgboost">XGBoost</option>
               {domain === 'electricity' && <option value="arima">ARIMA</option>}
-              <option value="hybrid">Hybrid (unsupported)</option>
-              <option value="lstm">LSTM (unsupported)</option>
+              <option value="hybrid">Hybrid</option>
+              <option value="lstm">LSTM</option>
             </select>
           </div>
           <div>
@@ -1777,19 +2464,20 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         ) : explainError ? (
           <div style={{ color: COLORS.accent, fontSize: 13 }}>⚠️ {explainError}</div>
         ) : explainData ? (() => {
-          const featureImportances = (
-            explainData.feature_importance
-              ? Object.entries(explainData.feature_importance).map(([feature, importance]) => ({
-                  feature: formatFeatureName(feature),
-                  rawFeature: feature,
-                  importance: Number(importance),
-                }))
-              : (explainData.feature_importances || []).map((item) => ({
-                  feature: formatFeatureName(item.feature),
-                  rawFeature: item.feature,
-                  importance: Number(item.importance),
-                }))
-          );
+          const rawImp = explainData.feature_importance || explainData.global_feature_importance || explainData.local_attributions;
+          const listImp = explainData.features || explainData.feature_importances;
+
+          const featureImportances = rawImp
+            ? Object.entries(rawImp).map(([feature, importance]) => ({
+                feature: formatFeatureName(feature),
+                rawFeature: feature,
+                importance: Math.abs(Number(importance)),
+              })).sort((a, b) => b.importance - a.importance)
+            : (listImp || []).map((item) => ({
+                feature: formatFeatureName(item.feature),
+                rawFeature: item.feature,
+                importance: Math.abs(Number(item.importance)),
+              })).sort((a, b) => b.importance - a.importance);
 
           if (featureImportances.length === 0) {
             return (
@@ -1801,9 +2489,23 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
 
           return (
             <div>
-              <div style={{ fontSize: 13, color: COLORS.text.secondary, marginBottom: 16 }}>
-                Top feature drivers for model <span style={{ color: COLORS.primary, fontWeight: 700, textTransform: 'capitalize' }}>{explainData.model?.replace('_', ' ')}</span>:
+              <div style={{ fontSize: 13, color: COLORS.text.secondary, marginBottom: 12, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                <span>
+                  Top feature drivers for model <span style={{ color: COLORS.primary, fontWeight: 700, textTransform: 'capitalize' }}>{explainData.model?.replace('_', ' ')}</span>:
+                </span>
+                {explainData.dataset_context && (
+                  <span style={{ fontSize: 11, fontFamily: "'Space Mono', monospace", color: COLORS.success, background: `${COLORS.success}18`, padding: '2px 8px', borderRadius: 6, border: `1px solid ${COLORS.success}44` }}>
+                    🔒 Verified Dataset: {explainData.dataset_context.dataset_id} (#{explainData.dataset_context.dataset_hash})
+                  </span>
+                )}
               </div>
+
+              {explainData.natural_language_explanation && (
+                <div style={{ background: COLORS.bg.dark, border: `1px solid ${COLORS.primary}44`, borderRadius: 8, padding: '10px 14px', fontSize: 12, color: COLORS.text.primary, marginBottom: 16, lineHeight: 1.5 }}>
+                  💬 <strong style={{ color: COLORS.primary }}>Natural Language Attribution:</strong> {explainData.natural_language_explanation}
+                </div>
+              )}
+
               <ResponsiveContainer width="100%" height={Math.max(240, featureImportances.slice(0, 10).length * 32)}>
                 <BarChart
                   layout="vertical"
@@ -1828,6 +2530,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               </ResponsiveContainer>
             </div>
           );
+
         })() : (
           <div style={{ padding: '20px 0', color: COLORS.text.muted, fontSize: 13 }}>
             Click "Recompute SHAP" to view feature importance analysis.

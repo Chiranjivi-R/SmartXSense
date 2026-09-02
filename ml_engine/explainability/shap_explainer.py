@@ -54,9 +54,13 @@ class ShapTreeExplainer:
             )
         return X_trans
 
-    def explain_global(self, eval_df: pd.DataFrame) -> dict[str, Any]:
+    def explain_global(self, eval_df: pd.DataFrame, max_samples: int = 100) -> dict[str, Any]:
         """Compute global feature importances based on mean absolute SHAP values."""
-        X_trans = self._get_transformed_features(eval_df)
+        sample_df = eval_df
+        if len(eval_df) > max_samples:
+            sample_df = eval_df.iloc[-max_samples:]
+
+        X_trans = self._get_transformed_features(sample_df)
         try:
             shap_values = self.explainer.shap_values(X_trans)
         except Exception as err:
@@ -74,12 +78,19 @@ class ShapTreeExplainer:
             sorted(importance_dict.items(), key=lambda item: item[1], reverse=True)
         )
 
+        features_list = [
+            {"feature": name, "importance": float(val)}
+            for name, val in sorted_importance.items()
+        ]
+
         return {
+            "status": "success",
             "explanation_type": "global",
             "method": "shap",
             "sample_count": len(eval_df),
             "feature_count": len(self.feature_names),
             "feature_importance": sorted_importance,
+            "features": features_list,
         }
 
     def explain_local(self, eval_df: pd.DataFrame, sample_index: int = 0) -> dict[str, Any]:
