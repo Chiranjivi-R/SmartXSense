@@ -28,10 +28,10 @@ class XGBoostForecaster:
         self,
         *,
         n_estimators: int = 200,
-        max_depth: int = 6,
-        learning_rate: float = 0.05,
-        subsample: float = 0.8,
-        colsample_bytree: float = 0.8,
+        max_depth: int = 4,
+        learning_rate: float = 0.04,
+        subsample: float = 0.85,
+        colsample_bytree: float = 0.85,
         random_state: int = 42,
         n_jobs: int = -1,
     ) -> None:
@@ -42,6 +42,7 @@ class XGBoostForecaster:
         self.colsample_bytree = colsample_bytree
         self.random_state = random_state
         self.n_jobs = n_jobs
+
 
         self._transformer: TabularFeatureTransformer | None = None
         self._model: XGBRegressor | None = None

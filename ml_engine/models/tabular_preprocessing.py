@@ -48,6 +48,8 @@ class TabularFeatureTransformer:
             for col in train_df.columns
             if col not in self.excluded_columns and not train_df[col].replace("", np.nan).dropna().empty
         ]
+
+
         if not candidates:
             self.feature_names = []
             self.categorical_columns = []
@@ -61,6 +63,7 @@ class TabularFeatureTransformer:
             col for col in candidates if train_df[col].dtype == "object" or train_df[col].dtype.name == "category"
         ]
         self.numeric_columns = [col for col in candidates if col not in self.categorical_columns]
+
 
         X_train = train_df[self.feature_names].copy()
 

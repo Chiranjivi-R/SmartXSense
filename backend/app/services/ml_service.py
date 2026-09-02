@@ -735,11 +735,35 @@ def _obtain_fitted_model_for_inference(
                 artifacts_root=artifacts_root,
             )
             if loaded is not None:
+                metadata = loaded.get("metadata") or {}
+                val_metrics = metadata.get("validation_metrics")
+                test_metrics = metadata.get("test_metrics")
+                if not val_metrics or not test_metrics:
+                    pred_res = predict_with_fitted_model(
+                        model_key=model_name,
+                        model=loaded["model"],
+                        domain=domain,
+                        target_column=target,
+                        train_df=train_df,
+                        val_df=val_df,
+                        test_df=test_df,
+                    )
+                    val_pred = pred_res["val_pred"]
+                    test_pred = pred_res["test_pred"]
+                    if model_name in ("lstm", "cnn_lstm"):
+                        val_metrics = evaluate_forecast(val_df.loc[val_pred.index, target], val_pred)
+                        test_metrics = evaluate_forecast(test_df.loc[test_pred.index, target], test_pred)
+                    else:
+                        val_metrics = evaluate_forecast(val_df[target], pd.Series(val_pred.values, index=val_df.index))
+                        test_metrics = evaluate_forecast(test_df[target], pd.Series(test_pred.values, index=test_df.index))
+
                 return loaded["model"], _artifact_response(
                     used=True,
                     source="loaded",
                     key=loaded.get("relative_key"),
-                )
+                ), val_metrics, test_metrics
+
+
         except Exception:
             pass
 
@@ -760,18 +784,18 @@ def _obtain_fitted_model_for_inference(
     except TrainerError as err:
         raise MLError(f"Future forecasting pipeline error: {err}", code=400) from err
 
+    val_pred = trained["val_pred"]
+    test_pred = trained["test_pred"]
+    if model_name in ("lstm", "cnn_lstm"):
+        val_metrics = evaluate_forecast(val_df.loc[val_pred.index, target], val_pred)
+        test_metrics = evaluate_forecast(test_df.loc[test_pred.index, target], test_pred)
+    else:
+        val_metrics = evaluate_forecast(val_df[target], val_pred)
+        test_metrics = evaluate_forecast(test_df[target], test_pred)
+
     artifact_info = _artifact_response(used=False, source="trained")
     if is_persistence_supported(model_name):
         try:
-            val_pred = trained["val_pred"]
-            test_pred = trained["test_pred"]
-            if model_name in ("lstm", "cnn_lstm"):
-                val_metrics = evaluate_forecast(val_df.loc[val_pred.index, target], val_pred)
-                test_metrics = evaluate_forecast(test_df.loc[test_pred.index, target], test_pred)
-            else:
-                val_metrics = evaluate_forecast(val_df[target], val_pred)
-                test_metrics = evaluate_forecast(test_df[target], test_pred)
-
             saved = save_model_artifact(
                 model=trained["model"],
                 domain=domain,
@@ -794,7 +818,7 @@ def _obtain_fitted_model_for_inference(
             # Persistence failure must not block future forecasting once the model is fitted.
             pass
 
-    return trained["model"], artifact_info
+    return trained["model"], artifact_info, val_metrics, test_metrics
 
 
 def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
@@ -806,20 +830,26 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     if not domain or domain not in DOMAIN_TARGET_MAP:
         raise MLError(f"Invalid or missing domain '{domain}'. Supported: {list(DOMAIN_TARGET_MAP.keys())}")
 
-    model_name = payload.get("model", "").lower().strip()
-    if not model_name:
-        raise MLError("Missing required parameter 'model'")
+    raw_model = payload.get("model")
+    if raw_model is None or str(raw_model).strip() == "" or str(raw_model).strip().lower() in ("auto_select", "best", "auto"):
+        model_name = "auto_select"
+    else:
+        model_name = str(raw_model).lower().strip()
+
     if model_name == "baseline":
         model_name = "naive"
 
+    selection_reason = "Best validation performance"
     if model_name == "auto_select":
-        raise MLError(
-            "Model 'auto_select' is not a trainable model. "
-            "Resolve the recommended model via /compare and submit that model name."
-        )
-
-    if not is_future_forecast_supported(domain, model_name):
-        raise MLError(future_support_error(domain, model_name), code=400)
+        comp_res = compare_service(payload)
+        ranking = comp_res.get("ranking", [])
+        eligible = [r["model"] for r in ranking if is_future_forecast_supported(domain, r["model"])]
+        model_name = eligible[0] if eligible else (comp_res.get("recommended_model") or "random_forest")
+        selection_reason = "Best validation performance"
+    else:
+        if not is_future_forecast_supported(domain, model_name):
+            raise MLError(future_support_error(domain, model_name), code=400)
+        selection_reason = f"Evaluated specified model '{model_name.replace('_', ' ').title()}'"
 
     features_dir, dataset_ctx = resolve_dynamic_features_and_context(payload)
 
@@ -835,11 +865,11 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     max_depth = payload.get("max_depth")
     if max_depth is not None:
         max_depth = int(max_depth)
-    learning_rate = float(payload.get("learning_rate", 0.05))
+    learning_rate = float(payload.get("learning_rate", 0.04))
     force_retrain = bool(payload.get("force_retrain", False))
 
     try:
-        model, artifact_info = _obtain_fitted_model_for_inference(
+        model, artifact_info, val_metrics, test_metrics = _obtain_fitted_model_for_inference(
             domain=domain,
             model_name=model_name,
             features_dir=features_dir,
@@ -856,7 +886,12 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             features_dir=features_dir,
             horizon=horizon,
         )
+        result["selected_model"] = model_name
+        result["selection_reason"] = selection_reason
+        result["validation_metrics"] = val_metrics
+        result["test_metrics"] = test_metrics
         result["artifact"] = artifact_info
+        result["artifact_reused"] = artifact_info.get("used", False)
         result["dataset_context"] = {
             **dataset_ctx,
             "model": model_name,
@@ -878,6 +913,7 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
         raise
     except Exception as err:
         raise MLError("Internal server error", code=500) from err
+
 
 
 def compare_service(payload: dict[str, Any]) -> dict[str, Any]:

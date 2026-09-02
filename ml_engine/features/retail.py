@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .common import add_history_features, canonicalize_time_target
+from .common import add_festival_interaction_features, add_history_features, canonicalize_time_target
 
 
 SERIES_DIMENSIONS = ("store_id", "product_id", "category", "city", "channel")
@@ -35,7 +35,7 @@ def _aggregate(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_retail_features(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str], dict]:
-    """Build within-series observation lags and shifted rolling target features.
+    """Build within-series observation lags, shifted rolling target, EWMA, and festival interaction features.
 
     Retail records are not assumed to be daily; lag_7 means seven earlier
     observations in the same series. Current-period revenue is excluded because
@@ -55,6 +55,8 @@ def build_retail_features(frame: pd.DataFrame) -> tuple[pd.DataFrame, list[str],
         result = result.sort_values([*groups, "timestamp"], kind="stable").reset_index(drop=True)
     else:
         result = _aggregate(result)
-    result, names = add_history_features(result, target="sales", lags=(1, 7, 14, 28), rolling_windows=(7, 14, 28), group_columns=groups or None)
+    result, names = add_history_features(result, target="sales", lags=(1, 7, 14, 28), rolling_windows=(7, 14, 28), ewma_spans=(3,), group_columns=groups or None)
+    result, fest_names = add_festival_interaction_features(result)
+    names = names + fest_names
     report = {"series_columns": groups, "aggregate_fallback": not bool(groups), "excluded_columns": ["revenue"] if "revenue" in frame.columns else [], "rows_missing_history": int(result[names].isna().any(axis=1).sum())}
     return result.sort_values("timestamp", kind="stable").reset_index(drop=True), names, report
