@@ -35,7 +35,7 @@ SUPPORTED_COMPONENTS = (
 )
 
 DEFAULT_HYBRID_COMPONENTS = {
-    "electricity": ["arima", "random_forest", "xgboost", "lstm", "cnn_lstm"],
+    "electricity": ["arima", "random_forest", "xgboost"],
     "retail": ["random_forest", "xgboost", "lstm", "cnn_lstm"],
 }
 

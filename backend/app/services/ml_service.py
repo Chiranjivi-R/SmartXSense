@@ -693,8 +693,10 @@ def _obtain_fitted_model_for_inference(
     n_estimators: int,
     max_depth: int | None,
     learning_rate: float,
+    components: list[str] | None = None,
+    hybrid_weighting: str = "inverse_rmse",
     force_retrain: bool = False,
-) -> tuple[Any, dict[str, Any]]:
+) -> tuple[Any, dict[str, Any], dict[str, float], dict[str, float]]:
     """Load a compatible Phase A artifact or train+persist a fitted model."""
     import pandas as pd
 
@@ -711,6 +713,8 @@ def _obtain_fitted_model_for_inference(
         n_estimators=n_estimators,
         max_depth=max_depth,
         learning_rate=learning_rate,
+        components=components,
+        hybrid_weighting=hybrid_weighting,
     )
     features_id = derive_features_id(features_dir)
     dataset_fingerprint = compute_dataset_fingerprint(features_dir)
@@ -767,6 +771,71 @@ def _obtain_fitted_model_for_inference(
         except Exception:
             pass
 
+
+    if model_name == "hybrid":
+        from ml_engine.models.hybrid import DEFAULT_HYBRID_COMPONENTS, HybridForecaster, HybridModelError
+        if domain != "electricity":
+            raise MLError("Future forecasting for hybrid is currently supported only for the electricity domain", code=400)
+
+        comps = components if components is not None else DEFAULT_HYBRID_COMPONENTS.get(domain, ["arima", "random_forest", "xgboost"])
+        for c in comps:
+            if not is_future_forecast_supported(domain, c) or c == "hybrid":
+                raise MLError(
+                    f"Component '{c}' does not support future forecasting in domain '{domain}'",
+                    code=400,
+                )
+
+        try:
+            hybrid_forecaster = HybridForecaster(
+                components=comps,
+                domain=domain,
+                weighting_strategy=hybrid_weighting,
+            )
+        except HybridModelError as err:
+            raise MLError(f"Invalid hybrid configuration: {err}", code=400) from err
+
+        val_predictions: dict[str, pd.Series] = {}
+        test_predictions: dict[str, pd.Series] = {}
+        component_val_metrics: dict[str, dict[str, float]] = {}
+        component_test_metrics: dict[str, dict[str, float]] = {}
+        component_models: dict[str, Any] = {}
+
+        for comp in hybrid_forecaster.components:
+            trained_comp = _train_and_predict_single_model(
+                model_key=comp,
+                domain=domain,
+                target_column=target,
+                train_df=train_df,
+                val_df=val_df,
+                test_df=test_df,
+                order=order,
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                learning_rate=learning_rate,
+            )
+            component_models[comp] = trained_comp["model"]
+            v_pred = trained_comp["val_pred"]
+            t_pred = trained_comp["test_pred"]
+            val_predictions[comp] = v_pred
+            test_predictions[comp] = t_pred
+            component_val_metrics[comp] = evaluate_forecast(val_df[target], pd.Series(v_pred.values, index=val_df.index))
+            component_test_metrics[comp] = evaluate_forecast(test_df[target], pd.Series(t_pred.values, index=test_df.index))
+
+        weights = HybridForecaster.calculate_weights(
+            component_val_metrics,
+            weighting_strategy=hybrid_weighting,
+        )
+        val_hybrid_pred = HybridForecaster.combine(val_predictions, weights)
+        test_hybrid_pred = HybridForecaster.combine(test_predictions, weights)
+
+        hybrid_forecaster.weights = weights
+        hybrid_forecaster.component_models = component_models
+
+        val_metrics = evaluate_forecast(val_df[target], pd.Series(val_hybrid_pred.values, index=val_df.index))
+        test_metrics = evaluate_forecast(test_df[target], pd.Series(test_hybrid_pred.values, index=test_df.index))
+
+        artifact_info = _artifact_response(used=False, source="trained")
+        return hybrid_forecaster, artifact_info, val_metrics, test_metrics
 
     try:
         trained = _train_and_predict_single_model(
@@ -867,6 +936,8 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
         max_depth = int(max_depth)
     learning_rate = float(payload.get("learning_rate", 0.04))
     force_retrain = bool(payload.get("force_retrain", False))
+    components = payload.get("components")
+    hybrid_weighting = payload.get("hybrid_weighting", "inverse_rmse")
 
     try:
         model, artifact_info, val_metrics, test_metrics = _obtain_fitted_model_for_inference(
@@ -877,6 +948,8 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
+            components=components,
+            hybrid_weighting=hybrid_weighting,
             force_retrain=force_retrain,
         )
         result = generate_future_forecast(

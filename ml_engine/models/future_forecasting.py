@@ -84,7 +84,7 @@ DETERMINISTIC_CALENDAR_FEATURES = {
 # Explicit capability matrix: only models listed here are enabled.
 FUTURE_SUPPORTED_MODELS: dict[str, frozenset[str]] = {
     "retail": frozenset({"random_forest", "xgboost"}),
-    "electricity": frozenset({"random_forest", "xgboost", "arima"}),
+    "electricity": frozenset({"random_forest", "xgboost", "arima", "hybrid"}),
 }
 
 UNSUPPORTED_FUTURE_REASONS: dict[str, str] = {
@@ -99,9 +99,9 @@ UNSUPPORTED_FUTURE_REASONS: dict[str, str] = {
         "and are not enabled in Phase B."
     ),
     "hybrid": (
-        "Future forecasting is not currently supported for model hybrid. "
-        "Hybrid reuse requires every component model to support legitimate "
-        "future forecasts; component future support is incomplete."
+        "Future forecasting for hybrid is supported for electricity using future-capable "
+        "components (arima, random_forest, xgboost). For retail or unsupported components, "
+        "future forecasting is disabled."
     ),
     "naive": (
         "Future forecasting is not currently supported for model naive."
@@ -126,6 +126,8 @@ def future_support_error(domain: str, model_key: str) -> str:
     model_key = model_key.lower().strip()
     if model_key == "arima" and domain == "retail":
         return "Future forecasting is not currently supported for model arima on the retail domain."
+    if model_key == "hybrid" and domain == "retail":
+        return "Future forecasting is not currently supported for model hybrid on the retail domain."
     if model_key in UNSUPPORTED_FUTURE_REASONS:
         return UNSUPPORTED_FUTURE_REASONS[model_key]
     if domain not in FUTURE_SUPPORTED_MODELS:
@@ -408,6 +410,85 @@ def arima_future_forecast(
     return predictions
 
 
+def hybrid_future_forecast(
+    *,
+    model: Any,
+    history_df: pd.DataFrame,
+    target_column: str,
+    horizon: int,
+    domain: str = "electricity",
+) -> list[dict[str, Any]]:
+    """Multi-step hybrid future forecast combining valid component models with frozen validation weights."""
+    if domain != "electricity":
+        raise FutureForecastError(f"Hybrid future forecasting is not supported for domain '{domain}'")
+
+    from ml_engine.models.hybrid import HybridForecaster
+
+    if not isinstance(model, HybridForecaster):
+        raise FutureForecastError(f"Expected HybridForecaster instance, got {type(model).__name__}")
+
+    if not hasattr(model, "weights") or not model.weights:
+        raise FutureForecastError("Hybrid model must have fitted validation weights before future forecasting")
+
+    if not hasattr(model, "component_models") or not model.component_models:
+        raise FutureForecastError("Hybrid model must have fitted component_models before future forecasting")
+
+    # Verify all components are future-capable
+    for comp in model.components:
+        if not is_future_forecast_supported(domain, comp) or comp == "hybrid":
+            raise FutureForecastError(
+                f"Component '{comp}' does not support future forecasting in domain '{domain}'"
+            )
+
+    component_future_preds: dict[str, list[dict[str, Any]]] = {}
+    for comp in model.components:
+        comp_model = model.component_models[comp]
+        if comp == "arima":
+            preds = arima_future_forecast(
+                model=comp_model,
+                history_df=history_df,
+                target_column=target_column,
+                horizon=horizon,
+                domain=domain,
+            )
+        else:
+            preds = recursive_tabular_future_forecast(
+                model=comp_model,
+                history_df=history_df,
+                domain=domain,
+                target_column=target_column,
+                horizon=horizon,
+            )
+        component_future_preds[comp] = preds
+
+    # Validate alignment and blend using frozen validation weights
+    first_comp = model.components[0]
+    first_preds = component_future_preds[first_comp]
+    combined_predictions: list[dict[str, Any]] = []
+
+    for step_idx in range(horizon):
+        ref_ts = first_preds[step_idx]["timestamp"]
+        combined_val = 0.0
+        for comp in model.components:
+            comp_step = component_future_preds[comp][step_idx]
+            if comp_step["timestamp"] != ref_ts:
+                raise FutureForecastError(
+                    f"Timestamp mismatch at step {step_idx} between components '{first_comp}' and '{comp}'"
+                )
+            weight = float(model.weights[comp])
+            combined_val += weight * float(comp_step["predicted"])
+
+        if not np.isfinite(combined_val):
+            raise FutureForecastError("Hybrid future forecast produced a non-finite prediction")
+
+        combined_predictions.append({
+            "timestamp": ref_ts,
+            "predicted": float(combined_val),
+        })
+
+    return combined_predictions
+
+
 def generate_future_forecast(
     *,
     model: Any,
@@ -430,6 +511,15 @@ def generate_future_forecast(
 
     if model_key == "arima":
         predictions = arima_future_forecast(
+            model=model,
+            history_df=history_df,
+            target_column=target_column,
+            horizon=horizon,
+            domain=domain,
+        )
+        exogenous_policy = "not_applicable"
+    elif model_key == "hybrid":
+        predictions = hybrid_future_forecast(
             model=model,
             history_df=history_df,
             target_column=target_column,

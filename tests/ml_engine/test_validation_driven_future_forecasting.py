@@ -97,3 +97,64 @@ def test_future_forecasting_with_validation_winning_xgboost(tmp_path):
         assert "timestamp" in p
         assert "predicted" in p
         assert "actual" not in p
+
+
+def test_electricity_future_hybrid_weights_frozen_from_validation(tmp_path):
+    """Verify Electricity Future Hybrid computes weights strictly from validation split and freezes them."""
+    from ml_engine.models.arima import ARIMAForecaster
+    from ml_engine.models.random_forest import RandomForestForecaster
+    from ml_engine.models.xgboost_model import XGBoostForecaster
+    from ml_engine.models.hybrid import HybridForecaster
+    from ml_engine.evaluation.metrics import evaluate_forecast
+
+    ts = pd.date_range("2024-01-01", periods=180, freq="h")
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "demand_mw": np.sin(np.linspace(0, 18, 180)) * 50 + 200,
+        "hour": ts.hour,
+    })
+    prep = materialize_forecasting_features(df, "electricity", output_root=tmp_path / "features_val_hyb")
+    features_dir = prep["features_dir"]
+
+    train_df = pd.read_parquet(features_dir / "train.parquet")
+    val_df = pd.read_parquet(features_dir / "validation.parquet")
+
+    # Fit component models strictly on train
+    m_arima = ARIMAForecaster(order=(1, 1, 1)).fit(train_df, target_column="demand_mw")
+    m_rf = RandomForestForecaster(n_estimators=10, random_state=42).fit(train_df, target_column="demand_mw")
+    m_xgb = XGBoostForecaster(n_estimators=10, max_depth=3, learning_rate=0.05, random_state=42).fit(train_df, target_column="demand_mw")
+
+    v_arima = m_arima.predict(val_df, target_column="demand_mw", history=train_df["demand_mw"])
+    v_rf = m_rf.predict(val_df)
+    v_xgb = m_xgb.predict(val_df)
+
+    comp_val = {
+        "arima": evaluate_forecast(val_df["demand_mw"], v_arima),
+        "random_forest": evaluate_forecast(val_df["demand_mw"], v_rf),
+        "xgboost": evaluate_forecast(val_df["demand_mw"], v_xgb),
+    }
+
+    # Derive weights strictly from validation metrics
+    weights = HybridForecaster.calculate_weights(comp_val, weighting_strategy="inverse_rmse")
+    assert pytest.approx(sum(weights.values()), abs=1e-5) == 1.0
+    assert all(w > 0 for w in weights.values())
+
+    hyb = HybridForecaster(components=["arima", "random_forest", "xgboost"], domain="electricity")
+    hyb.weights = weights
+    hyb.component_models = {"arima": m_arima, "random_forest": m_rf, "xgboost": m_xgb}
+
+    # Generate future predictions
+    result = generate_future_forecast(
+        model=hyb,
+        model_key="hybrid",
+        domain="electricity",
+        features_dir=features_dir,
+        horizon=12,
+    )
+
+    assert result["model"] == "hybrid"
+    assert result["horizon"] == 12
+    assert len(result["predictions"]) == 12
+    # Verify weights remained identical (frozen)
+    assert hyb.weights == weights
+

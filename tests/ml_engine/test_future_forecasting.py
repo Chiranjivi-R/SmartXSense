@@ -121,6 +121,7 @@ def test_horizon_validation() -> None:
 def test_support_matrix() -> None:
     assert is_future_forecast_supported("retail", "random_forest")
     assert is_future_forecast_supported("electricity", "arima")
+    assert is_future_forecast_supported("electricity", "hybrid")
     assert not is_future_forecast_supported("retail", "lstm")
     assert not is_future_forecast_supported("retail", "hybrid")
     assert not is_future_forecast_supported("retail", "arima")
@@ -248,3 +249,104 @@ def test_unsupported_model_raises(elec_features: Path) -> None:
             features_dir=elec_features,
             horizon=24,
         )
+
+
+def test_electricity_hybrid_future_forecasting(elec_features: Path) -> None:
+    """Verify Electricity Hybrid combines valid future forecasts using validation weights."""
+    from ml_engine.models.arima import ARIMAForecaster
+    from ml_engine.models.hybrid import HybridForecaster
+    from ml_engine.models.xgboost_model import XGBoostForecaster
+    from ml_engine.evaluation.metrics import evaluate_forecast
+
+    train = pd.read_parquet(elec_features / "train.parquet")
+    val = pd.read_parquet(elec_features / "validation.parquet")
+
+    # Fit component models on train
+    m_arima = ARIMAForecaster(order=(1, 1, 1)).fit(train, target_column="demand_mw")
+    m_rf = RandomForestForecaster(n_estimators=15, random_state=42).fit(train, target_column="demand_mw")
+    m_xgb = XGBoostForecaster(n_estimators=15, max_depth=3, learning_rate=0.05, random_state=42).fit(train, target_column="demand_mw")
+
+    # Evaluate validation predictions to derive frozen weights
+    v_arima = m_arima.predict(val, target_column="demand_mw", history=train["demand_mw"])
+    v_rf = m_rf.predict(val)
+    v_xgb = m_xgb.predict(val)
+
+    comp_val = {
+        "arima": evaluate_forecast(val["demand_mw"], v_arima),
+        "random_forest": evaluate_forecast(val["demand_mw"], v_rf),
+        "xgboost": evaluate_forecast(val["demand_mw"], v_xgb),
+    }
+    weights = HybridForecaster.calculate_weights(comp_val, weighting_strategy="inverse_rmse")
+
+    hyb = HybridForecaster(components=["arima", "random_forest", "xgboost"], domain="electricity")
+    hyb.weights = weights
+    hyb.component_models = {"arima": m_arima, "random_forest": m_rf, "xgboost": m_xgb}
+
+    history = load_chronological_history(elec_features, "demand_mw")
+    last_hist = pd.Timestamp(history["timestamp"].iloc[-1])
+
+    result = generate_future_forecast(
+        model=hyb,
+        model_key="hybrid",
+        domain="electricity",
+        features_dir=elec_features,
+        horizon=24,
+    )
+
+    assert result["forecast_type"] == "future"
+    assert result["domain"] == "electricity"
+    assert result["model"] == "hybrid"
+    assert result["horizon"] == 24
+    assert len(result["predictions"]) == 24
+    assert result["prediction_count"] == 24
+
+    timestamps = [pd.Timestamp(p["timestamp"]) for p in result["predictions"]]
+    assert timestamps[0] > last_hist
+    assert timestamps == sorted(timestamps)
+
+    for p in result["predictions"]:
+        assert "timestamp" in p
+        assert "predicted" in p
+        assert "actual" not in p
+        assert np.isfinite(p["predicted"])
+
+
+def test_electricity_hybrid_future_forecast_rejects_unsupported_components(elec_features: Path) -> None:
+    from ml_engine.models.hybrid import HybridForecaster
+
+    train = pd.read_parquet(elec_features / "train.parquet")
+    m_rf = RandomForestForecaster(n_estimators=10, random_state=42).fit(train, target_column="demand_mw")
+
+    hyb = HybridForecaster(components=["random_forest", "lstm"], domain="electricity")
+    hyb.weights = {"random_forest": 0.5, "lstm": 0.5}
+    hyb.component_models = {"random_forest": m_rf, "lstm": "mock_lstm"}
+
+    with pytest.raises(FutureForecastError, match="does not support future forecasting"):
+        generate_future_forecast(
+            model=hyb,
+            model_key="hybrid",
+            domain="electricity",
+            features_dir=elec_features,
+            horizon=12,
+        )
+
+
+def test_hybrid_future_forecast_rejects_retail(retail_features: Path) -> None:
+    from ml_engine.models.hybrid import HybridForecaster
+
+    train = pd.read_parquet(retail_features / "train.parquet")
+    m_rf = RandomForestForecaster(n_estimators=10, random_state=42).fit(train, target_column="sales")
+
+    hyb = HybridForecaster(components=["random_forest", "xgboost"], domain="retail")
+    hyb.weights = {"random_forest": 0.5, "xgboost": 0.5}
+    hyb.component_models = {"random_forest": m_rf, "xgboost": m_rf}
+
+    with pytest.raises(FutureForecastError, match="not currently supported"):
+        generate_future_forecast(
+            model=hyb,
+            model_key="hybrid",
+            domain="retail",
+            features_dir=retail_features,
+            horizon=7,
+        )
+

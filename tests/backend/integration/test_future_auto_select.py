@@ -75,3 +75,62 @@ def test_future_endpoint_auto_select_validation_winning_model(tmp_path):
 
         db.session.remove()
         db.drop_all()
+
+
+def test_future_endpoint_auto_select_electricity_hybrid(tmp_path):
+    """Test /api/v1/forecasting/future with electricity auto_select and manual hybrid."""
+    class CustomConfig(TestConfig):
+        ML_ARTIFACTS_ROOT = str(tmp_path / "artifacts_elec")
+
+    ts = pd.date_range("2024-01-01", periods=200, freq="h")
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "demand_mw": np.sin(np.linspace(0, 20, 200)) * 50 + 200,
+        "temperature": np.cos(np.linspace(0, 10, 200)) * 10 + 25,
+    })
+    prep = materialize_forecasting_features(df, "electricity", output_root=tmp_path / "features_elec")
+    features_dir = prep["features_dir"]
+
+    app = create_app(CustomConfig)
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        # 1. Test Auto Select for electricity
+        payload = {
+            "domain": "electricity",
+            "features_dir": str(features_dir),
+            "model": "auto_select",
+            "horizon": 12,
+        }
+
+        resp = client.post("/api/v1/forecasting/future", json=payload)
+        assert resp.status_code == 200
+        data = resp.get_json()["data"]
+
+        assert "selected_model" in data
+        assert data["selected_model"] in ("hybrid", "arima", "random_forest", "xgboost")
+        assert len(data["predictions"]) == 12
+        for pred in data["predictions"]:
+            assert "timestamp" in pred
+            assert "predicted" in pred
+            assert "actual" not in pred
+            assert np.isfinite(pred["predicted"])
+
+        # 2. Test Manual Hybrid selection for electricity
+        payload_manual = {
+            "domain": "electricity",
+            "features_dir": str(features_dir),
+            "model": "hybrid",
+            "horizon": 12,
+        }
+        resp_manual = client.post("/api/v1/forecasting/future", json=payload_manual)
+        assert resp_manual.status_code == 200
+        data_manual = resp_manual.get_json()["data"]
+        assert data_manual["selected_model"] == "hybrid"
+        assert len(data_manual["predictions"]) == 12
+        assert "validation_metrics" in data_manual
+
+        db.session.remove()
+        db.drop_all()
+

@@ -98,7 +98,7 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "compare_default": True,
         "notes": (
             "Hybrid supports validation-weighted test evaluation. "
-            "Persistence and future forecasting are intentionally unsupported."
+            "Future forecasting is supported for electricity via future-capable components (ARIMA, RF, XGBoost)."
         ),
     },
 ]
