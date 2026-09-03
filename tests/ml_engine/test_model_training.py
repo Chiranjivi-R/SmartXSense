@@ -18,7 +18,7 @@ def dummy_electricity_features_dir(tmp_path: Path) -> Path:
 
     timestamps = pd.date_range("2025-01-01", periods=100, freq="h")
     values = 100.0 + np.cumsum(np.random.randn(100))
-    df = pd.DataFrame({"timestamp": timestamps, "demand_mw": values})
+    df = pd.DataFrame({"timestamp": timestamps, "demand_mw": values, "feature_1": values + 1.0})
 
     train = df.iloc[:70].reset_index(drop=True)
     val = df.iloc[70:85].reset_index(drop=True)
@@ -38,7 +38,7 @@ def dummy_retail_features_dir(tmp_path: Path) -> Path:
 
     timestamps = pd.date_range("2025-01-01", periods=60, freq="D")
     values = 50.0 + np.cumsum(np.random.randn(60))
-    df = pd.DataFrame({"timestamp": timestamps, "sales": values})
+    df = pd.DataFrame({"timestamp": timestamps, "sales": values, "feature_1": values + 1.0})
 
     train = df.iloc[:40].reset_index(drop=True)
     val = df.iloc[40:50].reset_index(drop=True)
@@ -95,6 +95,38 @@ def test_retail_naive_pipeline(dummy_retail_features_dir: Path) -> None:
     assert result["domain"] == "retail"
     assert result["target"] == "sales"
     assert result["model"] == "naive"
+
+
+def test_retail_random_forest_pipeline_defaults_log1p(dummy_retail_features_dir: Path) -> None:
+    result = run_training_pipeline(
+        domain="retail",
+        features_dir=dummy_retail_features_dir,
+        model_name="random_forest",
+        n_estimators=5,
+    )
+
+    assert result["domain"] == "retail"
+    assert result["target"] == "sales"
+    assert result["model"] == "random_forest"
+    assert result["configuration"]["target_transform"] == "log1p"
+    assert "validation_metrics" in result
+    assert "test_metrics" in result
+
+
+def test_electricity_random_forest_pipeline_raw_scale(dummy_electricity_features_dir: Path) -> None:
+    result = run_training_pipeline(
+        domain="electricity",
+        features_dir=dummy_electricity_features_dir,
+        model_name="random_forest",
+        n_estimators=5,
+    )
+
+    assert result["domain"] == "electricity"
+    assert result["target"] == "demand_mw"
+    assert result["model"] == "random_forest"
+    assert "target_transform" not in result["configuration"]
+    assert "validation_metrics" in result
+    assert "test_metrics" in result
 
 
 def test_retail_arima_unsupported_error(dummy_retail_features_dir: Path) -> None:

@@ -86,3 +86,43 @@ def test_random_forest_unfitted_raises() -> None:
 
     with pytest.raises(RandomForestModelError, match="must be fitted"):
         model.get_feature_importances()
+
+
+def test_random_forest_log1p_target_transform() -> None:
+    train_df = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01", periods=30),
+        "sales": [10.0, 15.0, 25.0, 50.0, 80.0] * 6,
+        "lag_1": [8.0, 12.0, 20.0, 45.0, 70.0] * 6,
+    })
+    eval_df = pd.DataFrame({
+        "timestamp": pd.date_range("2025-02-01", periods=10),
+        "sales": [12.0, 18.0] * 5,
+        "lag_1": [10.0, 16.0] * 5,
+    })
+
+    model = RandomForestForecaster(n_estimators=10, random_state=42, target_transform="log1p")
+    model.fit(train_df, target_column="sales")
+    assert model.target_transform == "log1p"
+
+    preds = model.predict(eval_df)
+    assert len(preds) == len(eval_df)
+    assert (preds >= 0.0).all()
+    # Predictions should be in the physical range of sales (~10 to 80), not in log space (~2 to 4)
+    assert preds.mean() > 5.0
+
+
+def test_random_forest_unsupported_target_transform_raises() -> None:
+    with pytest.raises(RandomForestModelError, match="Unsupported target_transform"):
+        RandomForestForecaster(target_transform="invalid_transform")
+
+
+def test_random_forest_negative_target_with_log1p_raises() -> None:
+    train_df = pd.DataFrame({
+        "timestamp": pd.date_range("2025-01-01", periods=10),
+        "sales": [-5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0],
+        "lag_1": [5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0],
+    })
+    model = RandomForestForecaster(n_estimators=5, random_state=42, target_transform="log1p")
+    with pytest.raises(RandomForestModelError, match="Cannot apply log1p transform"):
+        model.fit(train_df, target_column="sales")
+

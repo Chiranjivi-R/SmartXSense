@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 
@@ -33,13 +34,18 @@ class RandomForestForecaster:
         min_samples_leaf: int = 1,
         random_state: int = 42,
         n_jobs: int = -1,
+        target_transform: str | None = None,
     ) -> None:
+        if target_transform not in (None, "log1p"):
+            raise RandomForestModelError(f"Unsupported target_transform '{target_transform}'. Supported: None, 'log1p'")
+
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.min_samples_split = min_samples_split
         self.min_samples_leaf = min_samples_leaf
         self.random_state = random_state
         self.n_jobs = n_jobs
+        self.target_transform = target_transform
 
         self._transformer: TabularFeatureTransformer | None = None
         self._model: RandomForestRegressor | None = None
@@ -58,6 +64,11 @@ class RandomForestForecaster:
 
         X_train = self._transformer.transform(train_df)
         y_train = train_df[target_column].astype(float).to_numpy()
+
+        if self.target_transform == "log1p":
+            if np.any(y_train < -1.0):
+                raise RandomForestModelError("Cannot apply log1p transform to target values < -1.0")
+            y_train = np.log1p(np.maximum(y_train, 0.0))
 
         self._model = RandomForestRegressor(
             n_estimators=self.n_estimators,
@@ -85,6 +96,9 @@ class RandomForestForecaster:
         X_eval = self._transformer.transform(eval_df)
         try:
             preds = self._model.predict(X_eval)
+            if self.target_transform == "log1p":
+                preds = np.expm1(preds)
+                preds = np.clip(preds, a_min=0.0, a_max=None)
         except Exception as err:
             raise RandomForestModelError(f"Failed to predict using RandomForestRegressor: {err}") from err
 

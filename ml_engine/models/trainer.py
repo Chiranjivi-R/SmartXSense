@@ -152,15 +152,20 @@ def _train_and_predict_single_model(
         test_pred = naive_model.predict(test_df, target_column=target_column, history=combined_train_val)
 
     elif model_key == "random_forest":
+        resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
         configuration.update({
             "n_estimators": n_estimators,
             "max_depth": max_depth,
             "random_state": random_state,
         })
+        if resolved_target_transform is not None:
+            configuration["target_transform"] = resolved_target_transform
+
         rf_model = RandomForestForecaster(
             n_estimators=n_estimators,
             max_depth=max_depth,
             random_state=random_state,
+            target_transform=resolved_target_transform,
         )
         rf_model.fit(train_df, target_column=target_column)
         model = rf_model
@@ -983,11 +988,15 @@ def expected_configuration_for_request(
         period = seasonal_period if seasonal_period is not None else DEFAULT_SEASONAL_PERIODS[domain]
         return {"seasonal_period": period}
     if model_key == "random_forest":
-        return {
+        resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
+        cfg = {
             "n_estimators": n_estimators,
             "max_depth": max_depth,
             "random_state": random_state,
         }
+        if resolved_target_transform is not None:
+            cfg["target_transform"] = resolved_target_transform
+        return cfg
     if model_key == "xgboost":
         resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
         default_depth = 3 if domain == "retail" else 6
