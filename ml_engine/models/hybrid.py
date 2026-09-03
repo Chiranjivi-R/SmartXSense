@@ -36,7 +36,7 @@ SUPPORTED_COMPONENTS = (
 
 DEFAULT_HYBRID_COMPONENTS = {
     "electricity": ["arima", "random_forest", "xgboost"],
-    "retail": ["random_forest", "xgboost", "lstm", "cnn_lstm"],
+    "retail": ["random_forest", "xgboost"],
 }
 
 
@@ -66,7 +66,7 @@ class HybridForecaster:
         raw_components = (
             components
             if components is not None
-            else DEFAULT_HYBRID_COMPONENTS.get(self.domain, ["random_forest", "xgboost", "lstm"])
+            else DEFAULT_HYBRID_COMPONENTS.get(self.domain, ["random_forest", "xgboost"])
         )
         self.components = self.validate_components(raw_components, self.domain)
         self.weights: dict[str, float] | None = None

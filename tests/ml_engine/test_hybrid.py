@@ -293,3 +293,40 @@ def test_hybrid_with_lstm_component(retail_features_dir: Path) -> None:
     assert pytest.approx(sum(result["weights"].values()), abs=1e-3) == 1.0
     assert "lstm" in result["component_validation_metrics"]
     assert set(result["validation_metrics"].keys()) == {"mae", "rmse", "mape", "r2", "smape", "wape"}
+
+
+def test_default_hybrid_components_isolation() -> None:
+    """Verify default hybrid components for retail and electricity are correctly isolated and configured."""
+    from ml_engine.models.hybrid import DEFAULT_HYBRID_COMPONENTS
+
+    assert DEFAULT_HYBRID_COMPONENTS["retail"] == ["random_forest", "xgboost"]
+    assert DEFAULT_HYBRID_COMPONENTS["electricity"] == ["arima", "random_forest", "xgboost"]
+
+    # HybridForecaster instantiation without components uses correct defaults
+    hyb_retail = HybridForecaster(domain="retail")
+    assert hyb_retail.components == ["random_forest", "xgboost"]
+
+    hyb_elec = HybridForecaster(domain="electricity")
+    assert hyb_elec.components == ["arima", "random_forest", "xgboost"]
+
+
+def test_retail_default_hybrid_pipeline(retail_features_dir: Path) -> None:
+    """Verify retail training pipeline defaults to RF + XGBoost without LSTM/CNN-LSTM overhead."""
+    result = run_training_pipeline(
+        domain="retail",
+        features_dir=retail_features_dir,
+        model_name="hybrid",
+        n_estimators=5,
+    )
+
+    assert result["model"] == "hybrid"
+    assert result["domain"] == "retail"
+    assert result["configuration"]["components"] == ["random_forest", "xgboost"]
+    assert set(result["weights"].keys()) == {"random_forest", "xgboost"}
+    assert pytest.approx(sum(result["weights"].values()), abs=1e-5) == 1.0
+    assert "lstm" not in result["weights"]
+    assert "cnn_lstm" not in result["weights"]
+    assert set(result["component_validation_metrics"].keys()) == {"random_forest", "xgboost"}
+    assert "selected_model" in result
+    assert result["selected_model"] in ("xgboost", "random_forest", "hybrid")
+
