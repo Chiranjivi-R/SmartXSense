@@ -132,7 +132,21 @@ def add_festival_interaction_features(
             result[name] = fest_series * result[roll_col].fillna(0)
             feature_names.append(name)
 
+    # 3. Festival season window flag and interaction with lag_1
+    # festival_season covers the ±7-day neighbourhood around each named festival date
+    # (a wider event-window signal than the point-day festival_flag).
+    # It is purely calendar-derived: no target values are used in its construction.
+    # fest_season_x_lag1 = festival_season_flag × lag_1, giving the model a
+    # "recent-demand-during-the-event-period" interaction signal.
+    if "festival_season" in result.columns:
+        result["festival_season_flag"] = result["festival_season"].notna().astype(float)
+        feature_names.append("festival_season_flag")
+        if "lag_1" in result.columns:
+            result["fest_season_x_lag1"] = result["festival_season_flag"] * result["lag_1"].fillna(0)
+            feature_names.append("fest_season_x_lag1")
+
     return result, feature_names
+
 
 
 

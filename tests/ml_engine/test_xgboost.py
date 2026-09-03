@@ -94,3 +94,58 @@ def test_xgboost_unfitted_raises() -> None:
 
     with pytest.raises(XGBoostModelError, match="must be fitted"):
         model.get_feature_importances()
+
+
+def test_xgboost_log1p_target_transform() -> None:
+    np.random.seed(42)
+    timestamps = pd.date_range("2025-01-01", periods=60, freq="D")
+    sales = np.exp(np.random.uniform(2.0, 5.0, size=60))  # positive sales
+    lag_1 = pd.Series(sales).shift(1).bfill().values
+
+    train_df = pd.DataFrame({
+        "timestamp": timestamps[:40],
+        "sales": sales[:40],
+        "lag_1": lag_1[:40],
+    })
+    eval_df = pd.DataFrame({
+        "timestamp": timestamps[40:],
+        "sales": sales[40:],
+        "lag_1": lag_1[40:],
+    })
+
+    model = XGBoostForecaster(
+        n_estimators=30,
+        max_depth=3,
+        learning_rate=0.05,
+        random_state=42,
+        target_transform="log1p",
+    )
+    model.fit(train_df, target_column="sales")
+    preds = model.predict(eval_df)
+
+    assert len(preds) == len(eval_df)
+    assert not preds.isna().any()
+    assert (preds >= 0.0).all()
+
+    # Determinism
+    model2 = XGBoostForecaster(
+        n_estimators=30,
+        max_depth=3,
+        learning_rate=0.05,
+        random_state=42,
+        target_transform="log1p",
+    )
+    model2.fit(train_df, target_column="sales")
+    preds2 = model2.predict(eval_df)
+    pd.testing.assert_series_equal(preds, preds2)
+
+    # Invalid transform check
+    with pytest.raises(XGBoostModelError, match="Unsupported target_transform"):
+        XGBoostForecaster(target_transform="invalid_transform")
+
+    # Negative target check
+    neg_train = train_df.copy()
+    neg_train.loc[0, "sales"] = -5.0
+    bad_model = XGBoostForecaster(target_transform="log1p")
+    with pytest.raises(XGBoostModelError, match="Cannot apply log1p transform"):
+        bad_model.fit(neg_train, target_column="sales")

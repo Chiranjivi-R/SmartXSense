@@ -36,12 +36,17 @@ def test_festival_interactions_and_ewma_leakage_safety(tmp_path):
     assert "festival_distance" in fest_names
     assert "fest_x_lag_1" in fest_names
     assert "fest_x_rolling_mean_7" in fest_names
+    # festival_season_flag and fest_season_x_lag1 are added only when festival_season column is present
+    # (it may be absent in minimal test frames — check conditionally)
+    if "festival_season" in res.columns:
+        assert "festival_season_flag" in fest_names
+        assert "fest_season_x_lag1" in fest_names
 
 
-    
     # Verify values at non-festival days are 0.0
     non_fest_idx = res.index[res["festival_flag"] == 0.0]
     assert (res.loc[non_fest_idx, "fest_x_lag_1"] == 0.0).all()
+
 
 
 def test_festival_interactions_skipped_when_no_festival_column():

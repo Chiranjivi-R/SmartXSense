@@ -101,6 +101,7 @@ def _train_and_predict_single_model(
     max_depth: int | None = None,
     learning_rate: float = 0.05,
     random_state: int = 42,
+    target_transform: str | None = None,
     lookback: int | None = None,
     lstm_units: int = 64,
     dropout: float = 0.1,
@@ -170,18 +171,25 @@ def _train_and_predict_single_model(
         feature_names = rf_model.feature_names
 
     elif model_key == "xgboost":
-        depth = max_depth if max_depth is not None else 6
+        resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
+        default_depth = 3 if domain == "retail" else 6
+        depth = max_depth if max_depth is not None else default_depth
+        lr = learning_rate if learning_rate != 0.05 else (0.03 if domain == "retail" else 0.05)
         configuration.update({
             "n_estimators": n_estimators,
             "max_depth": depth,
-            "learning_rate": learning_rate,
+            "learning_rate": lr,
             "random_state": random_state,
         })
+        if resolved_target_transform is not None:
+            configuration["target_transform"] = resolved_target_transform
+
         xgb_model = XGBoostForecaster(
             n_estimators=n_estimators,
             max_depth=depth,
-            learning_rate=learning_rate,
+            learning_rate=lr,
             random_state=random_state,
+            target_transform=resolved_target_transform,
         )
         xgb_model.fit(train_df, target_column=target_column)
         model = xgb_model
@@ -293,6 +301,7 @@ def run_training_pipeline(
     max_depth: int | None = None,
     learning_rate: float = 0.05,
     random_state: int = 42,
+    target_transform: str | None = None,
     # Deep-learning shared parameters (LSTM + CNN-LSTM)
     lookback: int | None = None,
     lstm_units: int = 64,
@@ -352,6 +361,7 @@ def run_training_pipeline(
         max_depth=max_depth,
         learning_rate=learning_rate,
         random_state=random_state,
+        target_transform=target_transform,
         lookback=lookback,
         lstm_units=lstm_units,
         dropout=dropout,
@@ -425,6 +435,7 @@ def run_training_pipeline(
                 max_depth=max_depth,
                 learning_rate=learning_rate,
                 random_state=random_state,
+                target_transform=target_transform,
                 lookback=lookback,
                 lstm_units=lstm_units,
                 dropout=dropout,
@@ -473,6 +484,7 @@ def run_training_pipeline(
                     max_depth=max_depth,
                     learning_rate=learning_rate,
                     random_state=random_state,
+                    target_transform=target_transform,
                     lookback=lookback,
                     lstm_units=lstm_units,
                     dropout=dropout,
@@ -613,6 +625,7 @@ def run_training_pipeline(
         max_depth=max_depth,
         learning_rate=learning_rate,
         random_state=random_state,
+        target_transform=target_transform,
         lookback=lookback,
         lstm_units=lstm_units,
         dropout=dropout,
@@ -937,6 +950,7 @@ def expected_configuration_for_request(
     max_depth: int | None = None,
     learning_rate: float = 0.05,
     random_state: int = 42,
+    target_transform: str | None = None,
     lookback: int | None = None,
     lstm_units: int = 64,
     dropout: float = 0.1,
@@ -975,13 +989,19 @@ def expected_configuration_for_request(
             "random_state": random_state,
         }
     if model_key == "xgboost":
-        depth = max_depth if max_depth is not None else 6
-        return {
+        resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
+        default_depth = 3 if domain == "retail" else 6
+        depth = max_depth if max_depth is not None else default_depth
+        lr = learning_rate if learning_rate != 0.05 else (0.03 if domain == "retail" else 0.05)
+        cfg = {
             "n_estimators": n_estimators,
             "max_depth": depth,
-            "learning_rate": learning_rate,
+            "learning_rate": lr,
             "random_state": random_state,
         }
+        if resolved_target_transform is not None:
+            cfg["target_transform"] = resolved_target_transform
+        return cfg
     if model_key == "lstm":
         effective_lookback = lookback if lookback is not None else DEFAULT_LOOKBACK.get(domain, 7)
         return {

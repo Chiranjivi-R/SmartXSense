@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 
@@ -34,7 +35,11 @@ class XGBoostForecaster:
         colsample_bytree: float = 0.85,
         random_state: int = 42,
         n_jobs: int = -1,
+        target_transform: str | None = None,
     ) -> None:
+        if target_transform not in (None, "log1p"):
+            raise XGBoostModelError(f"Unsupported target_transform '{target_transform}'. Supported: None, 'log1p'")
+
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.learning_rate = learning_rate
@@ -42,6 +47,7 @@ class XGBoostForecaster:
         self.colsample_bytree = colsample_bytree
         self.random_state = random_state
         self.n_jobs = n_jobs
+        self.target_transform = target_transform
 
 
         self._transformer: TabularFeatureTransformer | None = None
@@ -61,6 +67,11 @@ class XGBoostForecaster:
 
         X_train = self._transformer.transform(train_df)
         y_train = train_df[target_column].astype(float).to_numpy()
+
+        if self.target_transform == "log1p":
+            if np.any(y_train < -1.0):
+                raise XGBoostModelError("Cannot apply log1p transform to target values < -1.0")
+            y_train = np.log1p(np.maximum(y_train, 0.0))
 
         self._model = XGBRegressor(
             n_estimators=self.n_estimators,
@@ -89,6 +100,9 @@ class XGBoostForecaster:
         X_eval = self._transformer.transform(eval_df)
         try:
             preds = self._model.predict(X_eval)
+            if self.target_transform == "log1p":
+                preds = np.expm1(preds)
+                preds = np.clip(preds, a_min=0.0, a_max=None)
         except Exception as err:
             raise XGBoostModelError(f"Failed to predict using XGBRegressor: {err}") from err
 

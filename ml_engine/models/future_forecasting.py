@@ -320,6 +320,19 @@ def recursive_tabular_future_forecast(
         row.update(_lag_rolling_from_history(target_history, domain=domain))
         row[target_column] = np.nan
 
+        # Recompute derived festival-season features from the LOCF festival_season value.
+        # festival_season is a ±7-day named-festival window carried from history;
+        # festival_season_flag and fest_season_x_lag1 must reflect the current step's
+        # festival_season and lag_1 rather than a stale LOCF value.
+        if "festival_season_flag" in history_df.columns:
+            fest_season_val = row.get("festival_season")
+            festival_season_flag = 0.0 if (fest_season_val is None or (isinstance(fest_season_val, float) and np.isnan(fest_season_val))) else 1.0
+            row["festival_season_flag"] = festival_season_flag
+            if "fest_season_x_lag1" in history_df.columns:
+                lag1_val = row.get("lag_1", np.nan)
+                row["fest_season_x_lag1"] = festival_season_flag * (float(lag1_val) if (lag1_val is not None and not np.isnan(float(lag1_val))) else 0.0)
+
+
         step_df = pd.DataFrame([row])
         # Preserve historical column order for transformer feature lookup.
         for col in history_df.columns:
