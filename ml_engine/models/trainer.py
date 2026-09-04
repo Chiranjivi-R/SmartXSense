@@ -21,6 +21,8 @@ from ml_engine.models.artifact_store import (
     try_load_compatible_artifact,
 )
 
+_DEFAULT_SENTINEL = object()
+
 
 def format_chart_predictions(
     test_df: pd.DataFrame,
@@ -102,6 +104,7 @@ def _train_and_predict_single_model(
     learning_rate: float = 0.05,
     random_state: int = 42,
     target_transform: str | None = None,
+    sample_weight_strategy: Any = _DEFAULT_SENTINEL,
     lookback: int | None = None,
     lstm_units: int = 64,
     dropout: float = 0.1,
@@ -177,10 +180,13 @@ def _train_and_predict_single_model(
 
     elif model_key == "xgboost":
         resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
+        if sample_weight_strategy is _DEFAULT_SENTINEL:
+            resolved_weight_strategy = "spike_sensitive" if domain == "retail" else None
+        else:
+            resolved_weight_strategy = sample_weight_strategy
         default_depth = 3 if domain == "retail" else 6
         depth = max_depth if max_depth is not None else default_depth
         lr = learning_rate if learning_rate != 0.05 else (0.03 if domain == "retail" else 0.05)
-        weight_strategy = "spike_sensitive" if domain == "retail" else None
         configuration.update({
             "n_estimators": n_estimators,
             "max_depth": depth,
@@ -189,8 +195,8 @@ def _train_and_predict_single_model(
         })
         if resolved_target_transform is not None:
             configuration["target_transform"] = resolved_target_transform
-        if weight_strategy is not None:
-            configuration["sample_weight_strategy"] = weight_strategy
+        if resolved_weight_strategy is not None:
+            configuration["sample_weight_strategy"] = resolved_weight_strategy
 
         xgb_model = XGBoostForecaster(
             n_estimators=n_estimators,
@@ -198,7 +204,7 @@ def _train_and_predict_single_model(
             learning_rate=lr,
             random_state=random_state,
             target_transform=resolved_target_transform,
-            sample_weight_strategy=weight_strategy,
+            sample_weight_strategy=resolved_weight_strategy,
         )
         xgb_model.fit(train_df, target_column=target_column)
         model = xgb_model
@@ -311,6 +317,7 @@ def run_training_pipeline(
     learning_rate: float = 0.05,
     random_state: int = 42,
     target_transform: str | None = None,
+    sample_weight_strategy: Any = _DEFAULT_SENTINEL,
     # Deep-learning shared parameters (LSTM + CNN-LSTM)
     lookback: int | None = None,
     lstm_units: int = 64,
@@ -371,6 +378,7 @@ def run_training_pipeline(
         learning_rate=learning_rate,
         random_state=random_state,
         target_transform=target_transform,
+        sample_weight_strategy=sample_weight_strategy,
         lookback=lookback,
         lstm_units=lstm_units,
         dropout=dropout,
@@ -451,6 +459,7 @@ def run_training_pipeline(
                 learning_rate=learning_rate,
                 random_state=random_state,
                 target_transform=target_transform,
+                sample_weight_strategy=sample_weight_strategy,
                 lookback=lookback,
                 lstm_units=lstm_units,
                 dropout=dropout,
@@ -500,6 +509,7 @@ def run_training_pipeline(
                     learning_rate=learning_rate,
                     random_state=random_state,
                     target_transform=target_transform,
+                    sample_weight_strategy=sample_weight_strategy,
                     lookback=lookback,
                     lstm_units=lstm_units,
                     dropout=dropout,
@@ -668,6 +678,7 @@ def run_training_pipeline(
         learning_rate=learning_rate,
         random_state=random_state,
         target_transform=target_transform,
+        sample_weight_strategy=sample_weight_strategy,
         lookback=lookback,
         lstm_units=lstm_units,
         dropout=dropout,
@@ -993,6 +1004,7 @@ def expected_configuration_for_request(
     learning_rate: float = 0.05,
     random_state: int = 42,
     target_transform: str | None = None,
+    sample_weight_strategy: Any = _DEFAULT_SENTINEL,
     lookback: int | None = None,
     lstm_units: int = 64,
     dropout: float = 0.1,
@@ -1036,6 +1048,10 @@ def expected_configuration_for_request(
         return cfg
     if model_key == "xgboost":
         resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
+        if sample_weight_strategy is _DEFAULT_SENTINEL:
+            resolved_weight_strategy = "spike_sensitive" if domain == "retail" else None
+        else:
+            resolved_weight_strategy = sample_weight_strategy
         default_depth = 3 if domain == "retail" else 6
         depth = max_depth if max_depth is not None else default_depth
         lr = learning_rate if learning_rate != 0.05 else (0.03 if domain == "retail" else 0.05)
@@ -1047,6 +1063,8 @@ def expected_configuration_for_request(
         }
         if resolved_target_transform is not None:
             cfg["target_transform"] = resolved_target_transform
+        if resolved_weight_strategy is not None:
+            cfg["sample_weight_strategy"] = resolved_weight_strategy
         return cfg
     if model_key == "lstm":
         effective_lookback = lookback if lookback is not None else DEFAULT_LOOKBACK.get(domain, 7)

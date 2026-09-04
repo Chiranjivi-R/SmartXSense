@@ -61,7 +61,11 @@ class LimeTabularExplainer:
         sample_row = X_trans[sample_index]
 
         def predict_fn(x: np.ndarray) -> np.ndarray:
-            return self.model.predict(x)
+            preds = self.model.predict(x)
+            if getattr(self.forecaster, "target_transform", None) == "log1p":
+                preds = np.expm1(preds)
+                preds = np.clip(preds, a_min=0.0, a_max=None)
+            return preds
 
         try:
             exp = self.explainer.explain_instance(
