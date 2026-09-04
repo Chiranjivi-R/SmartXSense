@@ -260,3 +260,62 @@ def test_all_missing_training_feature_exclusion() -> None:
     assert len(xgb_preds) == len(eval_df)
     assert xgb.feature_names == ["valid_feature"]
     assert list(xgb.get_feature_importances().keys()) == ["valid_feature"]
+
+
+def test_xgboost_spike_sensitive_sample_weighting() -> None:
+    from ml_engine.models.xgboost_model import XGBoostForecaster, XGBoostModelError
+
+    # 1. Reject invalid strategy
+    with pytest.raises(XGBoostModelError, match="Unsupported sample_weight_strategy"):
+        XGBoostForecaster(sample_weight_strategy="invalid_strategy")
+
+    # 2. Support None (unweighted) and spike_sensitive
+    xgb_unweighted = XGBoostForecaster(n_estimators=10, random_state=42, sample_weight_strategy=None)
+    assert xgb_unweighted.sample_weight_strategy is None
+
+    xgb_spike = XGBoostForecaster(n_estimators=10, random_state=42, sample_weight_strategy="spike_sensitive")
+    assert xgb_spike.sample_weight_strategy == "spike_sensitive"
+
+    # 3. Fit on synthetic dataset with high variance
+    np.random.seed(42)
+    train_df = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01", periods=100),
+        "sales": [20.0 + i % 10 if i < 85 else 100.0 + i for i in range(100)],
+        "feature_a": np.random.randn(100),
+    })
+    eval_df = pd.DataFrame({
+        "timestamp": pd.date_range("2024-04-11", periods=10),
+        "sales": [30.0] * 10,
+        "feature_a": np.random.randn(10),
+    })
+
+    xgb_spike.fit(train_df, target_column="sales")
+    preds = xgb_spike.predict(eval_df)
+    assert len(preds) == len(eval_df)
+    assert not preds.isna().any()
+
+
+def test_trainer_spike_weighting_domain_isolation(
+    dummy_retail_features_dir: Path,
+    dummy_electricity_features_dir: Path,
+) -> None:
+    # Retail enables spike_sensitive
+    retail_res = run_training_pipeline(
+        domain="retail",
+        features_dir=dummy_retail_features_dir,
+        model_name="xgboost",
+        n_estimators=10,
+        random_state=42,
+    )
+    assert retail_res["configuration"].get("sample_weight_strategy") == "spike_sensitive"
+
+    # Electricity remains unweighted
+    elec_res = run_training_pipeline(
+        domain="electricity",
+        features_dir=dummy_electricity_features_dir,
+        model_name="xgboost",
+        n_estimators=10,
+        random_state=42,
+    )
+    assert "sample_weight_strategy" not in elec_res["configuration"] or elec_res["configuration"]["sample_weight_strategy"] is None
+

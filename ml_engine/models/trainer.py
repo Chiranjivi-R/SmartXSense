@@ -180,6 +180,7 @@ def _train_and_predict_single_model(
         default_depth = 3 if domain == "retail" else 6
         depth = max_depth if max_depth is not None else default_depth
         lr = learning_rate if learning_rate != 0.05 else (0.03 if domain == "retail" else 0.05)
+        weight_strategy = "spike_sensitive" if domain == "retail" else None
         configuration.update({
             "n_estimators": n_estimators,
             "max_depth": depth,
@@ -188,6 +189,8 @@ def _train_and_predict_single_model(
         })
         if resolved_target_transform is not None:
             configuration["target_transform"] = resolved_target_transform
+        if weight_strategy is not None:
+            configuration["sample_weight_strategy"] = weight_strategy
 
         xgb_model = XGBoostForecaster(
             n_estimators=n_estimators,
@@ -195,6 +198,7 @@ def _train_and_predict_single_model(
             learning_rate=lr,
             random_state=random_state,
             target_transform=resolved_target_transform,
+            sample_weight_strategy=weight_strategy,
         )
         xgb_model.fit(train_df, target_column=target_column)
         model = xgb_model

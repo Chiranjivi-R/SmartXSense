@@ -36,9 +36,14 @@ class XGBoostForecaster:
         random_state: int = 42,
         n_jobs: int = -1,
         target_transform: str | None = None,
+        sample_weight_strategy: str | None = None,
     ) -> None:
         if target_transform not in (None, "log1p"):
             raise XGBoostModelError(f"Unsupported target_transform '{target_transform}'. Supported: None, 'log1p'")
+        if sample_weight_strategy not in (None, "spike_sensitive"):
+            raise XGBoostModelError(
+                f"Unsupported sample_weight_strategy '{sample_weight_strategy}'. Supported: None, 'spike_sensitive'"
+            )
 
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -48,7 +53,7 @@ class XGBoostForecaster:
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.target_transform = target_transform
-
+        self.sample_weight_strategy = sample_weight_strategy
 
         self._transformer: TabularFeatureTransformer | None = None
         self._model: XGBRegressor | None = None
@@ -66,8 +71,19 @@ class XGBoostForecaster:
         self._transformer.fit(train_df)
 
         X_train = self._transformer.transform(train_df)
-        y_train = train_df[target_column].astype(float).to_numpy()
+        raw_y = train_df[target_column].astype(float).to_numpy()
 
+        sample_weights = None
+        if self.sample_weight_strategy == "spike_sensitive":
+            if len(raw_y) >= 10:
+                q85 = float(np.percentile(raw_y, 85))
+                q95 = float(np.percentile(raw_y, 95))
+                if q95 > q85:
+                    sample_weights = np.ones(len(raw_y), dtype=float)
+                    sample_weights[raw_y > q85] = 1.10
+                    sample_weights[raw_y > q95] = 1.30
+
+        y_train = raw_y.copy()
         if self.target_transform == "log1p":
             if np.any(y_train < -1.0):
                 raise XGBoostModelError("Cannot apply log1p transform to target values < -1.0")
@@ -84,7 +100,7 @@ class XGBoostForecaster:
         )
 
         try:
-            self._model.fit(X_train, y_train)
+            self._model.fit(X_train, y_train, sample_weight=sample_weights)
         except Exception as err:
             raise XGBoostModelError(f"Failed to fit XGBRegressor: {err}") from err
 
