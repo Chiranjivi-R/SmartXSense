@@ -350,3 +350,174 @@ def test_hybrid_future_forecast_rejects_retail(retail_features: Path) -> None:
             horizon=7,
         )
 
+
+def test_domain_specific_horizon_bounds() -> None:
+    """Verify domain-specific horizon limits (90 for retail, 2160 for electricity)."""
+    assert validate_horizon(90, domain="retail") == 90
+    with pytest.raises(FutureForecastError, match="exceeds maximum allowed value of 90 for domain 'retail'"):
+        validate_horizon(91, domain="retail")
+    assert validate_horizon(2160, domain="electricity") == 2160
+    with pytest.raises(FutureForecastError, match="exceeds maximum allowed value of 2160 for domain 'electricity'"):
+        validate_horizon(2161, domain="electricity")
+
+
+def test_ewma3_recursive_evolution() -> None:
+    """Verify ewma_3 recursively incorporates y_T at step 1 and predicted targets thereafter."""
+    from ml_engine.models.future_forecasting import build_future_feature_frame
+
+    # History of 10 rows ending at sales=100.0 and ewma_3=80.0
+    history = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01", periods=10, freq="D", tz="UTC"),
+        "sales": [50.0] * 9 + [100.0],
+        "ewma_3": [50.0] * 9 + [80.0],
+        "calendar_region": ["india"] * 10,
+    })
+
+    # Suppose predicted targets are [120.0, 140.0, 160.0]
+    preds = [120.0, 140.0, 160.0]
+    future, _ = build_future_feature_frame(
+        history,
+        domain="retail",
+        target_column="sales",
+        horizon=3,
+        predicted_targets=preds,
+    )
+
+    # Step 1 (t+1): ewma incorporates y_T (100.0) -> 0.5 * 100.0 + 0.5 * 80.0 = 90.0
+    # Step 2 (t+2): ewma incorporates pred_1 (120.0) -> 0.5 * 120.0 + 0.5 * 90.0 = 105.0
+    # Step 3 (t+3): ewma incorporates pred_2 (140.0) -> 0.5 * 140.0 + 0.5 * 105.0 = 122.5
+    assert future.loc[0, "ewma_3"] == pytest.approx(90.0)
+    assert future.loc[1, "ewma_3"] == pytest.approx(105.0)
+    assert future.loc[2, "ewma_3"] == pytest.approx(122.5)
+
+
+def test_payday_week_dynamic_recomputation() -> None:
+    """Verify payday_week is deterministically recomputed from date, not frozen via LOCF."""
+    from ml_engine.models.future_forecasting import build_future_feature_frame
+
+    # April 30 is in payday_week (last 2 days of month -> payday_week = 1.0)
+    history = pd.DataFrame({
+        "timestamp": pd.date_range("2024-04-20", "2024-04-30", freq="D", tz="UTC"),
+        "sales": [50.0] * 11,
+        "payday_week": [0.0] * 8 + [1.0, 1.0, 1.0],
+        "calendar_region": ["india"] * 11,
+    })
+
+    # Horizon 15 days: May 1 to May 15
+    future, _ = build_future_feature_frame(
+        history,
+        domain="retail",
+        target_column="sales",
+        horizon=15,
+        predicted_targets=[50.0] * 15,
+    )
+
+    # May 1..7: payday_week == 1.0 (day <= 7)
+    for i in range(7):
+        assert future.loc[i, "payday_week"] == 1.0, f"May {i+1} should be payday_week"
+
+    # May 8..15: payday_week == 0.0 (day > 7 and not end of month)
+    for i in range(7, 15):
+        assert future.loc[i, "payday_week"] == 0.0, f"May {i+1} should NOT be payday_week"
+
+
+def test_festival_proximity_flags_and_interactions_evolution() -> None:
+    """Verify festival_distance, flags, and interaction terms evolve dynamically without leakage or sentinel."""
+    from ml_engine.models.future_forecasting import build_future_feature_frame
+
+    # Holi in 2025 is on 2025-03-14 (defined in INDIA_FESTIVALS). History ends on 2025-03-09.
+    history = pd.DataFrame({
+        "timestamp": pd.date_range("2025-02-20", "2025-03-09", freq="D", tz="UTC"),
+        "sales": [50.0] * 18,
+        "festival_distance": [4.0] * 18,
+        "festival_flag": [0.0] * 18,
+        "holiday_flag": [0.0] * 18,
+        "festival_season_flag": [0.0] * 18,
+        "festival_name": [None] * 18,
+        "calendar_region": ["india"] * 18,
+        "lag_1": [50.0] * 18,
+        "fest_x_lag_1": [0.0] * 18,
+        "fest_season_x_lag1": [0.0] * 18,
+    })
+
+    preds = [60.0 + i * 5 for i in range(10)]  # 2025-03-10 to 2025-03-19
+    future, _ = build_future_feature_frame(
+        history,
+        domain="retail",
+        target_column="sales",
+        horizon=10,
+        predicted_targets=preds,
+    )
+
+    # March 10: 4 days before Holi -> -4.0 (saturated)
+    assert future.loc[0, "festival_distance"] == -4.0
+    assert future.loc[0, "festival_flag"] == 0.0
+    assert future.loc[0, "festival_season_flag"] == 0.0
+    assert future.loc[0, "fest_x_lag_1"] == 0.0
+    assert future.loc[0, "fest_season_x_lag1"] == 0.0
+
+    # March 11: 3 days before Holi -> -3.0, season_flag=1.0
+    assert future.loc[1, "festival_distance"] == -3.0
+    assert future.loc[1, "festival_flag"] == 0.0
+    assert future.loc[1, "festival_season_flag"] == 1.0
+    assert future.loc[1, "fest_x_lag_1"] == 0.0
+    assert future.loc[1, "fest_season_x_lag1"] == pytest.approx(future.loc[1, "lag_1"])
+
+    # March 12: 2 days before -> -2.0
+    assert future.loc[2, "festival_distance"] == -2.0
+    assert future.loc[2, "festival_season_flag"] == 1.0
+
+    # March 13: 1 day before -> -1.0
+    assert future.loc[3, "festival_distance"] == -1.0
+    assert future.loc[3, "festival_season_flag"] == 1.0
+
+    # March 14: Holi day -> distance = 0.0, festival_flag = 1.0, holiday_flag = 1.0
+    assert future.loc[4, "festival_distance"] == 0.0
+    assert future.loc[4, "festival_flag"] == 1.0
+    assert future.loc[4, "holiday_flag"] == 1.0
+    assert future.loc[4, "festival_name"] == "Holi"
+    assert future.loc[4, "festival_season_flag"] == 1.0
+    # fest_x_lag_1 should be 1.0 * lag_1
+    assert future.loc[4, "fest_x_lag_1"] == pytest.approx(future.loc[4, "lag_1"])
+    assert future.loc[4, "fest_season_x_lag1"] == pytest.approx(future.loc[4, "lag_1"])
+
+    # March 15: 1 day after -> 1.0
+    assert future.loc[5, "festival_distance"] == 1.0
+    assert future.loc[5, "festival_flag"] == 0.0
+    assert future.loc[5, "festival_season_flag"] == 1.0
+
+    # March 16: 2 days after -> 2.0
+    assert future.loc[6, "festival_distance"] == 2.0
+    assert future.loc[6, "festival_season_flag"] == 1.0
+
+    # March 17: 3 days after -> 3.0
+    assert future.loc[7, "festival_distance"] == 3.0
+    assert future.loc[7, "festival_season_flag"] == 1.0
+
+    # March 18: 4 days after -> 4.0 (saturated)
+    assert future.loc[8, "festival_distance"] == 4.0
+    assert future.loc[8, "festival_flag"] == 0.0
+    assert future.loc[8, "festival_season_flag"] == 0.0
+
+    # March 19: 5 days after -> 4.0 (saturated, NOT 99.0)
+    assert future.loc[9, "festival_distance"] == 4.0
+    assert future.loc[9, "festival_flag"] == 0.0
+    assert future.loc[9, "festival_season_flag"] == 0.0
+
+
+def test_electricity_future_forecasting_remains_unaffected(elec_features: Path) -> None:
+    """Verify electricity future forecasting matrices do not include retail-only features."""
+    from ml_engine.models.future_forecasting import build_future_feature_frame
+
+    history = load_chronological_history(elec_features, "demand_mw")
+    future, _ = build_future_feature_frame(
+        history,
+        domain="electricity",
+        target_column="demand_mw",
+        horizon=12,
+    )
+    # Electricity must NOT have festival_distance, ewma_3, payday_week injected
+    assert "festival_distance" not in future.columns
+    assert "ewma_3" not in future.columns
+    assert "payday_week" not in future.columns
+    assert len(future) == 12

@@ -45,6 +45,11 @@ ARTIFACT_VERSION_NOTE = 1
 # a request cannot accidentally turn into an unbounded browser/API workload.
 MAX_HORIZON = 2160
 
+DOMAIN_MAX_HORIZON = {
+    "retail": 90,
+    "electricity": 2160,
+}
+
 DOMAIN_FREQUENCY = {
     "retail": "D",
     "electricity": "h",
@@ -142,13 +147,12 @@ def validate_horizon(horizon: Any, *, domain: str) -> int:
         raise FutureForecastError("Parameter 'horizon' must be a positive integer")
     if horizon <= 0:
         raise FutureForecastError("Parameter 'horizon' must be a positive integer")
-    if horizon > MAX_HORIZON:
+    clean_domain = str(domain).lower().strip()
+    max_allowed = DOMAIN_MAX_HORIZON.get(clean_domain, MAX_HORIZON)
+    if horizon > max_allowed:
         raise FutureForecastError(
-            f"Parameter 'horizon' exceeds maximum allowed value of {MAX_HORIZON}"
+            f"Parameter 'horizon' ({horizon}) exceeds maximum allowed value of {max_allowed} for domain '{domain}'"
         )
-    # Soft domain guidance: allow any 1..MAX but electricity often uses hourly
-    # presets; retail daily presets. No extra hard domain max beyond MAX_HORIZON.
-    _ = domain
     return horizon
 
 
@@ -230,6 +234,92 @@ def _lag_rolling_from_history(
     return values
 
 
+def _detect_calendar_region(base: dict[str, Any], history_df: pd.DataFrame) -> str:
+    declared = base.get("calendar_region")
+    if declared and str(declared).strip().lower() in ("india", "uk", "other"):
+        return str(declared).strip().lower()
+    country = str(base.get("country") or "").strip().lower()
+    if country == "india":
+        return "india"
+    state = str(base.get("state") or "").strip().lower()
+    if state in {"maharashtra", "delhi", "karnataka", "tamil nadu", "gujarat", "uttar pradesh", "west bengal", "rajasthan"}:
+        return "india"
+    if "festival_name" in history_df.columns:
+        fest_names = history_df["festival_name"].dropna().astype(str).str.lower()
+        if fest_names.str.contains("diwali|holi|republic day|independence day|dussehra|makar sankranti").any():
+            return "india"
+    return "other"
+
+
+def _collect_festival_dates(history_df: pd.DataFrame, region: str) -> tuple[set[Any], dict[tuple[int, int], str]]:
+    """Collect all known historical festival dates and future regional festival dates."""
+    fest_dates: set[Any] = set()
+    named_festivals: dict[tuple[int, int], str] = {}
+
+    # 1. Historical festival dates from dataset
+    matched_col = None
+    for cand in ("festival_flag", "is_festival", "holiday_flag", "is_holiday"):
+        if cand in history_df.columns:
+            matched_col = cand
+            break
+
+    if matched_col and "timestamp" in history_df.columns:
+        ts_series = pd.to_datetime(history_df["timestamp"], errors="coerce", utc=True)
+        fest_series = pd.to_numeric(history_df[matched_col], errors="coerce").fillna(0)
+        active_dates = ts_series.loc[fest_series == 1].dt.date.dropna()
+        fest_dates.update(active_dates)
+
+    # 2. Regional calendar dates for future periods if region is known
+    if region == "india":
+        from ml_engine.preprocessing.calendar_features import _INDIA_FIXED, INDIA_FESTIVALS
+        years = {ts.year for ts in pd.to_datetime(history_df["timestamp"], errors="coerce", utc=True).dropna()}
+        if years:
+            max_year = max(years)
+            years.update(range(min(years), max_year + 3))
+        else:
+            years = {2024, 2025, 2026, 2027}
+
+        for y in years:
+            for (m, d), name in _INDIA_FIXED.items():
+                try:
+                    dt = pd.Timestamp(year=y, month=m, day=d).date()
+                    fest_dates.add(dt)
+                    named_festivals[(m, d)] = name
+                except Exception:
+                    pass
+            for (m, d), name in INDIA_FESTIVALS.get(y, {}).items():
+                try:
+                    dt = pd.Timestamp(year=y, month=m, day=d).date()
+                    fest_dates.add(dt)
+                    named_festivals[(m, d)] = name
+                except Exception:
+                    pass
+
+    return fest_dates, named_festivals
+
+
+def _compute_festival_distance(dt: Any, fest_dates: set[Any]) -> float:
+    """Compute signed festival distance in days with [-4.0, +4.0] saturation matching common.py."""
+    if not fest_dates:
+        return 4.0
+
+    min_abs = 999
+    best_signed = 999
+    for fd in fest_dates:
+        diff = (dt - fd).days
+        if abs(diff) < min_abs:
+            min_abs = abs(diff)
+            best_signed = diff
+        elif abs(diff) == min_abs:
+            best_signed = min(best_signed, diff)
+
+    if best_signed <= -4:
+        return -4.0
+    if best_signed >= 4:
+        return 4.0
+    return float(best_signed)
+
+
 def build_future_feature_frame(
     history_df: pd.DataFrame,
     *,
@@ -255,20 +345,89 @@ def build_future_feature_frame(
     future_timestamps = pd.date_range(last_ts + pd.tseries.frequencies.to_offset(freq), periods=horizon, freq=freq, tz="UTC")
 
     base = history_df.iloc[-1].to_dict()
-    region = str(base.get("calendar_region") or "other").lower().strip()
+    region = _detect_calendar_region(base, history_df)
+    fest_dates, named_festivals = _collect_festival_dates(history_df, region)
     target_history = [float(v) for v in history_df[target_column].astype(float).tolist()]
+
+    has_ewma = "ewma_3" in history_df.columns
+    current_ewma = float(history_df["ewma_3"].iloc[-1]) if has_ewma else None
+    prev_target = float(history_df[target_column].iloc[-1])
+
     rows: list[dict[str, Any]] = []
 
     for step, ts in enumerate(future_timestamps):
+        current_date = ts.date()
         row = dict(base)
         row["timestamp"] = ts
         row.update(_calendar_features_for_timestamp(ts, domain, region=region))
         row.update(_lag_rolling_from_history(target_history, domain=domain))
+
+        # Deterministic payday_week
+        if "payday_week" in history_df.columns:
+            days_in_month = ts.days_in_month
+            row["payday_week"] = 1.0 if (ts.day <= 7 or (days_in_month - ts.day) <= 2) else 0.0
+
+        # Recursive EWMA update
+        if has_ewma and current_ewma is not None:
+            current_ewma = 0.5 * prev_target + 0.5 * current_ewma
+            row["ewma_3"] = current_ewma
+
+        # Deterministic Festival Proximity and Flags
+        if fest_dates:
+            dist = _compute_festival_distance(current_date, fest_dates)
+            if "festival_distance" in history_df.columns:
+                row["festival_distance"] = dist
+
+            is_fest = 1.0 if current_date in fest_dates else 0.0
+            if "festival_flag" in history_df.columns:
+                row["festival_flag"] = is_fest
+            if "is_festival" in history_df.columns:
+                row["is_festival"] = int(is_fest)
+            if "holiday_flag" in history_df.columns:
+                row["holiday_flag"] = is_fest
+            if "is_holiday" in history_df.columns:
+                row["is_holiday"] = int(is_fest)
+
+            fest_name = named_festivals.get((current_date.month, current_date.day))
+            if "festival_name" in history_df.columns:
+                row["festival_name"] = fest_name
+            if "holiday_name" in history_df.columns:
+                row["holiday_name"] = fest_name
+
+            season_flag = 1.0 if abs(dist) <= 3 else 0.0
+            if "festival_season_flag" in history_df.columns:
+                row["festival_season_flag"] = season_flag
+            if "festival_season" in history_df.columns:
+                row["festival_season"] = fest_name if season_flag == 1.0 else None
+
+        # Dynamic Festival Interactions with current recursive values
+        fest_indicator = float(row.get("festival_flag", row.get("is_festival", 0.0)))
+        if "fest_x_lag_1" in history_df.columns:
+            lag1 = float(row.get("lag_1", 0.0)) if not np.isnan(float(row.get("lag_1", 0.0))) else 0.0
+            row["fest_x_lag_1"] = fest_indicator * lag1
+        if "fest_x_lag_7" in history_df.columns:
+            lag7 = float(row.get("lag_7", 0.0)) if not np.isnan(float(row.get("lag_7", 0.0))) else 0.0
+            row["fest_x_lag_7"] = fest_indicator * lag7
+        if "fest_x_lag_14" in history_df.columns:
+            lag14 = float(row.get("lag_14", 0.0)) if not np.isnan(float(row.get("lag_14", 0.0))) else 0.0
+            row["fest_x_lag_14"] = fest_indicator * lag14
+        if "fest_x_rolling_mean_7" in history_df.columns:
+            rm7 = float(row.get("rolling_mean_7", 0.0)) if not np.isnan(float(row.get("rolling_mean_7", 0.0))) else 0.0
+            row["fest_x_rolling_mean_7"] = fest_indicator * rm7
+        if "fest_x_rolling_mean_14" in history_df.columns:
+            rm14 = float(row.get("rolling_mean_14", 0.0)) if not np.isnan(float(row.get("rolling_mean_14", 0.0))) else 0.0
+            row["fest_x_rolling_mean_14"] = fest_indicator * rm14
+        if "fest_season_x_lag1" in history_df.columns:
+            season_flag = float(row.get("festival_season_flag", 0.0))
+            lag1 = float(row.get("lag_1", 0.0)) if not np.isnan(float(row.get("lag_1", 0.0))) else 0.0
+            row["fest_season_x_lag1"] = season_flag * lag1
+
         # Future actual target is unknown — never fabricate an actual value for metrics.
         if predicted_targets is not None:
             pred = float(predicted_targets[step])
             row[target_column] = pred
             target_history.append(pred)
+            prev_target = pred
         else:
             row[target_column] = np.nan
         rows.append(row)
@@ -296,8 +455,14 @@ def recursive_tabular_future_forecast(
     offset = pd.tseries.frequencies.to_offset(freq)
 
     base = history_df.iloc[-1].to_dict()
-    region = str(base.get("calendar_region") or "other").lower().strip()
+    region = _detect_calendar_region(base, history_df)
+    fest_dates, named_festivals = _collect_festival_dates(history_df, region)
     target_history = [float(v) for v in history_df[target_column].astype(float).tolist()]
+
+    has_ewma = "ewma_3" in history_df.columns
+    current_ewma = float(history_df["ewma_3"].iloc[-1]) if has_ewma else None
+    prev_target = float(history_df[target_column].iloc[-1])
+
     predictions: list[dict[str, Any]] = []
 
     # Ensure transformer is not refit: RandomForestForecaster.predict / XGBoost use transform only.
@@ -316,24 +481,72 @@ def recursive_tabular_future_forecast(
         if not (current_ts > last_ts):
             raise FutureForecastError("Future timestamp must be strictly after the last historical timestamp")
 
+        current_date = current_ts.date()
         row = dict(base)
         row["timestamp"] = current_ts
         row.update(_calendar_features_for_timestamp(current_ts, domain, region=region))
         row.update(_lag_rolling_from_history(target_history, domain=domain))
         row[target_column] = np.nan
 
-        # Recompute derived festival-season features from the LOCF festival_season value.
-        # festival_season is a ±7-day named-festival window carried from history;
-        # festival_season_flag and fest_season_x_lag1 must reflect the current step's
-        # festival_season and lag_1 rather than a stale LOCF value.
-        if "festival_season_flag" in history_df.columns:
-            fest_season_val = row.get("festival_season")
-            festival_season_flag = 0.0 if (fest_season_val is None or (isinstance(fest_season_val, float) and np.isnan(fest_season_val))) else 1.0
-            row["festival_season_flag"] = festival_season_flag
-            if "fest_season_x_lag1" in history_df.columns:
-                lag1_val = row.get("lag_1", np.nan)
-                row["fest_season_x_lag1"] = festival_season_flag * (float(lag1_val) if (lag1_val is not None and not np.isnan(float(lag1_val))) else 0.0)
+        # Deterministic payday_week
+        if "payday_week" in history_df.columns:
+            days_in_month = current_ts.days_in_month
+            row["payday_week"] = 1.0 if (current_ts.day <= 7 or (days_in_month - current_ts.day) <= 2) else 0.0
 
+        # Recursive EWMA update
+        if has_ewma and current_ewma is not None:
+            current_ewma = 0.5 * prev_target + 0.5 * current_ewma
+            row["ewma_3"] = current_ewma
+
+        # Deterministic Festival Proximity and Flags
+        if fest_dates:
+            dist = _compute_festival_distance(current_date, fest_dates)
+            if "festival_distance" in history_df.columns:
+                row["festival_distance"] = dist
+
+            is_fest = 1.0 if current_date in fest_dates else 0.0
+            if "festival_flag" in history_df.columns:
+                row["festival_flag"] = is_fest
+            if "is_festival" in history_df.columns:
+                row["is_festival"] = int(is_fest)
+            if "holiday_flag" in history_df.columns:
+                row["holiday_flag"] = is_fest
+            if "is_holiday" in history_df.columns:
+                row["is_holiday"] = int(is_fest)
+
+            fest_name = named_festivals.get((current_date.month, current_date.day))
+            if "festival_name" in history_df.columns:
+                row["festival_name"] = fest_name
+            if "holiday_name" in history_df.columns:
+                row["holiday_name"] = fest_name
+
+            season_flag = 1.0 if abs(dist) <= 3 else 0.0
+            if "festival_season_flag" in history_df.columns:
+                row["festival_season_flag"] = season_flag
+            if "festival_season" in history_df.columns:
+                row["festival_season"] = fest_name if season_flag == 1.0 else None
+
+        # Dynamic Festival Interactions with current recursive values
+        fest_indicator = float(row.get("festival_flag", row.get("is_festival", 0.0)))
+        if "fest_x_lag_1" in history_df.columns:
+            lag1 = float(row.get("lag_1", 0.0)) if not np.isnan(float(row.get("lag_1", 0.0))) else 0.0
+            row["fest_x_lag_1"] = fest_indicator * lag1
+        if "fest_x_lag_7" in history_df.columns:
+            lag7 = float(row.get("lag_7", 0.0)) if not np.isnan(float(row.get("lag_7", 0.0))) else 0.0
+            row["fest_x_lag_7"] = fest_indicator * lag7
+        if "fest_x_lag_14" in history_df.columns:
+            lag14 = float(row.get("lag_14", 0.0)) if not np.isnan(float(row.get("lag_14", 0.0))) else 0.0
+            row["fest_x_lag_14"] = fest_indicator * lag14
+        if "fest_x_rolling_mean_7" in history_df.columns:
+            rm7 = float(row.get("rolling_mean_7", 0.0)) if not np.isnan(float(row.get("rolling_mean_7", 0.0))) else 0.0
+            row["fest_x_rolling_mean_7"] = fest_indicator * rm7
+        if "fest_x_rolling_mean_14" in history_df.columns:
+            rm14 = float(row.get("rolling_mean_14", 0.0)) if not np.isnan(float(row.get("rolling_mean_14", 0.0))) else 0.0
+            row["fest_x_rolling_mean_14"] = fest_indicator * rm14
+        if "fest_season_x_lag1" in history_df.columns:
+            season_flag = float(row.get("festival_season_flag", 0.0))
+            lag1 = float(row.get("lag_1", 0.0)) if not np.isnan(float(row.get("lag_1", 0.0))) else 0.0
+            row["fest_season_x_lag1"] = season_flag * lag1
 
         step_df = pd.DataFrame([row])
         # Preserve historical column order for transformer feature lookup.
@@ -348,6 +561,7 @@ def recursive_tabular_future_forecast(
             raise FutureForecastError("Future forecast produced a non-finite prediction")
 
         target_history.append(pred_value)
+        prev_target = pred_value
         # Carry predicted target only into recursive history — not as an "actual".
         base = row
         base[target_column] = pred_value
