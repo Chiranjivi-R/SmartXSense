@@ -95,7 +95,7 @@ def add_festival_interaction_features(
 
     fest_series = result[matched_fest_col].fillna(0).astype(float)
 
-    # 0. Distance-aware festival proximity feature (signed distance -3..+3, 99.0 neutral outside window)
+    # 0. Distance-aware festival proximity feature (signed distance -3..+3, neutral saturation at -4.0 / +4.0 outside window)
     ts_series = pd.to_datetime(result["timestamp"], errors="coerce", utc=True) if "timestamp" in result.columns else None
     if ts_series is not None and not ts_series.isna().all():
         fest_dates = sorted(list(set(ts_series.loc[fest_series == 1].dt.date)))
@@ -111,7 +111,12 @@ def add_festival_interaction_features(
                         best_signed = diff
                     elif abs(diff) == min_abs:
                         best_signed = min(best_signed, diff)
-                dist_col.append(float(best_signed) if min_abs <= 3 else 99.0)
+                if best_signed <= -4:
+                    dist_col.append(-4.0)
+                elif best_signed >= 4:
+                    dist_col.append(4.0)
+                else:
+                    dist_col.append(float(best_signed))
             result["festival_distance"] = dist_col
             feature_names.append("festival_distance")
 
