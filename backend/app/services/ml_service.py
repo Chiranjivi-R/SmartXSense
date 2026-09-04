@@ -950,7 +950,12 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
         comp_res = compare_service(payload)
         ranking = comp_res.get("ranking", [])
         eligible = [r["model"] for r in ranking if is_future_forecast_supported(domain, r["model"])]
-        model_name = eligible[0] if eligible else (comp_res.get("recommended_model") or "random_forest")
+        if not eligible:
+            raise MLError(
+                f"None of the requested candidate models support future forecasting for domain '{domain}'",
+                code=400,
+            )
+        model_name = eligible[0]
         selection_reason = "Best validation performance"
     else:
         if not is_future_forecast_supported(domain, model_name):
@@ -971,7 +976,7 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     max_depth = payload.get("max_depth")
     if max_depth is not None:
         max_depth = int(max_depth)
-    learning_rate = float(payload.get("learning_rate", 0.04))
+    learning_rate = float(payload.get("learning_rate", 0.05))
     force_retrain = bool(payload.get("force_retrain", False))
     components = payload.get("components")
     hybrid_weighting = payload.get("hybrid_weighting", "inverse_rmse")

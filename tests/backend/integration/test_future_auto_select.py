@@ -58,13 +58,16 @@ def test_future_endpoint_auto_select_validation_winning_model(tmp_path):
         data = resp.get_json()["data"]
 
         assert "selected_model" in data
-        assert data["selected_model"] in ("xgboost", "random_forest", "naive")
+        assert data["selected_model"] in ("xgboost", "random_forest")
         assert "selection_reason" in data
         assert "validation_metrics" in data
         assert "test_metrics" in data
         assert "predictions" in data
         assert len(data["predictions"]) == 7
         assert "artifact" in data
+        assert data["artifact"]["used"] is True
+        assert data["artifact"]["source"] == "loaded"
+        assert data["artifact_reused"] is True
         assert "dataset_context" in data
 
         # Check prediction structure
@@ -130,6 +133,82 @@ def test_future_endpoint_auto_select_electricity_hybrid(tmp_path):
         assert data_manual["selected_model"] == "hybrid"
         assert len(data_manual["predictions"]) == 12
         assert "validation_metrics" in data_manual
+
+        db.session.remove()
+        db.drop_all()
+
+
+def test_future_auto_select_unsupported_candidate_models_returns_400(tmp_path):
+    """Test B: When requested candidate models contain only future-unsupported models, returns HTTP 400."""
+    class CustomConfig(TestConfig):
+        ML_ARTIFACTS_ROOT = str(tmp_path / "artifacts_guard")
+
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01", periods=60, freq="D"),
+        "sales": np.sin(np.linspace(0, 6, 60)) * 50 + 150,
+    })
+    prep = materialize_forecasting_features(df, "retail", output_root=tmp_path / "features_guard")
+    features_dir = prep["features_dir"]
+
+    app = create_app(CustomConfig)
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        # Request candidate models that do not support future forecasting in retail (lstm, naive)
+        payload = {
+            "domain": "retail",
+            "features_dir": str(features_dir),
+            "model": "auto_select",
+            "models": ["lstm", "naive"],
+            "horizon": 7,
+        }
+
+        resp = client.post("/api/v1/forecasting/future", json=payload)
+        assert resp.status_code == 400
+        err_json = resp.get_json()
+        assert err_json["status"] == "error"
+        assert err_json["code"] == 400
+        msg = err_json.get("message", "").lower()
+        assert "none of the requested candidate models support future forecasting" in msg
+        assert "retail" in msg
+
+        db.session.remove()
+        db.drop_all()
+
+
+def test_future_auto_select_explicit_learning_rate_preserved(tmp_path):
+    """Test that explicit user-provided learning_rate is respected and not overwritten by default 0.05."""
+    class CustomConfig(TestConfig):
+        ML_ARTIFACTS_ROOT = str(tmp_path / "artifacts_lr")
+
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2024-01-01", periods=80, freq="D"),
+        "sales": np.sin(np.linspace(0, 8, 80)) * 50 + 150,
+    })
+    prep = materialize_forecasting_features(df, "retail", output_root=tmp_path / "features_lr")
+    features_dir = prep["features_dir"]
+
+    app = create_app(CustomConfig)
+    with app.app_context():
+        db.create_all()
+        client = app.test_client()
+
+        explicit_lr = 0.08
+        payload = {
+            "domain": "retail",
+            "features_dir": str(features_dir),
+            "model": "auto_select",
+            "models": ["xgboost"],
+            "learning_rate": explicit_lr,
+            "horizon": 7,
+        }
+
+        resp = client.post("/api/v1/forecasting/future", json=payload)
+        assert resp.status_code == 200
+        data = resp.get_json()["data"]
+        assert data["selected_model"] == "xgboost"
+        assert len(data["predictions"]) == 7
 
         db.session.remove()
         db.drop_all()
