@@ -773,21 +773,25 @@ def _obtain_fitted_model_for_inference(
 
 
     if model_name == "hybrid":
-        from ml_engine.models.hybrid import DEFAULT_HYBRID_COMPONENTS, HybridForecaster, HybridModelError
+        from ml_engine.models.hybrid import DEFAULT_HYBRID_COMPONENTS, HybridForecaster, HybridModelError, generate_hybrid_candidates
         if domain != "electricity":
             raise MLError("Future forecasting for hybrid is currently supported only for the electricity domain", code=400)
 
-        comps = components if components is not None else DEFAULT_HYBRID_COMPONENTS.get(domain, ["arima", "random_forest", "xgboost"])
-        for c in comps:
-            if not is_future_forecast_supported(domain, c) or c == "hybrid":
-                raise MLError(
-                    f"Component '{c}' does not support future forecasting in domain '{domain}'",
-                    code=400,
-                )
+        if components is not None:
+            for c in components:
+                if not is_future_forecast_supported(domain, c) or c == "hybrid":
+                    raise MLError(
+                        f"Component '{c}' does not support future forecasting in domain '{domain}'",
+                        code=400,
+                    )
+            pool = components
+        else:
+            pool = DEFAULT_HYBRID_COMPONENTS.get(domain, ["arima", "random_forest", "xgboost"])
 
         try:
+            pool_components = HybridForecaster.validate_components(pool, domain)
             hybrid_forecaster = HybridForecaster(
-                components=comps,
+                components=pool_components,
                 domain=domain,
                 weighting_strategy=hybrid_weighting,
             )
@@ -800,7 +804,7 @@ def _obtain_fitted_model_for_inference(
         component_test_metrics: dict[str, dict[str, float]] = {}
         component_models: dict[str, Any] = {}
 
-        for comp in hybrid_forecaster.components:
+        for comp in pool_components:
             trained_comp = _train_and_predict_single_model(
                 model_key=comp,
                 domain=domain,
@@ -821,18 +825,51 @@ def _obtain_fitted_model_for_inference(
             component_val_metrics[comp] = evaluate_forecast(val_df[target], pd.Series(v_pred.values, index=val_df.index))
             component_test_metrics[comp] = evaluate_forecast(test_df[target], pd.Series(t_pred.values, index=test_df.index))
 
-        weights = HybridForecaster.calculate_weights(
-            component_val_metrics,
-            weighting_strategy=hybrid_weighting,
-        )
-        val_hybrid_pred = HybridForecaster.combine(val_predictions, weights)
-        test_hybrid_pred = HybridForecaster.combine(test_predictions, weights)
+        if components is not None:
+            candidate_list = [hybrid_forecaster.components]
+        else:
+            candidate_list = generate_hybrid_candidates(
+                domain=domain,
+                applicable_models=list(component_models.keys()),
+                future_forecast_only=True,
+            )
 
+        try:
+            evaluated_hybrids = HybridForecaster.evaluate_hybrid_candidates(
+                candidates=candidate_list,
+                component_val_predictions=val_predictions,
+                val_targets=val_df[target],
+                component_test_predictions=test_predictions,
+                test_targets=test_df[target],
+                domain=domain,
+                weighting_strategy=hybrid_weighting,
+                selection_metric="rmse",
+            )
+            decision = HybridForecaster.select_best_hybrid_and_standalone(
+                evaluated_hybrids=evaluated_hybrids,
+                component_val_metrics=component_val_metrics,
+                selection_metric="rmse",
+                require_future_forecast_support=True,
+            )
+        except HybridModelError as err:
+            raise MLError(f"Hybrid candidate evaluation failed: {err}", code=400) from err
+
+        best_hybrid_raw = decision.get("_best_hybrid_raw", decision["best_hybrid"])
+        best_hybrid = decision["best_hybrid"]
+        weights = best_hybrid["weights"]
+        val_hybrid_pred = best_hybrid_raw.get("val_pred")
+        test_hybrid_pred = best_hybrid_raw.get("test_pred")
+
+        hybrid_forecaster.components = best_hybrid["components"]
         hybrid_forecaster.weights = weights
-        hybrid_forecaster.component_models = component_models
+        hybrid_forecaster.component_models = {m: component_models[m] for m in best_hybrid["components"]}
+        hybrid_forecaster.candidate_evaluations = decision["evaluated_candidates"]
+        hybrid_forecaster.best_hybrid = best_hybrid
+        hybrid_forecaster.best_standalone = decision["best_standalone"]
+        hybrid_forecaster.selection_decision = {k: v for k, v in decision.items() if not k.startswith("_")}
 
-        val_metrics = evaluate_forecast(val_df[target], pd.Series(val_hybrid_pred.values, index=val_df.index))
-        test_metrics = evaluate_forecast(test_df[target], pd.Series(test_hybrid_pred.values, index=test_df.index))
+        val_metrics = best_hybrid["validation_metrics"]
+        test_metrics = best_hybrid.get("test_metrics") or {}
 
         artifact_info = _artifact_response(used=False, source="trained")
         return hybrid_forecaster, artifact_info, val_metrics, test_metrics

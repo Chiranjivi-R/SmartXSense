@@ -66,7 +66,7 @@ def format_chart_predictions(
 from .arima import ARIMAForecaster
 from .baseline import NaiveForecaster
 from .cnn_lstm import CNNLSTMForecaster, CNNLSTMModelError, DEFAULT_LOOKBACK_CNN_LSTM
-from .hybrid import HybridForecaster, HybridModelError, DEFAULT_HYBRID_COMPONENTS
+from .hybrid import DEFAULT_HYBRID_COMPONENTS, HybridForecaster, HybridModelError, generate_hybrid_candidates
 from .lstm import DEFAULT_LOOKBACK, LSTMForecaster
 from .random_forest import RandomForestForecaster
 from .xgboost_model import XGBoostForecaster
@@ -415,9 +415,15 @@ def run_training_pipeline(
                 pass
 
     if model_key == "hybrid":
+        if components is not None:
+            raw_pool = components
+        else:
+            raw_pool = DEFAULT_HYBRID_COMPONENTS.get(domain, ["random_forest", "xgboost"])
+
         try:
+            pool_components = HybridForecaster.validate_components(raw_pool, domain)
             hybrid_forecaster = HybridForecaster(
-                components=components,
+                components=pool_components,
                 domain=domain,
                 weighting_strategy=hybrid_weighting,
             )
@@ -430,7 +436,7 @@ def run_training_pipeline(
         component_test_metrics: dict[str, dict[str, float]] = {}
         component_models: dict[str, Any] = {}
 
-        for comp in hybrid_forecaster.components:
+        for comp in pool_components:
             comp_config = expected_configuration_for_request(
                 model_key=comp,
                 domain=domain,
@@ -533,30 +539,51 @@ def run_training_pipeline(
             component_val_metrics[comp] = evaluate_forecast(v_targets, v_pred)
             component_test_metrics[comp] = evaluate_forecast(t_targets, t_pred)
 
-        try:
-            weights = HybridForecaster.calculate_weights(
-                component_val_metrics,
-                weighting_strategy=hybrid_weighting,
+        # Dynamic or explicit candidate generation
+        if components is not None:
+            candidate_list = [hybrid_forecaster.components]
+        else:
+            candidate_list = generate_hybrid_candidates(
+                domain=domain,
+                applicable_models=list(component_models.keys()),
             )
-            val_hybrid_pred = HybridForecaster.combine(val_predictions, weights)
-            test_hybrid_pred = HybridForecaster.combine(test_predictions, weights)
+
+        try:
+            evaluated_hybrids = HybridForecaster.evaluate_hybrid_candidates(
+                candidates=candidate_list,
+                component_val_predictions=val_predictions,
+                val_targets=val_df[target_column],
+                component_test_predictions=test_predictions,
+                test_targets=test_df[target_column],
+                domain=domain,
+                weighting_strategy=hybrid_weighting,
+                selection_metric="rmse",
+            )
+            decision = HybridForecaster.select_best_hybrid_and_standalone(
+                evaluated_hybrids=evaluated_hybrids,
+                component_val_metrics=component_val_metrics,
+                selection_metric="rmse",
+            )
         except HybridModelError as err:
-            raise TrainerError(f"Hybrid ensemble calculation failed: {err}") from err
+            raise TrainerError(f"Hybrid candidate evaluation failed: {err}") from err
 
+        best_hybrid_raw = decision.get("_best_hybrid_raw", decision["best_hybrid"])
+        best_hybrid = decision["best_hybrid"]
+        weights = best_hybrid["weights"]
+        val_hybrid_pred = best_hybrid_raw.get("val_pred")
+        test_hybrid_pred = best_hybrid_raw.get("test_pred")
+        val_metrics = best_hybrid["validation_metrics"]
+        test_metrics = best_hybrid["test_metrics"]
+
+        hybrid_forecaster.components = best_hybrid["components"]
         hybrid_forecaster.weights = weights
-        hybrid_forecaster.component_models = component_models
+        hybrid_forecaster.component_models = {m: component_models[m] for m in best_hybrid["components"]}
+        hybrid_forecaster.candidate_evaluations = decision["evaluated_candidates"]
+        hybrid_forecaster.best_hybrid = best_hybrid
+        hybrid_forecaster.best_standalone = decision["best_standalone"]
+        hybrid_forecaster.selection_decision = {k: v for k, v in decision.items() if not k.startswith("_")}
 
-        val_targets = val_df.loc[val_hybrid_pred.index, target_column]
-        test_targets = test_df.loc[test_hybrid_pred.index, target_column]
-
-        val_metrics = evaluate_forecast(val_targets, val_hybrid_pred)
-        test_metrics = evaluate_forecast(test_targets, test_hybrid_pred)
-
-        adaptive_selection = HybridForecaster.select_adaptive_winner(
-            component_val_metrics,
-            val_metrics,
-        )
-        selected_model = adaptive_selection["selected_model"]
+        selected_model = decision["selected_model"]
         if selected_model == "hybrid":
             selected_test_pred = test_hybrid_pred
             selected_test_metrics = test_metrics
@@ -571,11 +598,16 @@ def run_training_pipeline(
             prediction_limit=prediction_limit,
         )
 
+        effective_config = dict(expected_config)
+        effective_config["components"] = best_hybrid["components"]
+
+        clean_decision = {k: v for k, v in decision.items() if not k.startswith("_")}
+
         result: dict[str, Any] = {
             "model": "hybrid",
             "domain": domain,
             "target": target_column,
-            "configuration": expected_config,
+            "configuration": effective_config,
             "weights": weights,
             "component_validation_metrics": component_val_metrics,
             "component_test_metrics": component_test_metrics,
@@ -586,7 +618,8 @@ def run_training_pipeline(
             "test_metrics": test_metrics,
             "selected_model": selected_model,
             "selected_test_metrics": selected_test_metrics,
-            "adaptive_selection": adaptive_selection,
+            "adaptive_selection": clean_decision,
+            "hybrid_candidate_evaluations": decision["evaluated_candidates"],
             "predictions": predictions_list,
             "prediction_count": pred_count,
             "total_test_predictions": total_test_preds,
