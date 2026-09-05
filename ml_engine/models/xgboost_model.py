@@ -15,6 +15,14 @@ class XGBoostModelError(ValueError):
     """Raised when XGBoost model fitting or prediction fails."""
 
 
+CANONICAL_DETREND_LAGS = (
+    ("lag_1", 1),
+    ("lag_24", 24),
+    ("lag_48", 48),
+    ("lag_168", 168),
+)
+
+
 class XGBoostForecaster:
     """Supervised XGBoost Regressor forecaster for tabular time-series features.
 
@@ -23,6 +31,8 @@ class XGBoostForecaster:
     2. Categorical features are encoded and missing values are imputed strictly using
        training-split statistics.
     3. Exposes model-native feature importances.
+    4. Supports optional causal linear detrending (fitted strictly on training timestamps),
+       detrending corresponding lag features and reconstructing predictions into original units.
     """
 
     def __init__(
@@ -37,6 +47,7 @@ class XGBoostForecaster:
         n_jobs: int = -1,
         target_transform: str | None = None,
         sample_weight_strategy: str | None = None,
+        trend_mode: str | None = None,
     ) -> None:
         if target_transform not in (None, "log1p"):
             raise XGBoostModelError(f"Unsupported target_transform '{target_transform}'. Supported: None, 'log1p'")
@@ -44,6 +55,10 @@ class XGBoostForecaster:
             raise XGBoostModelError(
                 f"Unsupported sample_weight_strategy '{sample_weight_strategy}'. Supported: None, 'spike_sensitive'"
             )
+        if trend_mode in ("none", ""):
+            trend_mode = None
+        if trend_mode not in (None, "linear"):
+            raise XGBoostModelError(f"Unsupported trend_mode '{trend_mode}'. Supported: None, 'linear'")
 
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -54,10 +69,25 @@ class XGBoostForecaster:
         self.n_jobs = n_jobs
         self.target_transform = target_transform
         self.sample_weight_strategy = sample_weight_strategy
+        self.trend_mode = trend_mode
+
+        self.trend_t0: pd.Timestamp | None = None
+        self.trend_intercept: float = 0.0
+        self.trend_slope: float = 0.0
 
         self._transformer: TabularFeatureTransformer | None = None
         self._model: XGBRegressor | None = None
         self.target_column: str = ""
+
+    @property
+    def trend_params(self) -> dict[str, Any] | None:
+        if self.trend_mode != "linear" or self.trend_t0 is None:
+            return None
+        return {
+            "slope": self.trend_slope,
+            "intercept": self.trend_intercept,
+            "t0": self.trend_t0,
+        }
 
     def fit(self, train_df: pd.DataFrame, target_column: str) -> XGBoostForecaster:
         """Fit preprocessing transformer and XGBoost regressor on training dataset."""
@@ -67,23 +97,49 @@ class XGBoostForecaster:
             raise XGBoostModelError(f"Target column '{target_column}' missing from training data")
 
         self.target_column = target_column
-        self._transformer = TabularFeatureTransformer(target_column=target_column)
-        self._transformer.fit(train_df)
-
-        X_train = self._transformer.transform(train_df)
         raw_y = train_df[target_column].astype(float).to_numpy()
+
+        df_train_proc = train_df
+        y_train = raw_y.copy()
+
+        if self.trend_mode == "linear":
+            if "timestamp" not in train_df.columns:
+                raise XGBoostModelError("Timestamp column required for trend_mode='linear'")
+            t_series = pd.to_datetime(train_df["timestamp"], utc=True)
+            self.trend_t0 = t_series.min()
+            t_hours = (t_series - self.trend_t0).dt.total_seconds().to_numpy() / 3600.0
+
+            b, a = np.polyfit(t_hours, raw_y, 1)
+            self.trend_intercept = float(a)
+            self.trend_slope = float(b)
+
+            y_trend = self.trend_intercept + self.trend_slope * t_hours
+            y_train = raw_y - y_trend
+
+            df_train_proc = train_df.copy()
+            df_train_proc[target_column] = y_train
+
+            for col, lag_h in CANONICAL_DETREND_LAGS:
+                if col in df_train_proc.columns:
+                    t_lag = np.maximum(0.0, t_hours - lag_h)
+                    trend_lag = self.trend_intercept + self.trend_slope * t_lag
+                    df_train_proc[col] = pd.to_numeric(df_train_proc[col], errors="coerce") - trend_lag
+
+        self._transformer = TabularFeatureTransformer(target_column=target_column)
+        self._transformer.fit(df_train_proc)
+        X_train = self._transformer.transform(df_train_proc)
 
         sample_weights = None
         if self.sample_weight_strategy == "spike_sensitive":
-            if len(raw_y) >= 10:
-                q85 = float(np.percentile(raw_y, 85))
-                q95 = float(np.percentile(raw_y, 95))
+            target_for_weights = y_train
+            if len(target_for_weights) >= 10:
+                q85 = float(np.percentile(target_for_weights, 85))
+                q95 = float(np.percentile(target_for_weights, 95))
                 if q95 > q85:
-                    sample_weights = np.ones(len(raw_y), dtype=float)
-                    sample_weights[raw_y > q85] = 1.10
-                    sample_weights[raw_y > q95] = 1.30
+                    sample_weights = np.ones(len(target_for_weights), dtype=float)
+                    sample_weights[target_for_weights > q85] = 1.10
+                    sample_weights[target_for_weights > q95] = 1.30
 
-        y_train = raw_y.copy()
         if self.target_transform == "log1p":
             if np.any(y_train < -1.0):
                 raise XGBoostModelError("Cannot apply log1p transform to target values < -1.0")
@@ -113,12 +169,35 @@ class XGBoostForecaster:
         if eval_df is None or eval_df.empty:
             raise XGBoostModelError("Evaluation dataset cannot be empty")
 
-        X_eval = self._transformer.transform(eval_df)
+        df_eval_proc = eval_df
+        eval_trend = None
+
+        if self.trend_mode == "linear":
+            if "timestamp" not in eval_df.columns:
+                raise XGBoostModelError("Timestamp column required for trend_mode='linear'")
+            if self.trend_t0 is None:
+                raise XGBoostModelError("Model trend baseline timestamp is missing")
+
+            t_eval = pd.to_datetime(eval_df["timestamp"], utc=True)
+            t_hours = (t_eval - self.trend_t0).dt.total_seconds().to_numpy() / 3600.0
+
+            df_eval_proc = eval_df.copy()
+            for col, lag_h in CANONICAL_DETREND_LAGS:
+                if col in df_eval_proc.columns:
+                    t_lag = np.maximum(0.0, t_hours - lag_h)
+                    trend_lag = self.trend_intercept + self.trend_slope * t_lag
+                    df_eval_proc[col] = pd.to_numeric(df_eval_proc[col], errors="coerce") - trend_lag
+
+            eval_trend = self.trend_intercept + self.trend_slope * t_hours
+
+        X_eval = self._transformer.transform(df_eval_proc)
         try:
             preds = self._model.predict(X_eval)
             if self.target_transform == "log1p":
                 preds = np.expm1(preds)
                 preds = np.clip(preds, a_min=0.0, a_max=None)
+            if eval_trend is not None:
+                preds = eval_trend + preds
         except Exception as err:
             raise XGBoostModelError(f"Failed to predict using XGBRegressor: {err}") from err
 

@@ -113,6 +113,7 @@ def _train_and_predict_single_model(
     lstm_learning_rate: float = 0.001,
     cnn_filters: int = 32,
     kernel_size: int = 3,
+    trend_mode: str | None = None,
 ) -> dict[str, Any]:
     """Internal helper to train a single component model and generate validation and test predictions."""
     model_key = model_key.lower().strip()
@@ -178,10 +179,16 @@ def _train_and_predict_single_model(
         feature_importances = rf_model.get_feature_importances()
         feature_names = rf_model.feature_names
 
-    elif model_key == "xgboost":
+    elif model_key in ("xgboost", "trend_xgboost"):
+        if model_key == "trend_xgboost" and domain == "retail":
+            raise TrainerError("Model 'trend_xgboost' is only supported for the electricity domain")
+        resolved_trend_mode = "linear" if (model_key == "trend_xgboost" or trend_mode == "linear") else None
+        if resolved_trend_mode == "linear" and domain == "retail":
+            raise TrainerError("trend_mode='linear' is only supported for the electricity domain")
+
         resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
         if sample_weight_strategy is _DEFAULT_SENTINEL:
-            resolved_weight_strategy = "spike_sensitive" if domain == "retail" else None
+            resolved_weight_strategy = "spike_sensitive" if (domain == "retail" or model_key == "trend_xgboost") else None
         else:
             resolved_weight_strategy = sample_weight_strategy
         default_depth = 3 if domain == "retail" else 6
@@ -197,6 +204,8 @@ def _train_and_predict_single_model(
             configuration["target_transform"] = resolved_target_transform
         if resolved_weight_strategy is not None:
             configuration["sample_weight_strategy"] = resolved_weight_strategy
+        if resolved_trend_mode is not None:
+            configuration["trend_mode"] = resolved_trend_mode
 
         xgb_model = XGBoostForecaster(
             n_estimators=n_estimators,
@@ -205,6 +214,7 @@ def _train_and_predict_single_model(
             random_state=random_state,
             target_transform=resolved_target_transform,
             sample_weight_strategy=resolved_weight_strategy,
+            trend_mode=resolved_trend_mode,
         )
         xgb_model.fit(train_df, target_column=target_column)
         model = xgb_model
@@ -287,7 +297,7 @@ def _train_and_predict_single_model(
     else:
         raise TrainerError(
             f"Unsupported model '{model_key}'. Supported models: "
-            "naive, seasonal_naive, arima, baseline, random_forest, xgboost, lstm, cnn_lstm, hybrid"
+            "naive, seasonal_naive, arima, baseline, random_forest, xgboost, trend_xgboost, lstm, cnn_lstm, hybrid"
         )
 
     return {
@@ -328,6 +338,7 @@ def run_training_pipeline(
     # CNN-LSTM-specific parameters
     cnn_filters: int = 32,
     kernel_size: int = 3,
+    trend_mode: str | None = None,
     components: list[str] | None = None,
     hybrid_weighting: str = "inverse_rmse",
     prediction_limit: int = 100,
@@ -342,6 +353,12 @@ def run_training_pipeline(
 
     target_column = DOMAIN_TARGET_MAP[domain]
     features_dir = Path(features_dir)
+
+    model_key = model_name.lower().strip()
+    if model_key == "baseline":
+        model_key = "naive"
+    if model_key == "trend_xgboost" and domain == "retail":
+        raise TrainerError("Model 'trend_xgboost' is only supported for the electricity domain")
 
     train_path = features_dir / "train.parquet"
     val_path = features_dir / "validation.parquet"
@@ -387,6 +404,7 @@ def run_training_pipeline(
         lstm_learning_rate=lstm_learning_rate,
         cnn_filters=cnn_filters,
         kernel_size=kernel_size,
+        trend_mode=trend_mode,
         components=components,
         hybrid_weighting=hybrid_weighting,
     )
@@ -518,6 +536,7 @@ def run_training_pipeline(
                     lstm_learning_rate=lstm_learning_rate,
                     cnn_filters=cnn_filters,
                     kernel_size=kernel_size,
+                    trend_mode=comp_config.get("trend_mode"),
                 )
                 comp_model = res["model"]
                 v_pred = res["val_pred"]
@@ -687,6 +706,7 @@ def run_training_pipeline(
         lstm_learning_rate=lstm_learning_rate,
         cnn_filters=cnn_filters,
         kernel_size=kernel_size,
+        trend_mode=trend_mode,
     )
 
     val_pred = res["val_pred"]
@@ -1013,6 +1033,7 @@ def expected_configuration_for_request(
     lstm_learning_rate: float = 0.001,
     cnn_filters: int = 32,
     kernel_size: int = 3,
+    trend_mode: str | None = None,
     components: list[str] | None = None,
     hybrid_weighting: str = "inverse_rmse",
 ) -> dict[str, Any]:
@@ -1046,10 +1067,16 @@ def expected_configuration_for_request(
         if resolved_target_transform is not None:
             cfg["target_transform"] = resolved_target_transform
         return cfg
-    if model_key == "xgboost":
+    if model_key in ("xgboost", "trend_xgboost"):
+        if model_key == "trend_xgboost" and domain == "retail":
+            raise TrainerError("Model 'trend_xgboost' is only supported for the electricity domain")
+        resolved_trend_mode = "linear" if (model_key == "trend_xgboost" or trend_mode == "linear") else None
+        if resolved_trend_mode == "linear" and domain == "retail":
+            raise TrainerError("trend_mode='linear' is only supported for the electricity domain")
+
         resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
         if sample_weight_strategy is _DEFAULT_SENTINEL:
-            resolved_weight_strategy = "spike_sensitive" if domain == "retail" else None
+            resolved_weight_strategy = "spike_sensitive" if (domain == "retail" or model_key == "trend_xgboost") else None
         else:
             resolved_weight_strategy = sample_weight_strategy
         default_depth = 3 if domain == "retail" else 6
@@ -1065,6 +1092,8 @@ def expected_configuration_for_request(
             cfg["target_transform"] = resolved_target_transform
         if resolved_weight_strategy is not None:
             cfg["sample_weight_strategy"] = resolved_weight_strategy
+        if resolved_trend_mode is not None:
+            cfg["trend_mode"] = resolved_trend_mode
         return cfg
     if model_key == "lstm":
         effective_lookback = lookback if lookback is not None else DEFAULT_LOOKBACK.get(domain, 7)
@@ -1099,10 +1128,11 @@ def main() -> None:
     parser.add_argument("--features-dir", type=Path, required=True, help="Path to Phase 5C feature directory containing train/validation/test parquets")
     parser.add_argument(
         "--model",
-        choices=("naive", "seasonal_naive", "arima", "baseline", "random_forest", "xgboost", "lstm", "cnn_lstm", "hybrid"),
+        choices=("naive", "seasonal_naive", "arima", "baseline", "random_forest", "xgboost", "trend_xgboost", "lstm", "cnn_lstm", "hybrid"),
         default="naive",
         help="Model family to train",
     )
+    parser.add_argument("--trend-mode", choices=("linear", None), default=None, help="Trend detrending mode for electricity XGBoost (default: None)")
     parser.add_argument("--order", type=int, nargs=3, default=[1, 1, 1], metavar=("P", "D", "Q"), help="ARIMA order (p d q), default: 1 1 1")
     parser.add_argument("--seasonal-period", type=int, default=None, help="Seasonal period for seasonal naive model")
     parser.add_argument("--n-estimators", type=int, default=200, help="Number of trees for Random Forest / XGBoost")
@@ -1146,6 +1176,7 @@ def main() -> None:
         hybrid_weighting=args.hybrid_weighting,
         prediction_limit=args.prediction_limit,
         save_artifact=args.save_artifact,
+        trend_mode=args.trend_mode,
     )
 
     print(json.dumps(result, indent=2))

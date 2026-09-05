@@ -89,7 +89,7 @@ DETERMINISTIC_CALENDAR_FEATURES = {
 # Explicit capability matrix: only models listed here are enabled.
 FUTURE_SUPPORTED_MODELS: dict[str, frozenset[str]] = {
     "retail": frozenset({"random_forest", "xgboost"}),
-    "electricity": frozenset({"random_forest", "xgboost", "arima", "hybrid"}),
+    "electricity": frozenset({"random_forest", "xgboost", "trend_xgboost", "arima", "hybrid"}),
 }
 
 UNSUPPORTED_FUTURE_REASONS: dict[str, str] = {
@@ -129,8 +129,8 @@ def is_future_forecast_supported(domain: str, model_key: str) -> bool:
 def future_support_error(domain: str, model_key: str) -> str:
     domain = domain.lower().strip()
     model_key = model_key.lower().strip()
-    if model_key == "arima" and domain == "retail":
-        return "Future forecasting is not currently supported for model arima on the retail domain."
+    if model_key in ("arima", "trend_xgboost") and domain == "retail":
+        return f"Future forecasting is not currently supported for model {model_key} on the retail domain."
     if model_key == "hybrid" and domain == "retail":
         return "Future forecasting is not currently supported for model hybrid on the retail domain."
     if model_key in UNSUPPORTED_FUTURE_REASONS:

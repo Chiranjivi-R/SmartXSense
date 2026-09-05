@@ -19,7 +19,7 @@ class ExplainabilityError(ValueError):
     """Raised when explanation request is invalid or attempted on an unsupported model."""
 
 
-SUPPORTED_EXPLAINABLE_MODELS = ("random_forest", "xgboost", "lstm", "cnn_lstm", "hybrid")
+SUPPORTED_EXPLAINABLE_MODELS = ("random_forest", "xgboost", "trend_xgboost", "lstm", "cnn_lstm", "hybrid")
 
 
 def generate_natural_language_explanation(top_features: list[dict[str, Any]], model_name: str, is_local: bool = False) -> str:
@@ -65,7 +65,7 @@ class ForecastExplainer:
             )
         self.forecaster = forecaster
         self.shap_explainer = None
-        if self.model_name in ("random_forest", "xgboost") and hasattr(forecaster, "_model") and forecaster._model is not None:
+        if self.model_name in ("random_forest", "xgboost", "trend_xgboost") and hasattr(forecaster, "_model") and forecaster._model is not None:
             try:
                 self.shap_explainer = ShapTreeExplainer(forecaster)
             except Exception:
@@ -129,7 +129,7 @@ class ForecastExplainer:
             except Exception:
                 pass
 
-        if method_clean == "lime" and self.model_name in ("random_forest", "xgboost") and train_df is not None and not train_df.empty:
+        if method_clean == "lime" and self.model_name in ("random_forest", "xgboost", "trend_xgboost") and train_df is not None and not train_df.empty:
             try:
                 lime_exp = LimeTabularExplainer(self.forecaster, train_df=train_df)
                 res = lime_exp.explain_local(eval_df, sample_index=sample_index)

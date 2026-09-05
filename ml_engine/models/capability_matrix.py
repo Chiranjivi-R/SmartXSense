@@ -20,7 +20,7 @@ SUPPORTED_DOMAINS = sorted(DOMAIN_TARGET_MAP.keys())
 
 # Models included in default Compare / Auto Select candidate lists.
 DEFAULT_COMPARE_MODELS: dict[str, list[str]] = {
-    "electricity": ["naive", "arima", "random_forest", "xgboost", "lstm", "hybrid"],
+    "electricity": ["arima", "random_forest", "xgboost", "trend_xgboost", "lstm", "hybrid"],
     "retail": ["naive", "random_forest", "xgboost", "lstm", "hybrid"],
 }
 
@@ -70,6 +70,15 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "test_forecast": True,
         "compare_default": True,
         "notes": None,
+    },
+    {
+        "key": "trend_xgboost",
+        "name": "Trend XGBoost",
+        "model_type": "tabular_ensemble",
+        "domains": ["electricity"],
+        "test_forecast": True,
+        "compare_default": True,
+        "notes": "Detrended residual XGBoost with conservative spike weighting for non-stationary electricity demand.",
     },
     {
         "key": "lstm",

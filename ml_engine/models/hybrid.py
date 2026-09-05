@@ -31,6 +31,7 @@ SUPPORTED_COMPONENTS = (
     "arima",
     "random_forest",
     "xgboost",
+    "trend_xgboost",
     "lstm",
     "cnn_lstm",
 )

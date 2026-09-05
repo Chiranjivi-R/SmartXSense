@@ -30,6 +30,7 @@ PERSISTENCE_SUPPORTED_MODELS = frozenset({
     "arima",
     "random_forest",
     "xgboost",
+    "trend_xgboost",
     "lstm",
     "cnn_lstm",
 })
@@ -677,7 +678,7 @@ def predict_with_fitted_model(
         val_pred = model.predict(val_df, target_column=target_column, history=train_df[target_column])
         combined = pd.concat([train_df[target_column], val_df[target_column]], ignore_index=True)
         test_pred = model.predict(test_df, target_column=target_column, history=combined)
-    elif model_key in ("random_forest", "xgboost"):
+    elif model_key in ("random_forest", "xgboost", "trend_xgboost"):
         val_pred = model.predict(val_df)
         test_pred = model.predict(test_df)
     elif model_key in ("lstm", "cnn_lstm"):

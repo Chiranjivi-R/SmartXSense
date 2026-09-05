@@ -86,6 +86,7 @@ KNOWN_FORECAST_MODELS = frozenset({
     "arima",
     "random_forest",
     "xgboost",
+    "trend_xgboost",
     "lstm",
     "cnn_lstm",
     "hybrid",
@@ -599,6 +600,8 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
 
     if model_name == "arima" and domain == "retail":
         raise MLError("ARIMA model is currently supported only for the electricity domain")
+    if model_name == "trend_xgboost" and domain == "retail":
+        raise MLError("Trend XGBoost model is currently supported only for the electricity domain")
 
     features_dir, dataset_ctx = resolve_dynamic_features_and_context(payload)
     selection_method = payload.get("selection_method")
@@ -1079,9 +1082,11 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
                 raise MLError(f"Unsupported comparison model '{name}'")
             candidate_models.append(name)
 
-    # Reject ARIMA for retail domain
+    # Reject ARIMA and trend_xgboost for retail domain
     if domain == "retail" and "arima" in candidate_models:
         raise MLError("ARIMA model is not supported for retail domain comparison")
+    if domain == "retail" and "trend_xgboost" in candidate_models:
+        raise MLError("Trend XGBoost model is not supported for retail domain comparison")
 
     artifacts_root = _resolve_artifacts_root()
     features_id = derive_features_id(features_dir)
@@ -1216,6 +1221,14 @@ def explain_service(payload: dict[str, Any]) -> dict[str, Any]:
     elif model_name == "xgboost":
         forecaster = XGBoostForecaster(
             n_estimators=int(payload.get("n_estimators", 200)),
+            random_state=42,
+        )
+        forecaster.fit(train_df, target_column=target_column)
+    elif model_name == "trend_xgboost":
+        forecaster = XGBoostForecaster(
+            n_estimators=int(payload.get("n_estimators", 200)),
+            trend_mode="linear",
+            sample_weight_strategy="spike_sensitive",
             random_state=42,
         )
         forecaster.fit(train_df, target_column=target_column)
