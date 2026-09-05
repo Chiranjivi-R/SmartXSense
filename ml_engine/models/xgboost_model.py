@@ -48,6 +48,7 @@ class XGBoostForecaster:
         target_transform: str | None = None,
         sample_weight_strategy: str | None = None,
         trend_mode: str | None = None,
+        trend_knot_hour: float | None = None,
     ) -> None:
         if target_transform not in (None, "log1p"):
             raise XGBoostModelError(f"Unsupported target_transform '{target_transform}'. Supported: None, 'log1p'")
@@ -57,8 +58,13 @@ class XGBoostForecaster:
             )
         if trend_mode in ("none", ""):
             trend_mode = None
-        if trend_mode not in (None, "linear"):
-            raise XGBoostModelError(f"Unsupported trend_mode '{trend_mode}'. Supported: None, 'linear'")
+        if trend_mode not in (None, "linear", "piecewise_linear"):
+            raise XGBoostModelError(
+                f"Unsupported trend_mode '{trend_mode}'. Supported: None, 'linear', 'piecewise_linear'"
+            )
+        if trend_knot_hour is not None:
+            if not isinstance(trend_knot_hour, (int, float)) or np.isnan(trend_knot_hour) or trend_knot_hour <= 0:
+                raise XGBoostModelError(f"trend_knot_hour must be a positive float, got '{trend_knot_hour}'")
 
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -70,24 +76,67 @@ class XGBoostForecaster:
         self.target_transform = target_transform
         self.sample_weight_strategy = sample_weight_strategy
         self.trend_mode = trend_mode
+        self.trend_knot_hour = (
+            float(trend_knot_hour)
+            if trend_knot_hour is not None
+            else (30000.0 if trend_mode == "piecewise_linear" else None)
+        )
 
         self.trend_t0: pd.Timestamp | None = None
         self.trend_intercept: float = 0.0
         self.trend_slope: float = 0.0
+        self.trend_slope2_delta: float = 0.0
 
         self._transformer: TabularFeatureTransformer | None = None
         self._model: XGBRegressor | None = None
         self.target_column: str = ""
 
+    def compute_trend(self, t_hours: np.ndarray | float) -> np.ndarray | float:
+        """Compute deterministic trend in MW for given hours elapsed from trend_t0."""
+        if self.trend_mode == "linear":
+            return self.trend_intercept + self.trend_slope * t_hours
+        if self.trend_mode == "piecewise_linear":
+            knot = self.trend_knot_hour if self.trend_knot_hour is not None else 30000.0
+            return (
+                self.trend_intercept
+                + self.trend_slope * t_hours
+                + self.trend_slope2_delta * np.maximum(0.0, t_hours - knot)
+            )
+        return 0.0
+
+    def detrend_lag_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Detrend canonical lag columns against the historical trend offsets."""
+        if self.trend_mode not in ("linear", "piecewise_linear") or self.trend_t0 is None:
+            return df
+        if "timestamp" not in df.columns:
+            return df
+        t_series = pd.to_datetime(df["timestamp"], utc=True)
+        t_hours = (t_series - self.trend_t0).dt.total_seconds().to_numpy() / 3600.0
+
+        df_proc = df.copy()
+        for col, lag_h in CANONICAL_DETREND_LAGS:
+            if col in df_proc.columns:
+                t_lag = np.maximum(0.0, t_hours - lag_h)
+                trend_lag = self.compute_trend(t_lag)
+                df_proc[col] = pd.to_numeric(df_proc[col], errors="coerce") - trend_lag
+        return df_proc
+
     @property
     def trend_params(self) -> dict[str, Any] | None:
-        if self.trend_mode != "linear" or self.trend_t0 is None:
+        if self.trend_mode not in ("linear", "piecewise_linear") or self.trend_t0 is None:
             return None
-        return {
+        params: dict[str, Any] = {
+            "trend_mode": self.trend_mode,
             "slope": self.trend_slope,
             "intercept": self.trend_intercept,
             "t0": self.trend_t0,
         }
+        if self.trend_mode == "piecewise_linear":
+            params["trend_knot_hour"] = self.trend_knot_hour
+            params["slope2_delta"] = self.trend_slope2_delta
+            params["seg1_slope"] = self.trend_slope
+            params["seg2_slope"] = self.trend_slope + self.trend_slope2_delta
+        return params
 
     def fit(self, train_df: pd.DataFrame, target_column: str) -> XGBoostForecaster:
         """Fit preprocessing transformer and XGBoost regressor on training dataset."""
@@ -102,28 +151,31 @@ class XGBoostForecaster:
         df_train_proc = train_df
         y_train = raw_y.copy()
 
-        if self.trend_mode == "linear":
+        if self.trend_mode in ("linear", "piecewise_linear"):
             if "timestamp" not in train_df.columns:
-                raise XGBoostModelError("Timestamp column required for trend_mode='linear'")
+                raise XGBoostModelError(f"Timestamp column required for trend_mode='{self.trend_mode}'")
             t_series = pd.to_datetime(train_df["timestamp"], utc=True)
             self.trend_t0 = t_series.min()
             t_hours = (t_series - self.trend_t0).dt.total_seconds().to_numpy() / 3600.0
 
-            b, a = np.polyfit(t_hours, raw_y, 1)
-            self.trend_intercept = float(a)
-            self.trend_slope = float(b)
+            if self.trend_mode == "linear":
+                b, a = np.polyfit(t_hours, raw_y, 1)
+                self.trend_intercept = float(a)
+                self.trend_slope = float(b)
+                self.trend_slope2_delta = 0.0
+            elif self.trend_mode == "piecewise_linear":
+                knot = self.trend_knot_hour if self.trend_knot_hour is not None else 30000.0
+                X_trend = np.column_stack([np.ones_like(t_hours), t_hours, np.maximum(0.0, t_hours - knot)])
+                coef, _, _, _ = np.linalg.lstsq(X_trend, raw_y, rcond=None)
+                self.trend_intercept = float(coef[0])
+                self.trend_slope = float(coef[1])
+                self.trend_slope2_delta = float(coef[2])
 
-            y_trend = self.trend_intercept + self.trend_slope * t_hours
+            y_trend = self.compute_trend(t_hours)
             y_train = raw_y - y_trend
 
-            df_train_proc = train_df.copy()
+            df_train_proc = self.detrend_lag_features(train_df)
             df_train_proc[target_column] = y_train
-
-            for col, lag_h in CANONICAL_DETREND_LAGS:
-                if col in df_train_proc.columns:
-                    t_lag = np.maximum(0.0, t_hours - lag_h)
-                    trend_lag = self.trend_intercept + self.trend_slope * t_lag
-                    df_train_proc[col] = pd.to_numeric(df_train_proc[col], errors="coerce") - trend_lag
 
         self._transformer = TabularFeatureTransformer(target_column=target_column)
         self._transformer.fit(df_train_proc)
@@ -172,23 +224,17 @@ class XGBoostForecaster:
         df_eval_proc = eval_df
         eval_trend = None
 
-        if self.trend_mode == "linear":
+        if self.trend_mode in ("linear", "piecewise_linear"):
             if "timestamp" not in eval_df.columns:
-                raise XGBoostModelError("Timestamp column required for trend_mode='linear'")
+                raise XGBoostModelError(f"Timestamp column required for trend_mode='{self.trend_mode}'")
             if self.trend_t0 is None:
                 raise XGBoostModelError("Model trend baseline timestamp is missing")
 
             t_eval = pd.to_datetime(eval_df["timestamp"], utc=True)
             t_hours = (t_eval - self.trend_t0).dt.total_seconds().to_numpy() / 3600.0
 
-            df_eval_proc = eval_df.copy()
-            for col, lag_h in CANONICAL_DETREND_LAGS:
-                if col in df_eval_proc.columns:
-                    t_lag = np.maximum(0.0, t_hours - lag_h)
-                    trend_lag = self.trend_intercept + self.trend_slope * t_lag
-                    df_eval_proc[col] = pd.to_numeric(df_eval_proc[col], errors="coerce") - trend_lag
-
-            eval_trend = self.trend_intercept + self.trend_slope * t_hours
+            df_eval_proc = self.detrend_lag_features(eval_df)
+            eval_trend = self.compute_trend(t_hours)
 
         X_eval = self._transformer.transform(df_eval_proc)
         try:

@@ -46,6 +46,10 @@ class ShapTreeExplainer:
         if df is None or df.empty:
             raise ShapExplainerError("Input DataFrame for explanation cannot be empty.")
 
+        # Detrend lag features if forecaster supports detrending (e.g., trend_xgboost)
+        if hasattr(self.forecaster, "detrend_lag_features"):
+            df = self.forecaster.detrend_lag_features(df)
+
         X_trans = self.transformer.transform(df)
         if X_trans.shape[1] != len(self.feature_names):
             raise ShapExplainerError(
@@ -148,6 +152,23 @@ class ShapTreeExplainer:
                 "feature": name,
                 "contribution": contrib,
                 "value": formatted_val,
+            })
+
+        # For trend models (linear or piecewise_linear), add baseline_trend attribution
+        # so the waterfall attribution sum (base_value + sum(contributions)) equals the point prediction.
+        if getattr(self.forecaster, "trend_mode", None) in ("linear", "piecewise_linear") and getattr(self.forecaster, "trend_t0", None) is not None:
+            if "timestamp" in row_df:
+                t_ts = pd.to_datetime(row_df["timestamp"], utc=True)
+                t_hr = (t_ts - self.forecaster.trend_t0).total_seconds() / 3600.0
+            else:
+                t_hr = 0.0
+            trend_val = float(self.forecaster.compute_trend(t_hr))
+            feature_values["baseline_trend"] = trend_val
+            contributions["baseline_trend"] = trend_val
+            items.append({
+                "feature": "baseline_trend",
+                "contribution": trend_val,
+                "value": trend_val,
             })
 
         top_positive = sorted(

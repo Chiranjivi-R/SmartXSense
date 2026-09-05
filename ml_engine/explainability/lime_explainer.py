@@ -38,7 +38,11 @@ class LimeTabularExplainer:
         self.transformer = forecaster._transformer
         self.feature_names = list(self.transformer.feature_names)
 
-        X_train = self.transformer.transform(train_df)
+        train_proc = train_df
+        if hasattr(self.forecaster, "detrend_lag_features"):
+            train_proc = self.forecaster.detrend_lag_features(train_df)
+
+        X_train = self.transformer.transform(train_proc)
 
         try:
             self.explainer = lime.lime_tabular.LimeTabularExplainer(
@@ -57,7 +61,11 @@ class LimeTabularExplainer:
                 f"Sample index {sample_index} out of range for evaluation data of size {len(eval_df)}."
             )
 
-        X_trans = self.transformer.transform(eval_df)
+        eval_proc = eval_df
+        if hasattr(self.forecaster, "detrend_lag_features"):
+            eval_proc = self.forecaster.detrend_lag_features(eval_df)
+
+        X_trans = self.transformer.transform(eval_proc)
         sample_row = X_trans[sample_index]
 
         def predict_fn(x: np.ndarray) -> np.ndarray:
@@ -89,6 +97,21 @@ class LimeTabularExplainer:
             }
             for condition, weight in exp_list
         ]
+
+        # For trend models (linear or piecewise_linear), add baseline_trend attribution
+        # to account for the deterministic baseline trend component in the prediction.
+        if getattr(self.forecaster, "trend_mode", None) in ("linear", "piecewise_linear") and getattr(self.forecaster, "trend_t0", None) is not None:
+            row_df = eval_df.iloc[sample_index]
+            if "timestamp" in row_df:
+                t_ts = pd.to_datetime(row_df["timestamp"], utc=True)
+                t_hr = (t_ts - self.forecaster.trend_t0).total_seconds() / 3600.0
+            else:
+                t_hr = 0.0
+            trend_val = float(self.forecaster.compute_trend(t_hr))
+            feature_attributions.append({
+                "rule": "baseline_trend",
+                "weight": trend_val,
+            })
 
         return {
             "explanation_type": "local",

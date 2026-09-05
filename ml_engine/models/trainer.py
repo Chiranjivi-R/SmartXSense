@@ -116,6 +116,7 @@ def _train_and_predict_single_model(
     cnn_filters: int = 32,
     kernel_size: int = 3,
     trend_mode: str | None = None,
+    trend_knot_hour: float | None = None,
 ) -> dict[str, Any]:
     """Internal helper to train a single component model and generate validation and test predictions."""
     model_key = model_key.lower().strip()
@@ -201,10 +202,21 @@ def _train_and_predict_single_model(
     elif model_key in ("xgboost", "trend_xgboost"):
         if model_key == "trend_xgboost" and domain == "retail":
             raise TrainerError("Model 'trend_xgboost' is only supported for the electricity domain")
-        resolved_trend_mode = "linear" if (model_key == "trend_xgboost" or trend_mode == "linear") else None
-        if resolved_trend_mode == "linear" and domain == "retail":
-            raise TrainerError("trend_mode='linear' is only supported for the electricity domain")
+        if model_key == "trend_xgboost":
+            resolved_trend_mode = trend_mode if trend_mode in ("linear", "piecewise_linear") else "piecewise_linear"
+        elif trend_mode in ("linear", "piecewise_linear"):
+            resolved_trend_mode = trend_mode
+        else:
+            resolved_trend_mode = None
 
+        if resolved_trend_mode in ("linear", "piecewise_linear") and domain == "retail":
+            raise TrainerError(f"trend_mode='{resolved_trend_mode}' is only supported for the electricity domain")
+
+        resolved_knot_hour = (
+            float(trend_knot_hour)
+            if trend_knot_hour is not None
+            else (30000.0 if resolved_trend_mode == "piecewise_linear" else None)
+        )
         resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
         if sample_weight_strategy is _DEFAULT_SENTINEL:
             resolved_weight_strategy = "spike_sensitive" if (domain == "retail" or model_key == "trend_xgboost") else None
@@ -225,6 +237,8 @@ def _train_and_predict_single_model(
             configuration["sample_weight_strategy"] = resolved_weight_strategy
         if resolved_trend_mode is not None:
             configuration["trend_mode"] = resolved_trend_mode
+            if resolved_trend_mode == "piecewise_linear":
+                configuration["trend_knot_hour"] = resolved_knot_hour
 
         xgb_model = XGBoostForecaster(
             n_estimators=n_estimators,
@@ -234,6 +248,7 @@ def _train_and_predict_single_model(
             target_transform=resolved_target_transform,
             sample_weight_strategy=resolved_weight_strategy,
             trend_mode=resolved_trend_mode,
+            trend_knot_hour=resolved_knot_hour,
         )
         xgb_model.fit(train_df, target_column=target_column)
         model = xgb_model
@@ -360,6 +375,7 @@ def run_training_pipeline(
     cnn_filters: int = 32,
     kernel_size: int = 3,
     trend_mode: str | None = None,
+    trend_knot_hour: float | None = None,
     components: list[str] | None = None,
     hybrid_weighting: str = "inverse_rmse",
     prediction_limit: int = 100,
@@ -428,6 +444,7 @@ def run_training_pipeline(
         cnn_filters=cnn_filters,
         kernel_size=kernel_size,
         trend_mode=trend_mode,
+        trend_knot_hour=trend_knot_hour,
         components=components,
         hybrid_weighting=hybrid_weighting,
     )
@@ -567,6 +584,7 @@ def run_training_pipeline(
                     cnn_filters=cnn_filters,
                     kernel_size=kernel_size,
                     trend_mode=comp_config.get("trend_mode"),
+                    trend_knot_hour=comp_config.get("trend_knot_hour"),
                 )
                 comp_model = res["model"]
                 v_pred = res["val_pred"]
@@ -739,6 +757,7 @@ def run_training_pipeline(
         cnn_filters=cnn_filters,
         kernel_size=kernel_size,
         trend_mode=trend_mode,
+        trend_knot_hour=trend_knot_hour,
     )
 
     val_pred = res["val_pred"]
@@ -1068,6 +1087,7 @@ def expected_configuration_for_request(
     cnn_filters: int = 32,
     kernel_size: int = 3,
     trend_mode: str | None = None,
+    trend_knot_hour: float | None = None,
     components: list[str] | None = None,
     hybrid_weighting: str = "inverse_rmse",
 ) -> dict[str, Any]:
@@ -1117,10 +1137,21 @@ def expected_configuration_for_request(
     if model_key in ("xgboost", "trend_xgboost"):
         if model_key == "trend_xgboost" and domain == "retail":
             raise TrainerError("Model 'trend_xgboost' is only supported for the electricity domain")
-        resolved_trend_mode = "linear" if (model_key == "trend_xgboost" or trend_mode == "linear") else None
-        if resolved_trend_mode == "linear" and domain == "retail":
-            raise TrainerError("trend_mode='linear' is only supported for the electricity domain")
+        if model_key == "trend_xgboost":
+            resolved_trend_mode = trend_mode if trend_mode in ("linear", "piecewise_linear") else "piecewise_linear"
+        elif trend_mode in ("linear", "piecewise_linear"):
+            resolved_trend_mode = trend_mode
+        else:
+            resolved_trend_mode = None
 
+        if resolved_trend_mode in ("linear", "piecewise_linear") and domain == "retail":
+            raise TrainerError(f"trend_mode='{resolved_trend_mode}' is only supported for the electricity domain")
+
+        resolved_knot_hour = (
+            float(trend_knot_hour)
+            if trend_knot_hour is not None
+            else (30000.0 if resolved_trend_mode == "piecewise_linear" else None)
+        )
         resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
         if sample_weight_strategy is _DEFAULT_SENTINEL:
             resolved_weight_strategy = "spike_sensitive" if (domain == "retail" or model_key == "trend_xgboost") else None
@@ -1141,6 +1172,8 @@ def expected_configuration_for_request(
             cfg["sample_weight_strategy"] = resolved_weight_strategy
         if resolved_trend_mode is not None:
             cfg["trend_mode"] = resolved_trend_mode
+            if resolved_trend_mode == "piecewise_linear":
+                cfg["trend_knot_hour"] = resolved_knot_hour
         return cfg
     if model_key == "lstm":
         effective_lookback = lookback if lookback is not None else DEFAULT_LOOKBACK.get(domain, 7)
