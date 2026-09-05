@@ -70,7 +70,7 @@ from .baseline import NaiveForecaster
 from .cnn_lstm import CNNLSTMForecaster, CNNLSTMModelError, DEFAULT_LOOKBACK_CNN_LSTM
 from .hybrid import DEFAULT_HYBRID_COMPONENTS, HybridForecaster, HybridModelError, generate_hybrid_candidates
 from .lstm import DEFAULT_LOOKBACK, LSTMForecaster
-from .random_forest import RandomForestForecaster
+from .random_forest import RETAIL_MACRO_EXCLUSIONS, RandomForestForecaster
 from .xgboost_model import XGBoostForecaster
 
 
@@ -172,6 +172,7 @@ def _train_and_predict_single_model(
 
     elif model_key == "random_forest":
         resolved_target_transform = target_transform if target_transform is not None else ("log1p" if domain == "retail" else None)
+        resolved_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if domain == "retail" else None
         configuration.update({
             "n_estimators": n_estimators,
             "max_depth": max_depth,
@@ -179,12 +180,15 @@ def _train_and_predict_single_model(
         })
         if resolved_target_transform is not None:
             configuration["target_transform"] = resolved_target_transform
+        if resolved_exclusions is not None:
+            configuration["feature_exclusions"] = resolved_exclusions
 
         rf_model = RandomForestForecaster(
             n_estimators=n_estimators,
             max_depth=max_depth,
             random_state=random_state,
             target_transform=resolved_target_transform,
+            feature_exclusions=resolved_exclusions,
         )
         rf_model.fit(train_df, target_column=target_column)
         model = rf_model
@@ -430,7 +434,8 @@ def run_training_pipeline(
 
     from .tabular_preprocessing import TabularFeatureTransformer
 
-    expected_feature_names = TabularFeatureTransformer(target_column=target_column).fit(train_df).feature_names
+    rf_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (model_key == "random_forest" and domain == "retail") else ()
+    expected_feature_names = TabularFeatureTransformer(target_column=target_column, extra_exclude=rf_exclusions).fit(train_df).feature_names
 
     # Attempt to reuse existing artifact if force_retrain is False and persistence is supported
     if not force_retrain and is_persistence_supported(model_key):
@@ -510,13 +515,15 @@ def run_training_pipeline(
             )
             comp_loaded = None
             if not force_retrain and is_persistence_supported(comp):
+                comp_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (comp == "random_forest" and domain == "retail") else ()
+                comp_expected_features = TabularFeatureTransformer(target_column=target_column, extra_exclude=comp_exclusions).fit(train_df).feature_names
                 comp_loaded = try_load_compatible_artifact(
                     domain=domain,
                     model_key=comp,
                     target=target_column,
                     features_id=features_id,
                     dataset_fingerprint=dataset_fingerprint,
-                    feature_names=expected_feature_names,
+                    feature_names=comp_expected_features,
                     configuration=comp_config,
                     artifacts_root=artifacts_root,
                 )
@@ -876,8 +883,8 @@ def evaluate_fitted_model_on_splits(
     test_df = pd.read_parquet(features_dir / "test.parquet")
     from .tabular_preprocessing import TabularFeatureTransformer
 
-
-    expected_feature_names = TabularFeatureTransformer(target_column=target_column).fit(train_df).feature_names
+    rf_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (model_key == "random_forest" and domain == "retail") else ()
+    expected_feature_names = TabularFeatureTransformer(target_column=target_column, extra_exclude=rf_exclusions).fit(train_df).feature_names
     if hasattr(model, "feature_names") and model.feature_names:
         if list(model.feature_names) != list(expected_feature_names):
             raise TrainerError(
@@ -1104,6 +1111,8 @@ def expected_configuration_for_request(
         }
         if resolved_target_transform is not None:
             cfg["target_transform"] = resolved_target_transform
+        if domain == "retail":
+            cfg["feature_exclusions"] = list(RETAIL_MACRO_EXCLUSIONS)
         return cfg
     if model_key in ("xgboost", "trend_xgboost"):
         if model_key == "trend_xgboost" and domain == "retail":

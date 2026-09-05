@@ -735,8 +735,11 @@ def _obtain_fitted_model_for_inference(
     val_df = pd.read_parquet(features_dir / "validation.parquet")
     test_df = pd.read_parquet(features_dir / "test.parquet")
 
+    from ml_engine.models.random_forest import RETAIL_MACRO_EXCLUSIONS
     from ml_engine.models.tabular_preprocessing import TabularFeatureTransformer
-    expected_feature_names = TabularFeatureTransformer(target_column=target).fit(train_df).feature_names
+
+    rf_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (model_name == "random_forest" and domain == "retail") else ()
+    expected_feature_names = TabularFeatureTransformer(target_column=target, extra_exclude=rf_exclusions).fit(train_df).feature_names
 
     if not force_retrain and is_persistence_supported(model_name):
         try:

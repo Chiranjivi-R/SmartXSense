@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 
 from .tabular_preprocessing import TabularFeatureTransformer
+
+
+RETAIL_MACRO_EXCLUSIONS: tuple[str, ...] = (
+    "cpi_clothing",
+    "cpi_combined",
+    "cpi_food",
+    "fuel_price_petrol",
+    "gdp_growth_rate",
+    "inflation_rate",
+    "repo_rate",
+    "unemployment_rate",
+    "wpi_index",
+)
 
 
 class RandomForestModelError(ValueError):
@@ -35,6 +48,7 @@ class RandomForestForecaster:
         random_state: int = 42,
         n_jobs: int = -1,
         target_transform: str | None = None,
+        feature_exclusions: Sequence[str] | None = None,
     ) -> None:
         if target_transform not in (None, "log1p"):
             raise RandomForestModelError(f"Unsupported target_transform '{target_transform}'. Supported: None, 'log1p'")
@@ -46,6 +60,7 @@ class RandomForestForecaster:
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.target_transform = target_transform
+        self.feature_exclusions = list(feature_exclusions) if feature_exclusions is not None else None
 
         self._transformer: TabularFeatureTransformer | None = None
         self._model: RandomForestRegressor | None = None
@@ -59,7 +74,8 @@ class RandomForestForecaster:
             raise RandomForestModelError(f"Target column '{target_column}' missing from training data")
 
         self.target_column = target_column
-        self._transformer = TabularFeatureTransformer(target_column=target_column)
+        extra_exclude = self.feature_exclusions or ()
+        self._transformer = TabularFeatureTransformer(target_column=target_column, extra_exclude=extra_exclude)
         self._transformer.fit(train_df)
 
         X_train = self._transformer.transform(train_df)

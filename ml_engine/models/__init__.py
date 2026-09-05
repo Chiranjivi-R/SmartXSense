@@ -5,7 +5,7 @@ from .baseline import BaselineModelError, NaiveForecaster
 from .cnn_lstm import CNNLSTMForecaster, CNNLSTMModelError, DEFAULT_LOOKBACK_CNN_LSTM
 from .hybrid import DEFAULT_HYBRID_COMPONENTS, SUPPORTED_COMPONENTS, HybridForecaster, HybridModelError
 from .lstm import DEFAULT_LOOKBACK, LSTMForecaster, LSTMModelError
-from .random_forest import RandomForestForecaster, RandomForestModelError
+from .random_forest import RETAIL_MACRO_EXCLUSIONS, RandomForestForecaster, RandomForestModelError
 from .sequence_preprocessing import SequencePreprocessingError, SequencePreprocessor
 from .tabular_preprocessing import PreprocessingError, TabularFeatureTransformer
 from .xgboost_model import XGBoostForecaster, XGBoostModelError
@@ -27,6 +27,7 @@ __all__ = [
     "PreprocessingError",
     "RandomForestForecaster",
     "RandomForestModelError",
+    "RETAIL_MACRO_EXCLUSIONS",
     "SequencePreprocessingError",
     "SequencePreprocessor",
     "SUPPORTED_COMPONENTS",
