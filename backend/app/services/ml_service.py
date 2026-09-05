@@ -84,6 +84,7 @@ KNOWN_FORECAST_MODELS = frozenset({
     "seasonal_naive",
     "baseline",
     "arima",
+    "sarima",
     "random_forest",
     "xgboost",
     "trend_xgboost",
@@ -598,8 +599,8 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             f"Unsupported model '{model_name}'. Supported: {sorted(KNOWN_FORECAST_MODELS - {'baseline'})}"
         )
 
-    if model_name == "arima" and domain == "retail":
-        raise MLError("ARIMA model is currently supported only for the electricity domain")
+    if model_name in ("arima", "sarima") and domain == "retail":
+        raise MLError(f"{model_name.upper()} model is currently supported only for the electricity domain")
     if model_name == "trend_xgboost" and domain == "retail":
         raise MLError("Trend XGBoost model is currently supported only for the electricity domain")
 
@@ -624,6 +625,8 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     components = payload.get("components")
     hybrid_weighting = payload.get("hybrid_weighting", "inverse_rmse")
     order = tuple(payload.get("order", [1, 1, 1]))
+    seasonal_order = tuple(payload.get("seasonal_order")) if payload.get("seasonal_order") is not None else None
+    training_window = int(payload.get("training_window")) if payload.get("training_window") is not None else None
     n_estimators = int(payload.get("n_estimators", 200))
     max_depth = payload.get("max_depth")
     if max_depth is not None:
@@ -642,6 +645,8 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             components=components,
             hybrid_weighting=hybrid_weighting,
             order=order,
+            seasonal_order=seasonal_order,
+            training_window=training_window,
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
@@ -693,6 +698,8 @@ def _obtain_fitted_model_for_inference(
     model_name: str,
     features_dir: Path,
     order: tuple[int, int, int],
+    seasonal_order: tuple[int, int, int, int] | None = None,
+    training_window: int | None = None,
     n_estimators: int,
     max_depth: int | None,
     learning_rate: float,
@@ -713,6 +720,8 @@ def _obtain_fitted_model_for_inference(
         model_key=model_name,
         domain=domain,
         order=order,
+        seasonal_order=seasonal_order,
+        training_window=training_window,
         n_estimators=n_estimators,
         max_depth=max_depth,
         learning_rate=learning_rate,
@@ -886,6 +895,8 @@ def _obtain_fitted_model_for_inference(
             val_df=val_df,
             test_df=test_df,
             order=order,
+            seasonal_order=seasonal_order,
+            training_window=training_window,
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
@@ -939,6 +950,13 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     if not domain or domain not in DOMAIN_TARGET_MAP:
         raise MLError(f"Invalid or missing domain '{domain}'. Supported: {list(DOMAIN_TARGET_MAP.keys())}")
 
+    if "horizon" not in payload:
+        raise MLError("Missing required parameter 'horizon'")
+    try:
+        horizon = validate_horizon(payload.get("horizon"), domain=domain)
+    except FutureForecastError as err:
+        raise MLError(str(err), code=400) from err
+
     raw_model = payload.get("model")
     if raw_model is None or str(raw_model).strip() == "" or str(raw_model).strip().lower() in ("auto_select", "best", "auto"):
         model_name = "auto_select"
@@ -952,29 +970,24 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     if model_name == "auto_select":
         comp_res = compare_service(payload)
         ranking = comp_res.get("ranking", [])
-        eligible = [r["model"] for r in ranking if is_future_forecast_supported(domain, r["model"])]
+        eligible = [r["model"] for r in ranking if is_future_forecast_supported(domain, r["model"], horizon=horizon)]
         if not eligible:
             raise MLError(
-                f"None of the requested candidate models support future forecasting for domain '{domain}'",
+                f"None of the requested candidate models support future forecasting for domain '{domain}' at horizon {horizon}",
                 code=400,
             )
         model_name = eligible[0]
         selection_reason = "Best validation performance"
     else:
-        if not is_future_forecast_supported(domain, model_name):
-            raise MLError(future_support_error(domain, model_name), code=400)
+        if not is_future_forecast_supported(domain, model_name, horizon=horizon):
+            raise MLError(future_support_error(domain, model_name, horizon=horizon), code=400)
         selection_reason = f"Evaluated specified model '{model_name.replace('_', ' ').title()}'"
 
     features_dir, dataset_ctx = resolve_dynamic_features_and_context(payload)
 
-    if "horizon" not in payload:
-        raise MLError("Missing required parameter 'horizon'")
-    try:
-        horizon = validate_horizon(payload.get("horizon"), domain=domain)
-    except FutureForecastError as err:
-        raise MLError(str(err), code=400) from err
-
     order = tuple(payload.get("order", [1, 1, 1]))
+    seasonal_order = tuple(payload.get("seasonal_order")) if payload.get("seasonal_order") is not None else None
+    training_window = int(payload.get("training_window")) if payload.get("training_window") is not None else None
     n_estimators = int(payload.get("n_estimators", 200))
     max_depth = payload.get("max_depth")
     if max_depth is not None:
@@ -990,6 +1003,8 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             model_name=model_name,
             features_dir=features_dir,
             order=order,
+            seasonal_order=seasonal_order,
+            training_window=training_window,
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
@@ -1082,9 +1097,9 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
                 raise MLError(f"Unsupported comparison model '{name}'")
             candidate_models.append(name)
 
-    # Reject ARIMA and trend_xgboost for retail domain
-    if domain == "retail" and "arima" in candidate_models:
-        raise MLError("ARIMA model is not supported for retail domain comparison")
+    # Reject ARIMA, SARIMA, and trend_xgboost for retail domain
+    if domain == "retail" and ("arima" in candidate_models or "sarima" in candidate_models):
+        raise MLError("ARIMA/SARIMA models are not supported for retail domain comparison")
     if domain == "retail" and "trend_xgboost" in candidate_models:
         raise MLError("Trend XGBoost model is not supported for retail domain comparison")
 

@@ -23,8 +23,15 @@ class ARIMAForecaster:
     4. Configurable (p, d, q) order tuple defaulting to (1, 1, 1).
     """
 
-    def __init__(self, order: tuple[int, int, int] = (1, 1, 1)) -> None:
+    def __init__(
+        self,
+        order: tuple[int, int, int] = (1, 1, 1),
+        seasonal_order: tuple[int, int, int, int] | None = None,
+        training_window: int | None = None,
+    ) -> None:
         self.order = self._validate_order(order)
+        self.seasonal_order = self._validate_seasonal_order(seasonal_order) if seasonal_order is not None else None
+        self.training_window = self._validate_training_window(training_window) if training_window is not None else None
         self._fitted_model: ARIMAResults | None = None
         self._last_train_target: pd.Series | None = None
 
@@ -40,8 +47,29 @@ class ARIMAForecaster:
 
         return int(p), int(d), int(q)
 
+    @staticmethod
+    def _validate_seasonal_order(seasonal_order: Any) -> tuple[int, int, int, int]:
+        if not isinstance(seasonal_order, (tuple, list)) or len(seasonal_order) != 4:
+            raise ARIMAModelError("SARIMA seasonal_order must be a 4-element tuple (P, D, Q, s)")
+
+        P, D, Q, s = seasonal_order
+        for val, name in zip((P, D, Q, s), ("P", "D", "Q", "s")):
+            if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+                raise ARIMAModelError(f"SARIMA parameter '{name}' must be a non-negative integer")
+
+        if s <= 0:
+            raise ARIMAModelError("SARIMA seasonal period s must be a positive integer >= 1")
+
+        return int(P), int(D), int(Q), int(s)
+
+    @staticmethod
+    def _validate_training_window(training_window: Any) -> int:
+        if not isinstance(training_window, int) or isinstance(training_window, bool) or training_window <= 0:
+            raise ARIMAModelError("training_window must be a positive integer")
+        return int(training_window)
+
     def fit(self, train_df: pd.DataFrame | pd.Series, target_column: str = "demand_mw") -> ARIMAForecaster:
-        """Fit ARIMA model parameters strictly on training target values."""
+        """Fit ARIMA/SARIMA model parameters strictly on training target values."""
         if train_df is None or len(train_df) == 0:
             raise ARIMAModelError("Training data is empty")
 
@@ -61,15 +89,20 @@ class ARIMAForecaster:
         if clean_series.isna().any():
             raise ARIMAModelError("Training target series contains NaN values")
 
+        if self.training_window is not None and len(clean_series) > self.training_window:
+            clean_series = clean_series.iloc[-self.training_window:].reset_index(drop=True)
+
         self._last_train_target = clean_series
 
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                model = ARIMA(clean_series, order=self.order)
+                s_order = self.seasonal_order if self.seasonal_order is not None else (0, 0, 0, 0)
+                model = ARIMA(clean_series, order=self.order, seasonal_order=s_order)
                 self._fitted_model = model.fit()
         except Exception as err:
-            raise ARIMAModelError(f"Failed to fit ARIMA model with order {self.order}: {err}") from err
+            s_str = f" and seasonal_order {self.seasonal_order}" if self.seasonal_order is not None else ""
+            raise ARIMAModelError(f"Failed to fit ARIMA model with order {self.order}{s_str}: {err}") from err
 
         return self
 
@@ -111,9 +144,10 @@ class ARIMAForecaster:
             elif isinstance(history, pd.Series):
                 ref_history = history.astype(float).reset_index(drop=True)
 
-        if not dynamic and eval_series is not None and ref_history is not None and not ref_history.empty:
             try:
                 hist_clean = ref_history.astype(float).reset_index(drop=True)
+                if self.training_window is not None and len(hist_clean) > self.training_window:
+                    hist_clean = hist_clean.iloc[-self.training_window:].reset_index(drop=True)
                 eval_clean = eval_series.astype(float).reset_index(drop=True)
                 combined = pd.concat([hist_clean, eval_clean], ignore_index=True)
                 with warnings.catch_warnings():

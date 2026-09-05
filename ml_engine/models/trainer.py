@@ -98,6 +98,8 @@ def _train_and_predict_single_model(
     val_df: pd.DataFrame,
     test_df: pd.DataFrame,
     order: tuple[int, int, int] = (1, 1, 1),
+    seasonal_order: tuple[int, int, int, int] | None = None,
+    training_window: int | None = None,
     seasonal_period: int | None = None,
     n_estimators: int = 200,
     max_depth: int | None = None,
@@ -129,11 +131,24 @@ def _train_and_predict_single_model(
     epochs_trained: int | None = None
     model: Any = None
 
-    if model_key == "arima":
+    if model_key in ("arima", "sarima"):
         if domain == "retail":
-            raise TrainerError("ARIMA model is currently supported only for the electricity domain")
-        configuration["order"] = list(order)
-        arima_model = ARIMAForecaster(order=order)
+            raise TrainerError(f"{model_key.upper()} model is currently supported only for the electricity domain")
+        effective_order = (0, 1, 1) if (model_key == "sarima" and order == (1, 1, 1) and seasonal_order is None) else order
+        effective_seasonal = (0, 1, 1, 24) if (model_key == "sarima" and seasonal_order is None) else seasonal_order
+        effective_window = 8760 if (model_key == "sarima" and training_window is None) else training_window
+
+        configuration["order"] = list(effective_order)
+        if effective_seasonal is not None:
+            configuration["seasonal_order"] = list(effective_seasonal)
+        if effective_window is not None:
+            configuration["training_window"] = int(effective_window)
+
+        arima_model = ARIMAForecaster(
+            order=effective_order,
+            seasonal_order=effective_seasonal,
+            training_window=effective_window,
+        )
         arima_model.fit(train_df, target_column=target_column)
         model = arima_model
 
@@ -321,6 +336,8 @@ def run_training_pipeline(
     features_dir: Path | str,
     model_name: str,
     order: tuple[int, int, int] = (1, 1, 1),
+    seasonal_order: tuple[int, int, int, int] | None = None,
+    training_window: int | None = None,
     seasonal_period: int | None = None,
     n_estimators: int = 200,
     max_depth: int | None = None,
@@ -357,8 +374,8 @@ def run_training_pipeline(
     model_key = model_name.lower().strip()
     if model_key == "baseline":
         model_key = "naive"
-    if model_key == "trend_xgboost" and domain == "retail":
-        raise TrainerError("Model 'trend_xgboost' is only supported for the electricity domain")
+    if model_key in ("trend_xgboost", "sarima") and domain == "retail":
+        raise TrainerError(f"Model '{model_key}' is only supported for the electricity domain")
 
     train_path = features_dir / "train.parquet"
     val_path = features_dir / "validation.parquet"
@@ -389,6 +406,8 @@ def run_training_pipeline(
         model_key=model_key,
         domain=domain,
         order=order,
+        seasonal_order=seasonal_order,
+        training_window=training_window,
         seasonal_period=seasonal_period,
         n_estimators=n_estimators,
         max_depth=max_depth,
@@ -471,6 +490,8 @@ def run_training_pipeline(
                 model_key=comp,
                 domain=domain,
                 order=order,
+                seasonal_order=seasonal_order,
+                training_window=training_window,
                 seasonal_period=seasonal_period,
                 n_estimators=n_estimators,
                 max_depth=max_depth,
@@ -521,6 +542,8 @@ def run_training_pipeline(
                     val_df=val_df,
                     test_df=test_df,
                     order=order,
+                    seasonal_order=seasonal_order,
+                    training_window=training_window,
                     seasonal_period=seasonal_period,
                     n_estimators=n_estimators,
                     max_depth=max_depth,
@@ -691,6 +714,8 @@ def run_training_pipeline(
         val_df=val_df,
         test_df=test_df,
         order=order,
+        seasonal_order=seasonal_order,
+        training_window=training_window,
         seasonal_period=seasonal_period,
         n_estimators=n_estimators,
         max_depth=max_depth,
@@ -1018,6 +1043,8 @@ def expected_configuration_for_request(
     model_key: str,
     domain: str,
     order: tuple[int, int, int] = (1, 1, 1),
+    seasonal_order: tuple[int, int, int, int] | None = None,
+    training_window: int | None = None,
     seasonal_period: int | None = None,
     n_estimators: int = 200,
     max_depth: int | None = None,
@@ -1050,8 +1077,19 @@ def expected_configuration_for_request(
             "weighting": hybrid_weighting,
         }
 
-    if model_key == "arima":
-        return {"order": list(order)}
+    if model_key in ("arima", "sarima"):
+        if model_key == "sarima" and domain == "retail":
+            raise TrainerError("Model 'sarima' is only supported for the electricity domain")
+        effective_order = (0, 1, 1) if (model_key == "sarima" and order == (1, 1, 1) and seasonal_order is None) else order
+        effective_seasonal = (0, 1, 1, 24) if (model_key == "sarima" and seasonal_order is None) else seasonal_order
+        effective_window = 8760 if (model_key == "sarima" and training_window is None) else training_window
+
+        cfg: dict[str, Any] = {"order": list(effective_order)}
+        if effective_seasonal is not None:
+            cfg["seasonal_order"] = list(effective_seasonal)
+        if effective_window is not None:
+            cfg["training_window"] = int(effective_window)
+        return cfg
     if model_key == "naive":
         return {"seasonal_period": 1}
     if model_key == "seasonal_naive":
@@ -1128,12 +1166,14 @@ def main() -> None:
     parser.add_argument("--features-dir", type=Path, required=True, help="Path to Phase 5C feature directory containing train/validation/test parquets")
     parser.add_argument(
         "--model",
-        choices=("naive", "seasonal_naive", "arima", "baseline", "random_forest", "xgboost", "trend_xgboost", "lstm", "cnn_lstm", "hybrid"),
+        choices=("naive", "seasonal_naive", "arima", "sarima", "baseline", "random_forest", "xgboost", "trend_xgboost", "lstm", "cnn_lstm", "hybrid"),
         default="naive",
         help="Model family to train",
     )
     parser.add_argument("--trend-mode", choices=("linear", None), default=None, help="Trend detrending mode for electricity XGBoost (default: None)")
     parser.add_argument("--order", type=int, nargs=3, default=[1, 1, 1], metavar=("P", "D", "Q"), help="ARIMA order (p d q), default: 1 1 1")
+    parser.add_argument("--seasonal-order", type=int, nargs=4, default=None, metavar=("P", "D", "Q", "S"), help="SARIMA seasonal order (P D Q s), default: None")
+    parser.add_argument("--training-window", type=int, default=None, help="Training window size for ARIMA/SARIMA (default: None, 8760 for sarima)")
     parser.add_argument("--seasonal-period", type=int, default=None, help="Seasonal period for seasonal naive model")
     parser.add_argument("--n-estimators", type=int, default=200, help="Number of trees for Random Forest / XGBoost")
     parser.add_argument("--max-depth", type=int, default=None, help="Maximum tree depth for Random Forest / XGBoost")
@@ -1159,6 +1199,8 @@ def main() -> None:
         features_dir=args.features_dir,
         model_name=args.model,
         order=tuple(args.order),
+        seasonal_order=tuple(args.seasonal_order) if args.seasonal_order is not None else None,
+        training_window=args.training_window,
         seasonal_period=args.seasonal_period,
         n_estimators=args.n_estimators,
         max_depth=args.max_depth,

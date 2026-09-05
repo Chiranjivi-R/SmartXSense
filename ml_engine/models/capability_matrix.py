@@ -54,6 +54,15 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "notes": "ARIMA is electricity-only for test and future forecasting.",
     },
     {
+        "key": "sarima",
+        "name": "SARIMA",
+        "model_type": "statistical",
+        "domains": ["electricity"],
+        "test_forecast": True,
+        "compare_default": False,
+        "notes": "SARIMA(0,1,1)(0,1,1,24) with 8760h training window; future forecasting supported up to horizon <= 168h.",
+    },
+    {
         "key": "random_forest",
         "name": "Random Forest",
         "model_type": "tabular_ensemble",

@@ -26,6 +26,7 @@ LOCF is intentional, tested, and disclosed in API metadata under
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
@@ -89,7 +90,11 @@ DETERMINISTIC_CALENDAR_FEATURES = {
 # Explicit capability matrix: only models listed here are enabled.
 FUTURE_SUPPORTED_MODELS: dict[str, frozenset[str]] = {
     "retail": frozenset({"random_forest", "xgboost"}),
-    "electricity": frozenset({"random_forest", "xgboost", "trend_xgboost", "arima", "hybrid"}),
+    "electricity": frozenset({"random_forest", "xgboost", "trend_xgboost", "arima", "sarima", "hybrid"}),
+}
+
+MODEL_MAX_HORIZON: dict[str, int] = {
+    "sarima": 168,
 }
 
 UNSUPPORTED_FUTURE_REASONS: dict[str, str] = {
@@ -120,16 +125,27 @@ UNSUPPORTED_FUTURE_REASONS: dict[str, str] = {
 }
 
 
-def is_future_forecast_supported(domain: str, model_key: str) -> bool:
+def is_future_forecast_supported(domain: str, model_key: str, *, horizon: int | None = None) -> bool:
     domain = domain.lower().strip()
     model_key = model_key.lower().strip()
-    return model_key in FUTURE_SUPPORTED_MODELS.get(domain, frozenset())
+    base_supported = model_key in FUTURE_SUPPORTED_MODELS.get(domain, frozenset())
+    if not base_supported:
+        return False
+    if horizon is not None and model_key in MODEL_MAX_HORIZON:
+        if horizon > MODEL_MAX_HORIZON[model_key]:
+            return False
+    return True
 
 
-def future_support_error(domain: str, model_key: str) -> str:
+def future_support_error(domain: str, model_key: str, *, horizon: int | None = None) -> str:
     domain = domain.lower().strip()
     model_key = model_key.lower().strip()
-    if model_key in ("arima", "trend_xgboost") and domain == "retail":
+    if horizon is not None and model_key in MODEL_MAX_HORIZON and horizon > MODEL_MAX_HORIZON[model_key]:
+        return (
+            f"Future forecasting for model '{model_key}' is restricted to horizon <= {MODEL_MAX_HORIZON[model_key]} "
+            f"(requested {horizon}). For longer horizons, use 'trend_xgboost' or Auto Select."
+        )
+    if model_key in ("arima", "sarima", "trend_xgboost") and domain == "retail":
         return f"Future forecasting is not currently supported for model {model_key} on the retail domain."
     if model_key == "hybrid" and domain == "retail":
         return "Future forecasting is not currently supported for model hybrid on the retail domain."
@@ -585,7 +601,11 @@ def arima_future_forecast(
     domain: str = "electricity",
 ) -> list[dict[str, Any]]:
     """Multi-step ARIMA forecast from the end of the full historical target series."""
-    import warnings
+    if getattr(model, "seasonal_order", None) is not None and horizon > 168:
+        raise FutureForecastError(
+            f"SARIMA future forecasting is restricted to horizon <= 168 (requested {horizon}). "
+            f"For longer horizons, use 'trend_xgboost' or Auto Select."
+        )
 
     if model._fitted_model is None:
         raise FutureForecastError("ARIMA model must be fitted before future forecasting")
@@ -604,6 +624,10 @@ def arima_future_forecast(
         raise FutureForecastError("Future timestamp must be strictly after the last historical timestamp")
 
     history_target = history_df[target_column].astype(float).reset_index(drop=True)
+    if getattr(model, "training_window", None) is not None:
+        window = int(model.training_window)
+        if len(history_target) > window:
+            history_target = history_target.iloc[-window:].reset_index(drop=True)
     if history_target.isna().any():
         raise FutureForecastError("Historical target series contains NaN values")
 
@@ -657,7 +681,7 @@ def hybrid_future_forecast(
     component_future_preds: dict[str, list[dict[str, Any]]] = {}
     for comp in model.components:
         comp_model = model.component_models[comp]
-        if comp == "arima":
+        if comp in ("arima", "sarima"):
             preds = arima_future_forecast(
                 model=comp_model,
                 history_df=history_df,
@@ -716,14 +740,14 @@ def generate_future_forecast(
     model_key = model_key.lower().strip()
     horizon = validate_horizon(horizon, domain=domain)
 
-    if not is_future_forecast_supported(domain, model_key):
-        raise FutureForecastError(future_support_error(domain, model_key))
+    if not is_future_forecast_supported(domain, model_key, horizon=horizon):
+        raise FutureForecastError(future_support_error(domain, model_key, horizon=horizon))
 
     target_column = DOMAIN_TARGET_MAP[domain]
     history_df = load_chronological_history(features_dir, target_column)
     last_historical_timestamp = pd.Timestamp(history_df["timestamp"].iloc[-1]).isoformat()
 
-    if model_key == "arima":
+    if model_key in ("arima", "sarima"):
         predictions = arima_future_forecast(
             model=model,
             history_df=history_df,

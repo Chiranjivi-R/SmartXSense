@@ -29,6 +29,7 @@ SUPPORTED_COMPONENTS = (
     "naive",
     "seasonal_naive",
     "arima",
+    "sarima",
     "random_forest",
     "xgboost",
     "trend_xgboost",
@@ -71,7 +72,7 @@ def generate_hybrid_candidates(
             continue
         if m_clean not in SUPPORTED_COMPONENTS:
             continue
-        if m_clean == "arima" and domain_clean == "retail":
+        if m_clean in ("arima", "sarima") and domain_clean == "retail":
             continue
         if future_forecast_only and not is_future_forecast_supported(domain_clean, m_clean):
             continue
@@ -146,8 +147,8 @@ class HybridForecaster:
                     f"Unsupported component model '{comp}'. "
                     f"Supported components: {list(SUPPORTED_COMPONENTS)}"
                 )
-            if comp_clean == "arima" and domain_clean == "retail":
-                raise HybridModelError("ARIMA model is not supported for the 'retail' domain.")
+            if comp_clean in ("arima", "sarima") and domain_clean == "retail":
+                raise HybridModelError(f"{comp_clean.upper()} model is not supported for the 'retail' domain.")
 
             if comp_clean not in normalized:
                 normalized.append(comp_clean)

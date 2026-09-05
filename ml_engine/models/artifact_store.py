@@ -28,6 +28,7 @@ PERSISTENCE_SUPPORTED_MODELS = frozenset({
     "naive",
     "seasonal_naive",
     "arima",
+    "sarima",
     "random_forest",
     "xgboost",
     "trend_xgboost",
@@ -670,7 +671,7 @@ def predict_with_fitted_model(
             "test_predictions": test_predictions,
         }
 
-    if model_key == "arima":
+    if model_key in ("arima", "sarima"):
         val_pred = model.predict(val_df, target_column=target_column, history=train_df[target_column])
         combined = pd.concat([train_df[target_column], val_df[target_column]], ignore_index=True)
         test_pred = model.predict(test_df, target_column=target_column, history=combined)
