@@ -18,13 +18,21 @@ from ml_engine.models.trainer import DOMAIN_TARGET_MAP
 
 SUPPORTED_DOMAINS = sorted(DOMAIN_TARGET_MAP.keys())
 
-# Models included in default Compare / Auto Select candidate lists.
+from ml_engine.models.applicability import (
+    DatasetProfile,
+    ModelApplicabilityResult,
+    assess_future_capability,
+    assess_model_applicability,
+    profile_dataset_for_applicability,
+)
+
+# Models included in default Compare / Auto Select candidate lists (filtered dynamically by applicability).
 DEFAULT_COMPARE_MODELS: dict[str, list[str]] = {
-    "electricity": ["arima", "random_forest", "xgboost", "trend_xgboost", "lstm", "hybrid"],
-    "retail": ["naive", "random_forest", "xgboost", "lstm", "hybrid"],
+    "electricity": ["arima", "sarima", "random_forest", "xgboost", "trend_xgboost", "lstm", "hybrid"],
+    "retail": ["arima", "sarima", "random_forest", "xgboost", "lstm", "hybrid"],
 }
 
-# Base catalog entries (domains + type). Runtime flags are derived.
+# Base catalog entries. Dynamic dataset applicability determines runtime eligibility.
 _MODEL_BASE: list[dict[str, Any]] = [
     {
         "key": "naive",
@@ -42,25 +50,25 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "domains": ["retail", "electricity"],
         "test_forecast": True,
         "compare_default": False,
-        "notes": "Seasonal baseline; not used for future forecasting.",
+        "notes": "Seasonal baseline; requires history longer than seasonal cycle.",
     },
     {
         "key": "arima",
         "name": "ARIMA",
         "model_type": "statistical",
-        "domains": ["electricity"],
+        "domains": ["retail", "electricity"],
         "test_forecast": True,
         "compare_default": True,
-        "notes": "ARIMA is electricity-only for test and future forecasting.",
+        "notes": "Autoregressive integrated moving average; requires a coherent univariate series with regular temporal spacing.",
     },
     {
         "key": "sarima",
         "name": "SARIMA",
         "model_type": "statistical",
-        "domains": ["electricity"],
+        "domains": ["retail", "electricity"],
         "test_forecast": True,
-        "compare_default": False,
-        "notes": "SARIMA(0,1,1)(0,1,1,24) with 8760h training window; future forecasting supported up to horizon <= 168h.",
+        "compare_default": True,
+        "notes": "Seasonal ARIMA; requires coherent univariate series and sufficient seasonal cycles; future forecasting supported up to horizon <= 168h.",
     },
     {
         "key": "random_forest",
@@ -69,7 +77,7 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "domains": ["retail", "electricity"],
         "test_forecast": True,
         "compare_default": True,
-        "notes": None,
+        "notes": "Tabular tree ensemble; robust across tabular feature panels.",
     },
     {
         "key": "xgboost",
@@ -78,7 +86,7 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "domains": ["retail", "electricity"],
         "test_forecast": True,
         "compare_default": True,
-        "notes": None,
+        "notes": "Gradient boosted decision trees; robust across tabular feature panels.",
     },
     {
         "key": "trend_xgboost",
@@ -87,7 +95,7 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "domains": ["electricity"],
         "test_forecast": True,
         "compare_default": True,
-        "notes": "Piecewise linear trend XGBoost with conservative spike weighting and stationary AR(1, 24, 168) residual error dynamics for electricity demand.",
+        "notes": "Piecewise linear trend XGBoost with causal trend detrending and canonical hourly lag architecture.",
     },
     {
         "key": "lstm",
@@ -96,7 +104,7 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "domains": ["retail", "electricity"],
         "test_forecast": True,
         "compare_default": True,
-        "notes": "Supported for held-out test evaluation.",
+        "notes": "Supported for held-out test evaluation with sufficient sequence history.",
     },
     {
         "key": "cnn_lstm",
@@ -105,7 +113,7 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "domains": ["retail", "electricity"],
         "test_forecast": True,
         "compare_default": False,
-        "notes": "Supported for held-out test evaluation; future forecasting is not enabled.",
+        "notes": "Supported for held-out test evaluation; future forecasting is not enabled in Phase B.",
     },
     {
         "key": "hybrid",
@@ -115,8 +123,8 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "test_forecast": True,
         "compare_default": True,
         "notes": (
-            "Hybrid supports validation-weighted test evaluation. "
-            "Future forecasting is supported for electricity via future-capable components (ARIMA, RF, XGBoost)."
+            "Hybrid supports validation-weighted test evaluation across at least two eligible component models. "
+            "Future forecasting supported via future-capable components."
         ),
     },
 ]

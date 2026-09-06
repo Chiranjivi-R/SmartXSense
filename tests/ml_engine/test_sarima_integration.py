@@ -105,15 +105,20 @@ def test_sarima_parameter_validation() -> None:
 
 
 def test_sarima_domain_safety_rejection() -> None:
-    """Verify SARIMA is strictly rejected for the retail domain across all entrypoints."""
-    with pytest.raises(TrainerError, match="Model 'sarima' is only supported for the electricity domain"):
-        expected_configuration_for_request(model_key="sarima", domain="retail")
+    """Verify SARIMA applicability is dataset-driven rather than hard-coded domain."""
+    from ml_engine.models.applicability import assess_model_applicability
+    # An interleaved panel retail dataframe
+    ts = pd.date_range("2025-01-01", periods=60, freq="D")
+    df_panel = pd.DataFrame({"timestamp": ts, "sales": np.random.uniform(10, 50, 60), "product_id": ["A", "B"] * 30})
+    app_panel = assess_model_applicability(df_panel, domain="retail", target_column="sales")
+    assert not app_panel["models"]["sarima"]["eligible"]
+    assert app_panel["models"]["sarima"]["reason_code"] == "INTERLEAVED_PANEL"
 
-    with pytest.raises(HybridModelError, match="SARIMA model is not supported for the 'retail' domain"):
-        HybridForecaster.validate_components(["random_forest", "sarima"], domain="retail")
-
-    assert not is_future_forecast_supported("retail", "sarima")
-    assert "retail domain" in future_support_error("retail", "sarima")
+    # A too-short retail series lacking seasonal history
+    df_short = pd.DataFrame({"timestamp": ts[:30], "sales": np.random.uniform(10, 50, 30)})
+    app_short = assess_model_applicability(df_short, domain="retail", target_column="sales")
+    assert not app_short["models"]["sarima"]["eligible"]
+    assert app_short["models"]["sarima"]["reason_code"] == "INSUFFICIENT_SEASONAL_HISTORY"
 
 
 def test_sarima_horizon_aware_capability() -> None:
@@ -263,12 +268,12 @@ def test_sarima_capability_matrix_registration() -> None:
     assert entry["name"] == "SARIMA"
     assert entry["model_type"] == "statistical"
     assert entry["electricity"] is True
-    assert entry["retail"] is False
+    assert entry["retail"] is True
     assert entry["test_forecast"] is True
     assert entry["future_forecast_supported"] is True
-    assert entry["future_forecast_domains"] == ["electricity"]
+    assert "electricity" in entry["future_forecast_domains"]
     assert entry["persistence_supported"] is True
-    assert entry["compare_default"] is False
+    assert entry["compare_default"] is True
     assert entry["explainability_supported"] is False  # statistical fallback, like ARIMA
 
 

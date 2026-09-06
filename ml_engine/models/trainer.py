@@ -135,8 +135,10 @@ def _train_and_predict_single_model(
     model: Any = None
 
     if model_key in ("arima", "sarima"):
-        if domain == "retail":
-            raise TrainerError(f"{model_key.upper()} model is currently supported only for the electricity domain")
+        from ml_engine.models.applicability import assess_model_applicability
+        app_res = assess_model_applicability(train_df, target_column=target_column, domain=domain)["models"].get(model_key)
+        if app_res and not app_res["eligible"]:
+            raise TrainerError(f"Model '{model_key}' is not applicable: [{app_res['reason_code']}] {app_res['reason']}")
         effective_order = (0, 1, 1) if (model_key == "sarima" and order == (1, 1, 1) and seasonal_order is None) else order
         effective_seasonal = (0, 1, 1, 24) if (model_key == "sarima" and seasonal_order is None) else seasonal_order
         effective_window = 8760 if (model_key == "sarima" and training_window is None) else training_window
@@ -205,6 +207,10 @@ def _train_and_predict_single_model(
         if model_key == "trend_xgboost" and domain == "retail":
             raise TrainerError("Model 'trend_xgboost' is only supported for the electricity domain")
         if model_key == "trend_xgboost":
+            from ml_engine.models.applicability import assess_model_applicability
+            app_res = assess_model_applicability(train_df, target_column=target_column, domain=domain)["models"].get("trend_xgboost")
+            if app_res and not app_res["eligible"]:
+                raise TrainerError(f"Model 'trend_xgboost' is not applicable: [{app_res['reason_code']}] {app_res['reason']}")
             resolved_trend_mode = trend_mode if trend_mode in ("linear", "piecewise_linear") else "piecewise_linear"
         elif trend_mode in ("linear", "piecewise_linear"):
             resolved_trend_mode = trend_mode
@@ -217,8 +223,11 @@ def _train_and_predict_single_model(
         # Residual AR resolution: backward-compatible default is False
         resolved_residual_ar = bool(residual_ar) if residual_ar is not None else False
 
-        if resolved_residual_ar and domain == "retail":
-            raise TrainerError("residual_ar is only supported for the electricity domain")
+        if resolved_residual_ar:
+            from ml_engine.models.applicability import profile_dataset_for_applicability
+            p = profile_dataset_for_applicability(train_df, target_column=target_column, domain=domain)
+            if not p.has_hourly_lag_structure:
+                raise TrainerError("residual_ar requires canonical hourly lag structure (lag_1, lag_24, lag_168)")
 
         resolved_knot_hour = (
             float(trend_knot_hour)
@@ -414,11 +423,10 @@ def run_training_pipeline(
     model_key = model_name.lower().strip()
     if model_key == "baseline":
         model_key = "naive"
-    if model_key in ("trend_xgboost", "sarima") and domain == "retail":
-        raise TrainerError(f"Model '{model_key}' is only supported for the electricity domain")
-    if residual_ar and domain == "retail":
-        raise TrainerError("residual_ar is only supported for the electricity domain")
-
+    if model_key == "trend_xgboost" and domain == "retail":
+        raise TrainerError("Model 'trend_xgboost' is only supported for the electricity domain")
+    if trend_mode in ("linear", "piecewise_linear") and domain == "retail":
+        raise TrainerError(f"trend_mode='{trend_mode}' is only supported for the electricity domain")
     train_path = features_dir / "train.parquet"
     val_path = features_dir / "validation.parquet"
     test_path = features_dir / "test.parquet"
@@ -436,6 +444,18 @@ def run_training_pipeline(
             raise TrainerError(f"Target column '{target_column}' missing from {name} split")
         if "timestamp" not in df.columns:
             raise TrainerError(f"Timestamp column 'timestamp' missing from {name} split")
+
+    from ml_engine.models.applicability import assess_model_applicability, profile_dataset_for_applicability
+    applicability_report = assess_model_applicability(train_df, target_column=target_column, domain=domain)
+    model_app = applicability_report["models"].get(model_key)
+    if model_app and not model_app["eligible"]:
+        raise TrainerError(
+            f"Model '{model_key}' is not applicable: [{model_app['reason_code']}] {model_app['reason']}"
+        )
+    if residual_ar:
+        p = profile_dataset_for_applicability(train_df, target_column=target_column, domain=domain)
+        if not p.has_hourly_lag_structure:
+            raise TrainerError("residual_ar requires canonical hourly lag structure (lag_1, lag_24, lag_168)")
 
     model_key = model_name.lower().strip()
     if model_key == "baseline":
@@ -1135,8 +1155,6 @@ def expected_configuration_for_request(
         }
 
     if model_key in ("arima", "sarima"):
-        if model_key == "sarima" and domain == "retail":
-            raise TrainerError("Model 'sarima' is only supported for the electricity domain")
         effective_order = (0, 1, 1) if (model_key == "sarima" and order == (1, 1, 1) and seasonal_order is None) else order
         effective_seasonal = (0, 1, 1, 24) if (model_key == "sarima" and seasonal_order is None) else seasonal_order
         effective_window = 8760 if (model_key == "sarima" and training_window is None) else training_window
@@ -1179,9 +1197,6 @@ def expected_configuration_for_request(
 
         # Residual AR resolution: backward-compatible default is False
         resolved_residual_ar = bool(residual_ar) if residual_ar is not None else False
-
-        if resolved_residual_ar and domain == "retail":
-            raise TrainerError("residual_ar is only supported for the electricity domain")
 
         resolved_knot_hour = (
             float(trend_knot_hour)

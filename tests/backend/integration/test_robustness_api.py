@@ -283,6 +283,20 @@ def test_future_rejects_invalid_horizon_and_unsupported_combo(tmp_path, mock_fea
             )
             assert response.status_code == 400, f"horizon={bad_horizon}"
 
+        # Inapplicable model request on fixture (lacks hourly lag architecture) must return 400
+        unsupported_trend = client.post(
+            "/api/v1/forecasting/forecast",
+            json={
+                "domain": "retail",
+                "features_dir": str(mock_features_dir),
+                "model": "trend_xgboost",
+            },
+        )
+        assert unsupported_trend.status_code == 400
+        trend_err = unsupported_trend.get_json()
+        assert "not applicable" in trend_err.get("message", "").lower()
+
+        # Exp34: clean single-series retail fixture dynamically allows ARIMA (HTTP 200)
         retail_arima = client.post(
             "/api/v1/forecasting/forecast",
             json={
@@ -291,7 +305,7 @@ def test_future_rejects_invalid_horizon_and_unsupported_combo(tmp_path, mock_fea
                 "model": "arima",
             },
         )
-        assert retail_arima.status_code == 400
+        assert retail_arima.status_code == 200
 
         unsupported_future = client.post(
             "/api/v1/forecasting/future",

@@ -15,8 +15,8 @@ export const FUTURE_HORIZON_PRESETS = {
 };
 
 export const FUTURE_SUPPORTED_MODELS = {
-  retail: ['random_forest', 'xgboost'],
-  electricity: ['random_forest', 'xgboost', 'arima'],
+  retail: ['random_forest', 'xgboost', 'hybrid'],
+  electricity: ['random_forest', 'xgboost', 'trend_xgboost', 'arima', 'sarima', 'hybrid'],
 };
 
 async function parseJsonResponse(response) {

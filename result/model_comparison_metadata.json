@@ -1,0 +1,247 @@
+{
+  "title": "Comparison of Forecasting Models on Held-Out Test Sets",
+  "generated_at_utc": "2026-09-06T19:09:54.052391+00:00",
+  "domains": {
+    "retail": {
+      "domain_name": "retail",
+      "target_variable": "sales",
+      "feature_dataset_id": "features_1c0c92ff-264e-4398-b83c-e0e082b956b4",
+      "test_period": {
+        "start": "2024-07-20 00:00:00",
+        "end": "2024-12-31 00:00:00"
+      },
+      "num_test_observations": 165,
+      "temporal_frequency": "Daily",
+      "models_plotted": [
+        "naive",
+        "seasonal_naive",
+        "random_forest",
+        "xgboost",
+        "lstm",
+        "cnn_lstm",
+        "hybrid"
+      ],
+      "models_excluded": [
+        {
+          "model": "arima",
+          "reason_code": "INTERLEAVED_PANEL",
+          "reason": "Retail dataset comprises multiple interleaved store/department panels; continuous 1D ARIMA is not mathematically applicable."
+        },
+        {
+          "model": "sarima",
+          "reason_code": "INTERLEAVED_PANEL",
+          "reason": "Seasonal ARIMA requires a single continuous time series; interleaved store/dept panel structure breaks contiguous lag/seasonal assumptions."
+        },
+        {
+          "model": "trend_xgboost",
+          "reason_code": "NO_HOURLY_LAG_STRUCTURE",
+          "reason": "Trend XGBoost and piecewise trend knots require the hourly lag structure (lag_1, lag_24, lag_168) which is exclusive to Electricity."
+        }
+      ],
+      "prediction_sources": {
+        "naive": "canonical_pipeline_evaluation",
+        "seasonal_naive": "canonical_pipeline_evaluation",
+        "random_forest": "pre_trained_artifact",
+        "xgboost": "pre_trained_artifact",
+        "lstm": "pre_trained_artifact",
+        "cnn_lstm": "pre_trained_artifact",
+        "hybrid": "canonical_pipeline_evaluation"
+      },
+      "test_metrics": {
+        "naive": {
+          "mae": 41.56363636363636,
+          "rmse": 60.32809285796119,
+          "mape": 0.8468841006209271,
+          "smape": 0.6109521631400517,
+          "wape": 0.6562051478321154,
+          "r2": -0.6777930486183821
+        },
+        "seasonal_naive": {
+          "mae": 44.67878787878788,
+          "rmse": 64.35253285495828,
+          "mape": 0.9634324637704558,
+          "smape": 0.6649429480002075,
+          "wape": 0.7053870443013057,
+          "r2": -0.9091079589805269
+        },
+        "random_forest": {
+          "mae": 13.083199042262423,
+          "rmse": 23.956407039467983,
+          "mape": 0.19102591915262188,
+          "smape": 0.20222454339861493,
+          "wape": 0.20655706075698343,
+          "r2": 0.735428801172409
+        },
+        "xgboost": {
+          "mae": 12.45704688356092,
+          "rmse": 22.26684488804086,
+          "mape": 0.18934862604529126,
+          "smape": 0.19397857142131605,
+          "wape": 0.1966713937217094,
+          "r2": 0.7714314012542055
+        },
+        "lstm": {
+          "mae": 31.367060089111327,
+          "rmse": 45.54957560744756,
+          "mape": 0.6931994911087347,
+          "smape": 0.5007378730864304,
+          "wape": 0.49522198016442603,
+          "r2": 0.04353767453025037
+        },
+        "cnn_lstm": {
+          "mae": 31.322854937929094,
+          "rmse": 46.78759781478383,
+          "mape": 0.6578285220325659,
+          "smape": 0.4995814646703424,
+          "wape": 0.49452407087870587,
+          "r2": -0.009161548135177888
+        },
+        "hybrid": {
+          "mae": 12.669271877129596,
+          "rmse": 22.998296908109328,
+          "mape": 0.18800481131395108,
+          "smape": 0.1958825320243984,
+          "wape": 0.200021994041181,
+          "r2": 0.7561680841505896
+        }
+      },
+      "timestamp_validation": {
+        "is_strictly_chronological": true,
+        "contains_future_forecasts": false,
+        "contains_validation_data": false,
+        "prediction_length_matches_test": true
+      }
+    },
+    "electricity": {
+      "domain_name": "electricity",
+      "target_variable": "demand_mw",
+      "feature_dataset_id": "features_23889e57-aa6d-4a50-930c-874f6a963a25",
+      "test_period": {
+        "start": "2024-11-10 10:00:00",
+        "end": "2026-03-31 23:00:00"
+      },
+      "num_test_observations": 12158,
+      "temporal_frequency": "Hourly",
+      "models_plotted": [
+        "naive",
+        "seasonal_naive",
+        "arima",
+        "sarima",
+        "random_forest",
+        "xgboost",
+        "trend_xgboost",
+        "lstm",
+        "cnn_lstm",
+        "hybrid"
+      ],
+      "models_excluded": [],
+      "prediction_sources": {
+        "naive": "canonical_pipeline_evaluation",
+        "seasonal_naive": "canonical_pipeline_evaluation",
+        "arima": "canonical_pipeline_evaluation",
+        "sarima": "canonical_pipeline_evaluation",
+        "random_forest": "pre_trained_artifact",
+        "xgboost": "pre_trained_artifact",
+        "trend_xgboost": "pre_trained_artifact",
+        "lstm": "pre_trained_artifact",
+        "cnn_lstm": "canonical_pipeline_evaluation",
+        "hybrid": "canonical_pipeline_evaluation"
+      },
+      "test_metrics": {
+        "naive": {
+          "mae": 5239.046385918736,
+          "rmse": 6928.741713683532,
+          "mape": 0.027932815396796644,
+          "smape": 0.02809169386667679,
+          "wape": 0.027489147656531637,
+          "r2": 0.9118654205106682
+        },
+        "seasonal_naive": {
+          "mae": 4979.387558809015,
+          "rmse": 6938.738579308706,
+          "mape": 0.026320963758819323,
+          "smape": 0.026253019651828066,
+          "wape": 0.026126724170851958,
+          "r2": 0.9116109139370381
+        },
+        "arima": {
+          "mae": 3689.781322125696,
+          "rmse": 4816.965043535158,
+          "mape": 0.019508035430634257,
+          "smape": 0.019552723298181387,
+          "wape": 0.0193601919343264,
+          "r2": 0.9574024538942434
+        },
+        "sarima": {
+          "mae": 1112.308865426652,
+          "rmse": 1585.3242424343566,
+          "mape": 0.005774898344938779,
+          "smape": 0.005774046620037571,
+          "wape": 0.00583625728597561,
+          "r2": 0.9953860403317456
+        },
+        "random_forest": {
+          "mae": 3573.1242559467023,
+          "rmse": 4998.178292512984,
+          "mape": 0.01826152654951774,
+          "smape": 0.018364836361449293,
+          "wape": 0.01874809517450552,
+          "r2": 0.9541371456453667
+        },
+        "xgboost": {
+          "mae": 4136.333999552764,
+          "rmse": 6330.943678855796,
+          "mape": 0.02044598944171221,
+          "smape": 0.02077360178439181,
+          "wape": 0.021703242860389077,
+          "r2": 0.9264175079355824
+        },
+        "trend_xgboost": {
+          "mae": 1890.4525932001256,
+          "rmse": 2552.5325208537706,
+          "mape": 0.01029506234670988,
+          "smape": 0.010289330351820824,
+          "wape": 0.009919158305569822,
+          "r2": 0.9880386510510847
+        },
+        "lstm": {
+          "mae": 3824.758525610709,
+          "rmse": 4861.406324435657,
+          "mape": 0.02001637469478635,
+          "smape": 0.019926430305597317,
+          "wape": 0.02006841400444166,
+          "r2": 0.9566128187985738
+        },
+        "cnn_lstm": {
+          "mae": 3681.401315697483,
+          "rmse": 4712.051891569288,
+          "mape": 0.019352891456678185,
+          "smape": 0.019356467969140107,
+          "wape": 0.019316222246505543,
+          "r2": 0.9592377900747803
+        },
+        "hybrid": {
+          "mae": 3094.246152835959,
+          "rmse": 4096.2669617769925,
+          "mape": 0.01619794234524487,
+          "smape": 0.01624862077285678,
+          "wape": 0.01623543353415959,
+          "r2": 0.9691955046987502
+        }
+      },
+      "timestamp_validation": {
+        "is_strictly_chronological": true,
+        "contains_future_forecasts": false,
+        "contains_validation_data": false,
+        "prediction_length_matches_test": true
+      }
+    }
+  },
+  "figure_deliverables": {
+    "png": "result/model_comparison_heldout_test.png",
+    "svg": "result/model_comparison_heldout_test.svg",
+    "pdf": "result/model_comparison_heldout_test.pdf",
+    "dpi": 300,
+    "layout": "1x2 horizontal side-by-side subplots"
+  }
+}

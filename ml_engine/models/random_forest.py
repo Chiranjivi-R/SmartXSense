@@ -112,7 +112,7 @@ class RandomForestForecaster:
         X_eval = self._transformer.transform(eval_df)
         try:
             preds = self._model.predict(X_eval)
-            if self.target_transform == "log1p":
+            if getattr(self, "target_transform", None) == "log1p":
                 preds = np.expm1(preds)
                 preds = np.clip(preds, a_min=0.0, a_max=None)
         except Exception as err:

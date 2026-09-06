@@ -961,7 +961,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               <option value="xgboost">XGBoost (Gradient Boosted Trees)</option>
               <option value="hybrid">Hybrid Ensemble (Validation-Weighted)</option>
               <option value="lstm">LSTM (PyTorch Deep Sequence)</option>
-              {domain === 'electricity' && <option value="arima">ARIMA (Time Series)</option>}
+              <option value="arima">ARIMA (Time Series)</option>
             </select>
           </div>
 
@@ -2066,7 +2066,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             >
               <option value="random_forest">Random Forest</option>
               <option value="xgboost">XGBoost</option>
-              {domain === 'electricity' && <option value="arima">ARIMA</option>}
+              <option value="arima">ARIMA</option>
               <option value="hybrid">Hybrid</option>
               <option value="lstm">LSTM</option>
             </select>
@@ -2121,7 +2121,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
 
         {!isFutureModelSupported && (
           <div style={{ background: `${COLORS.accent}15`, border: `1px solid ${COLORS.accent}44`, borderRadius: 10, padding: '10px 14px', color: COLORS.accent, fontSize: 13, marginBottom: 12 }}>
-            Future forecasting is not currently supported for model {futureModel}. Choose Random Forest or XGBoost{domain === 'electricity' ? ' (or ARIMA)' : ''}.
+            Future forecasting is not currently supported for model {futureModel}. Choose Random Forest, XGBoost, or Hybrid{domain === 'electricity' ? ' (or ARIMA / SARIMA / Trend XGBoost)' : ''}.
           </div>
         )}
 

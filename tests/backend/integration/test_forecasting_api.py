@@ -263,6 +263,18 @@ def test_invalid_domain_or_model(client, mock_features_dir):
     )
     assert res_domain.status_code == 400
 
+    # 1. Unsuitable model structure (trend_xgboost without hourly lags) must return 400
+    res_inapplicable = client.post(
+        "/api/v1/forecasting/train",
+        json={
+            "domain": "retail",
+            "features_dir": str(mock_features_dir),
+            "model": "trend_xgboost",
+        },
+    )
+    assert res_inapplicable.status_code == 400
+
+    # 2. Suitable single-series retail ARIMA is now accepted (200)
     res_arima = client.post(
         "/api/v1/forecasting/train",
         json={
@@ -271,7 +283,7 @@ def test_invalid_domain_or_model(client, mock_features_dir):
             "model": "arima",
         },
     )
-    assert res_arima.status_code == 400
+    assert res_arima.status_code == 200
 
 
 def test_invalid_json_payload(client):
@@ -711,7 +723,7 @@ def test_failed_forecast_does_not_create_history(tmp_path, mock_features_dir):
             json={
                 "domain": "retail",
                 "features_dir": str(mock_features_dir),
-                "model": "arima",
+                "model": "trend_xgboost",
             },
         )
         assert bad.status_code == 400

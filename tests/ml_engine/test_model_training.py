@@ -129,11 +129,30 @@ def test_electricity_random_forest_pipeline_raw_scale(dummy_electricity_features
     assert "test_metrics" in result
 
 
-def test_retail_arima_unsupported_error(dummy_retail_features_dir: Path) -> None:
-    with pytest.raises(TrainerError, match="supported only for the electricity domain"):
+def test_retail_arima_unsupported_error(dummy_retail_features_dir: Path, tmp_path: Path) -> None:
+    # 1. Clean univariate retail series is ELIGIBLE for ARIMA
+    res = run_training_pipeline(
+        domain="retail",
+        features_dir=dummy_retail_features_dir,
+        model_name="arima",
+    )
+    assert res["model"] == "arima"
+    assert "validation_metrics" in res
+
+    # 2. Interleaved panel retail dataset is dynamically rejected as N/A with INTERLEAVED_PANEL
+    interleaved_dir = tmp_path / "retail_interleaved"
+    interleaved_dir.mkdir(parents=True, exist_ok=True)
+    ts = pd.date_range("2025-01-01", periods=60, freq="D")
+    prods = ["prod_A", "prod_B"] * 30
+    df = pd.DataFrame({"timestamp": ts, "sales": np.random.uniform(10, 50, 60), "product_id": prods, "feature_1": 1.0})
+    df.iloc[:40].to_parquet(interleaved_dir / "train.parquet", index=False)
+    df.iloc[40:50].to_parquet(interleaved_dir / "validation.parquet", index=False)
+    df.iloc[50:].to_parquet(interleaved_dir / "test.parquet", index=False)
+
+    with pytest.raises(TrainerError, match="INTERLEAVED_PANEL"):
         run_training_pipeline(
             domain="retail",
-            features_dir=dummy_retail_features_dir,
+            features_dir=interleaved_dir,
             model_name="arima",
         )
 

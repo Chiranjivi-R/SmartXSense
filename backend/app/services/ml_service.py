@@ -599,12 +599,15 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             f"Unsupported model '{model_name}'. Supported: {sorted(KNOWN_FORECAST_MODELS - {'baseline'})}"
         )
 
-    if model_name in ("arima", "sarima") and domain == "retail":
-        raise MLError(f"{model_name.upper()} model is currently supported only for the electricity domain")
-    if model_name == "trend_xgboost" and domain == "retail":
-        raise MLError("Trend XGBoost model is currently supported only for the electricity domain")
-
     features_dir, dataset_ctx = resolve_dynamic_features_and_context(payload)
+    from ml_engine.models.applicability import assess_model_applicability
+    applicability_report = assess_model_applicability(features_dir, domain=domain)
+    app = applicability_report["models"].get(model_name)
+    if app and not app["eligible"]:
+        raise MLError(
+            f"Model '{model_name}' is not applicable to this dataset: [{app['reason_code']}] {app['reason']}",
+            code=400,
+        )
     selection_method = payload.get("selection_method")
     if selection_method is not None:
         selection_method = str(selection_method).strip() or None
@@ -634,6 +637,15 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     learning_rate = float(payload.get("learning_rate", 0.05))
     force_retrain = bool(payload.get("force_retrain", False))
 
+    residual_ar = payload.get("residual_ar")
+    if model_name == "trend_xgboost" and residual_ar is None and "comp_res" in locals():
+        if comp_res.get("configurations") and "trend_xgboost" in comp_res["configurations"]:
+            residual_ar = comp_res["configurations"]["trend_xgboost"].get("residual_ar")
+        if residual_ar is None:
+            for r_item in comp_res.get("ranking", []):
+                if r_item.get("model") == "trend_xgboost":
+                    residual_ar = r_item.get("configuration", {}).get("residual_ar")
+
     artifacts_root = _resolve_artifacts_root()
 
     start_time = time.perf_counter()
@@ -650,6 +662,7 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
+            residual_ar=residual_ar,
             prediction_limit=prediction_limit,
             save_artifact=is_persistence_supported(model_name),
             force_retrain=force_retrain,
@@ -705,13 +718,19 @@ def _obtain_fitted_model_for_inference(
     learning_rate: float,
     components: list[str] | None = None,
     hybrid_weighting: str = "inverse_rmse",
+    residual_ar: bool | None = None,
     force_retrain: bool = False,
+    horizon: int | None = None,
 ) -> tuple[Any, dict[str, Any], dict[str, float], dict[str, float]]:
     """Load a compatible Phase A artifact or train+persist a fitted model."""
     import pandas as pd
 
     from ml_engine.evaluation.metrics import evaluate_forecast
-    from ml_engine.models.artifact_store import compute_dataset_fingerprint, save_model_artifact
+    from ml_engine.models.artifact_store import (
+        compute_dataset_fingerprint,
+        predict_with_fitted_model,
+        save_model_artifact,
+    )
     from ml_engine.models.trainer import _train_and_predict_single_model
 
     artifacts_root = _resolve_artifacts_root()
@@ -727,6 +746,7 @@ def _obtain_fitted_model_for_inference(
         learning_rate=learning_rate,
         components=components,
         hybrid_weighting=hybrid_weighting,
+        residual_ar=residual_ar,
     )
     features_id = derive_features_id(features_dir)
     dataset_fingerprint = compute_dataset_fingerprint(features_dir)
@@ -789,22 +809,28 @@ def _obtain_fitted_model_for_inference(
 
     if model_name == "hybrid":
         from ml_engine.models.hybrid import DEFAULT_HYBRID_COMPONENTS, HybridForecaster, HybridModelError, generate_hybrid_candidates
-        if domain != "electricity":
-            raise MLError("Future forecasting for hybrid is currently supported only for the electricity domain", code=400)
+        from ml_engine.models.applicability import assess_model_applicability
+
+        applicability_report = assess_model_applicability(features_dir, domain=domain)
+        eligible_set = set(applicability_report["eligible_models"])
 
         if components is not None:
-            for c in components:
-                if not is_future_forecast_supported(domain, c) or c == "hybrid":
-                    raise MLError(
-                        f"Component '{c}' does not support future forecasting in domain '{domain}'",
-                        code=400,
-                    )
-            pool = components
+            raw_pool = components
         else:
-            pool = DEFAULT_HYBRID_COMPONENTS.get(domain, ["arima", "random_forest", "xgboost"])
+            raw_pool = DEFAULT_HYBRID_COMPONENTS.get(domain, ["random_forest", "xgboost"])
+
+        compatible_pool = [
+            c for c in raw_pool
+            if c in eligible_set and is_future_forecast_supported(domain, c, horizon=horizon) and c != "hybrid"
+        ]
+        if len(compatible_pool) < 2:
+            raise MLError(
+                "Hybrid requires at least two future-compatible component models for this horizon.",
+                code=400,
+            )
 
         try:
-            pool_components = HybridForecaster.validate_components(pool, domain)
+            pool_components = HybridForecaster.validate_components(compatible_pool, domain)
             hybrid_forecaster = HybridForecaster(
                 components=pool_components,
                 domain=domain,
@@ -818,23 +844,93 @@ def _obtain_fitted_model_for_inference(
         component_val_metrics: dict[str, dict[str, float]] = {}
         component_test_metrics: dict[str, dict[str, float]] = {}
         component_models: dict[str, Any] = {}
+        comp_used_artifact: dict[str, bool] = {}
 
         for comp in pool_components:
-            trained_comp = _train_and_predict_single_model(
+            comp_config = expected_configuration_for_request(
                 model_key=comp,
                 domain=domain,
-                target_column=target,
-                train_df=train_df,
-                val_df=val_df,
-                test_df=test_df,
                 order=order,
+                seasonal_order=seasonal_order,
+                training_window=training_window,
                 n_estimators=n_estimators,
                 max_depth=max_depth,
                 learning_rate=learning_rate,
+                residual_ar=residual_ar,
             )
-            component_models[comp] = trained_comp["model"]
-            v_pred = trained_comp["val_pred"]
-            t_pred = trained_comp["test_pred"]
+            comp_loaded = None
+            if not force_retrain and is_persistence_supported(comp):
+                comp_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (comp == "random_forest" and domain == "retail") else ()
+                comp_expected_features = TabularFeatureTransformer(target_column=target, extra_exclude=comp_exclusions).fit(train_df).feature_names
+                try:
+                    comp_loaded = try_load_compatible_artifact(
+                        domain=domain,
+                        model_key=comp,
+                        target=target,
+                        features_id=features_id,
+                        dataset_fingerprint=dataset_fingerprint,
+                        feature_names=comp_expected_features,
+                        configuration=comp_config,
+                        artifacts_root=artifacts_root,
+                    )
+                except Exception:
+                    comp_loaded = None
+
+            if comp_loaded is not None:
+                component_models[comp] = comp_loaded["model"]
+                pred_res = predict_with_fitted_model(
+                    model_key=comp,
+                    model=comp_loaded["model"],
+                    domain=domain,
+                    target_column=target,
+                    train_df=train_df,
+                    val_df=val_df,
+                    test_df=test_df,
+                )
+                v_pred = pred_res["val_pred"]
+                t_pred = pred_res["test_pred"]
+                comp_used_artifact[comp] = True
+            else:
+                trained_comp = _train_and_predict_single_model(
+                    model_key=comp,
+                    domain=domain,
+                    target_column=target,
+                    train_df=train_df,
+                    val_df=val_df,
+                    test_df=test_df,
+                    order=order,
+                    seasonal_order=seasonal_order,
+                    training_window=training_window,
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    residual_ar=residual_ar,
+                )
+                component_models[comp] = trained_comp["model"]
+                v_pred = trained_comp["val_pred"]
+                t_pred = trained_comp["test_pred"]
+                comp_used_artifact[comp] = False
+
+                if is_persistence_supported(comp):
+                    try:
+                        v_targs = val_df.loc[v_pred.index, target]
+                        t_targs = test_df.loc[t_pred.index, target]
+                        save_model_artifact(
+                            model=trained_comp["model"],
+                            domain=domain,
+                            model_key=comp,
+                            target=target,
+                            features_id=features_id,
+                            dataset_fingerprint=dataset_fingerprint,
+                            feature_names=trained_comp.get("feature_names") or [],
+                            configuration=trained_comp.get("configuration") or comp_config,
+                            validation_metrics=evaluate_forecast(v_targs, v_pred),
+                            test_metrics=evaluate_forecast(t_targs, t_pred),
+                            artifacts_root=artifacts_root,
+                        )
+                    except Exception:
+                        pass
+
             val_predictions[comp] = v_pred
             test_predictions[comp] = t_pred
             component_val_metrics[comp] = evaluate_forecast(val_df[target], pd.Series(v_pred.values, index=val_df.index))
@@ -847,6 +943,7 @@ def _obtain_fitted_model_for_inference(
                 domain=domain,
                 applicable_models=list(component_models.keys()),
                 future_forecast_only=True,
+                horizon=horizon,
             )
 
         try:
@@ -859,6 +956,7 @@ def _obtain_fitted_model_for_inference(
                 domain=domain,
                 weighting_strategy=hybrid_weighting,
                 selection_metric="rmse",
+                horizon=horizon,
             )
             decision = HybridForecaster.select_best_hybrid_and_standalone(
                 evaluated_hybrids=evaluated_hybrids,
@@ -872,8 +970,6 @@ def _obtain_fitted_model_for_inference(
         best_hybrid_raw = decision.get("_best_hybrid_raw", decision["best_hybrid"])
         best_hybrid = decision["best_hybrid"]
         weights = best_hybrid["weights"]
-        val_hybrid_pred = best_hybrid_raw.get("val_pred")
-        test_hybrid_pred = best_hybrid_raw.get("test_pred")
 
         hybrid_forecaster.components = best_hybrid["components"]
         hybrid_forecaster.weights = weights
@@ -886,7 +982,11 @@ def _obtain_fitted_model_for_inference(
         val_metrics = best_hybrid["validation_metrics"]
         test_metrics = best_hybrid.get("test_metrics") or {}
 
-        artifact_info = _artifact_response(used=False, source="trained")
+        all_reused = bool(comp_used_artifact) and all(comp_used_artifact.values())
+        artifact_info = _artifact_response(
+            used=all_reused,
+            source="loaded" if all_reused else "trained",
+        )
         return hybrid_forecaster, artifact_info, val_metrics, test_metrics
 
     try:
@@ -903,6 +1003,7 @@ def _obtain_fitted_model_for_inference(
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
+            residual_ar=residual_ar,
         )
     except TrainerError as err:
         raise MLError(f"Future forecasting pipeline error: {err}", code=400) from err
@@ -969,6 +1070,8 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     if model_name == "baseline":
         model_name = "naive"
 
+    features_dir, dataset_ctx = resolve_dynamic_features_and_context(payload)
+
     selection_reason = "Best validation performance"
     if model_name == "auto_select":
         comp_res = compare_service(payload)
@@ -984,9 +1087,26 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         if not is_future_forecast_supported(domain, model_name, horizon=horizon):
             raise MLError(future_support_error(domain, model_name, horizon=horizon), code=400)
+        from ml_engine.models.applicability import assess_model_applicability
+        applicability_report = assess_model_applicability(features_dir, domain=domain)
+        app = applicability_report["models"].get(model_name)
+        if app and not app["eligible"]:
+            raise MLError(
+                f"Model '{model_name}' is not applicable to this dataset: [{app['reason_code']}] {app['reason']}",
+                code=400,
+            )
         selection_reason = f"Evaluated specified model '{model_name.replace('_', ' ').title()}'"
 
-    features_dir, dataset_ctx = resolve_dynamic_features_and_context(payload)
+    residual_ar = payload.get("residual_ar")
+    if model_name == "trend_xgboost" and residual_ar is None:
+        if "comp_res" in locals() and comp_res.get("configurations"):
+            winning_cfg = comp_res["configurations"].get("trend_xgboost", {})
+            if isinstance(winning_cfg, dict) and "residual_ar" in winning_cfg:
+                residual_ar = winning_cfg["residual_ar"]
+        if residual_ar is None and "ranking" in locals():
+            for r_item in ranking:
+                if r_item.get("model") == "trend_xgboost":
+                    residual_ar = r_item.get("configuration", {}).get("residual_ar")
 
     order = tuple(payload.get("order", [1, 1, 1]))
     seasonal_order = tuple(payload.get("seasonal_order")) if payload.get("seasonal_order") is not None else None
@@ -1013,7 +1133,9 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             learning_rate=learning_rate,
             components=components,
             hybrid_weighting=hybrid_weighting,
+            residual_ar=residual_ar,
             force_retrain=force_retrain,
+            horizon=horizon,
         )
         result = generate_future_forecast(
             model=model,
@@ -1033,6 +1155,19 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             "model": model_name,
             "artifact_reused": artifact_info.get("used", False),
         }
+        result["configuration"] = expected_configuration_for_request(
+            model_key=model_name,
+            domain=domain,
+            order=order,
+            seasonal_order=seasonal_order,
+            training_window=training_window,
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            components=getattr(model, "components", components),
+            hybrid_weighting=hybrid_weighting,
+            residual_ar=residual_ar,
+        )
         result = _attach_history(
             result,
             forecast_type="future",
@@ -1048,6 +1183,8 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     except MLError:
         raise
     except Exception as err:
+        import traceback
+        traceback.print_exc()
         raise MLError("Internal server error", code=500) from err
 
 
@@ -1080,8 +1217,17 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
             raise MLError("Parameter 'selection_split' must be 'validation'")
 
     models_input = payload.get("models")
+    from ml_engine.models.applicability import assess_model_applicability
+    applicability_report = assess_model_applicability(features_dir, domain=domain)
+
     if models_input is None:
-        candidate_models = DEFAULT_COMPARISON_MODELS.get(domain, ["random_forest", "xgboost", "hybrid"])
+        raw_candidates = DEFAULT_COMPARISON_MODELS.get(domain, ["random_forest", "xgboost", "hybrid"])
+        candidate_models = [
+            m for m in raw_candidates
+            if applicability_report["models"].get(m, {}).get("eligible", False)
+        ]
+        if not candidate_models:
+            raise MLError("No eligible models available for comparison on this dataset", code=400)
     else:
         if not isinstance(models_input, list) or not models_input:
             raise MLError("Parameter 'models' must be a non-empty list of model names")
@@ -1098,13 +1244,13 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
                 name = "naive"
             if name not in KNOWN_FORECAST_MODELS or name == "auto_select":
                 raise MLError(f"Unsupported comparison model '{name}'")
+            app = applicability_report["models"].get(name)
+            if app and not app["eligible"]:
+                raise MLError(
+                    f"Model '{name}' is not applicable to this dataset: [{app['reason_code']}] {app['reason']}",
+                    code=400,
+                )
             candidate_models.append(name)
-
-    # Reject ARIMA, SARIMA, and trend_xgboost for retail domain
-    if domain == "retail" and ("arima" in candidate_models or "sarima" in candidate_models):
-        raise MLError("ARIMA/SARIMA models are not supported for retail domain comparison")
-    if domain == "retail" and "trend_xgboost" in candidate_models:
-        raise MLError("Trend XGBoost model is not supported for retail domain comparison")
 
     artifacts_root = _resolve_artifacts_root()
     features_id = derive_features_id(features_dir)
@@ -1112,10 +1258,19 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
 
     configurations = {}
     for m in candidate_models:
-        configurations[m] = expected_configuration_for_request(
-            model_key=m,
-            domain=domain,
-        )
+        if m == "trend_xgboost":
+            from ml_engine.models.applicability import profile_dataset_for_applicability
+            p = profile_dataset_for_applicability(features_dir, domain=domain)
+            configurations[m] = expected_configuration_for_request(
+                model_key=m,
+                domain=domain,
+                residual_ar=bool(p.has_hourly_lag_structure),
+            )
+        else:
+            configurations[m] = expected_configuration_for_request(
+                model_key=m,
+                domain=domain,
+            )
 
     cached_benchmark = try_load_benchmark_cache(
         domain=domain,
@@ -1135,6 +1290,7 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
             "ranking": cached_benchmark["ranking"],
             "recommended_model": cached_benchmark["recommended_model"],
             "adaptive_selection": cached_benchmark["adaptive_selection"],
+            "configurations": cached_benchmark.get("configurations", configurations),
             "benchmark_execution": {
                 "reused": True,
                 "status": "Benchmark Reused",
@@ -1145,16 +1301,55 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
     reports = []
     for m in candidate_models:
         try:
-            report = run_training_pipeline(
-                domain=domain,
-                features_dir=features_dir,
-                model_name=m,
-                save_artifact=is_persistence_supported(m),
-                artifacts_root=artifacts_root,
-            )
+            if m == "trend_xgboost":
+                from ml_engine.models.applicability import profile_dataset_for_applicability
+                p = profile_dataset_for_applicability(features_dir, domain=domain)
+                if p.has_hourly_lag_structure:
+                    report_base = run_training_pipeline(
+                        domain=domain,
+                        features_dir=features_dir,
+                        model_name="trend_xgboost",
+                        residual_ar=False,
+                        save_artifact=is_persistence_supported("trend_xgboost"),
+                        artifacts_root=artifacts_root,
+                    )
+                    report_rar = run_training_pipeline(
+                        domain=domain,
+                        features_dir=features_dir,
+                        model_name="trend_xgboost",
+                        residual_ar=True,
+                        save_artifact=is_persistence_supported("trend_xgboost"),
+                        artifacts_root=artifacts_root,
+                    )
+                    val_metric = selection_metric.lower().strip()
+                    score_base = report_base.get("validation_metrics", {}).get(val_metric, float("inf"))
+                    score_rar = report_rar.get("validation_metrics", {}).get(val_metric, float("inf"))
+                    report = report_rar if score_rar < score_base else report_base
+                else:
+                    report = run_training_pipeline(
+                        domain=domain,
+                        features_dir=features_dir,
+                        model_name="trend_xgboost",
+                        residual_ar=False,
+                        save_artifact=is_persistence_supported("trend_xgboost"),
+                        artifacts_root=artifacts_root,
+                    )
+            else:
+                report = run_training_pipeline(
+                    domain=domain,
+                    features_dir=features_dir,
+                    model_name=m,
+                    save_artifact=is_persistence_supported(m),
+                    artifacts_root=artifacts_root,
+                )
             reports.append(report)
         except Exception as err:
             raise MLError(f"Failed to evaluate candidate model '{m}': {err}", code=400) from err
+
+    for r in reports:
+        m_name = r.get("model") or r.get("model_name")
+        if m_name and "configuration" in r:
+            configurations[m_name] = r["configuration"]
 
     try:
         comparison_res = compare_models(reports, selection_metric=selection_metric)
@@ -1184,6 +1379,7 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
         "ranking": comparison_res["ranking"],
         "recommended_model": comparison_res["recommended_model"],
         "adaptive_selection": selection_res,
+        "configurations": configurations,
         "benchmark_execution": {
             "reused": False,
             "status": "Benchmark Computed",

@@ -322,10 +322,21 @@ def test_trend_xgboost_disabled_flag_matches_exp26(
 # Test 11: Retail domain rejection in trainer.py
 # -----------------------------------------------------------------------------
 def test_trend_xgboost_retail_domain_rejection_in_trainer(tmp_path: Path) -> None:
-    with pytest.raises(TrainerError, match="residual_ar is only supported for the electricity domain"):
-        expected_configuration_for_request(
-            model_key="xgboost",
+    # When a dataset lacks canonical hourly lag structure (lag_1, lag_24, lag_168),
+    # residual_ar is dynamically rejected with a clear structural error
+    features_dir = tmp_path / "retail_features"
+    features_dir.mkdir(parents=True, exist_ok=True)
+    ts = pd.date_range("2025-01-01", periods=60, freq="D")
+    df = pd.DataFrame({"timestamp": ts, "sales": np.random.uniform(10, 50, 60), "feature_1": 1.0})
+    df.iloc[:40].to_parquet(features_dir / "train.parquet", index=False)
+    df.iloc[40:50].to_parquet(features_dir / "validation.parquet", index=False)
+    df.iloc[50:].to_parquet(features_dir / "test.parquet", index=False)
+
+    with pytest.raises(TrainerError, match="residual_ar requires canonical hourly lag structure"):
+        run_training_pipeline(
             domain="retail",
+            features_dir=features_dir,
+            model_name="xgboost",
             residual_ar=True,
         )
 

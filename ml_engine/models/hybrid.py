@@ -48,6 +48,7 @@ def generate_hybrid_candidates(
     applicable_models: list[str] | None = None,
     future_forecast_only: bool = False,
     max_components: int = 3,
+    horizon: int | None = None,
 ) -> list[list[str]]:
     """Generate a bounded, deterministic list of hybrid candidate compositions of size >= 2.
 
@@ -74,7 +75,7 @@ def generate_hybrid_candidates(
             continue
         if m_clean in ("arima", "sarima") and domain_clean == "retail":
             continue
-        if future_forecast_only and not is_future_forecast_supported(domain_clean, m_clean):
+        if future_forecast_only and not is_future_forecast_supported(domain_clean, m_clean, horizon=horizon):
             continue
         if m_clean not in pool:
             pool.append(m_clean)
@@ -263,6 +264,7 @@ class HybridForecaster:
         domain: str = "electricity",
         weighting_strategy: str = "inverse_rmse",
         selection_metric: str = "rmse",
+        horizon: int | None = None,
     ) -> list[dict[str, Any]]:
         """Evaluate a list of candidate hybrid combinations using cached predictions.
 
@@ -305,7 +307,7 @@ class HybridForecaster:
                     test_hybrid_pred = cls.combine(cand_test_preds, weights)
                     test_metrics = evaluate_forecast(test_targets.loc[test_hybrid_pred.index], test_hybrid_pred)
 
-            future_capable = all(is_future_forecast_supported(domain_clean, m) for m in cand)
+            future_capable = all(is_future_forecast_supported(domain_clean, m, horizon=horizon) for m in cand)
 
             evaluated.append({
                 "components": cand,

@@ -123,7 +123,7 @@ def test_support_matrix() -> None:
     assert is_future_forecast_supported("electricity", "arima")
     assert is_future_forecast_supported("electricity", "hybrid")
     assert not is_future_forecast_supported("retail", "lstm")
-    assert not is_future_forecast_supported("retail", "hybrid")
+    assert is_future_forecast_supported("retail", "hybrid")
     assert not is_future_forecast_supported("retail", "arima")
 
 
@@ -331,23 +331,120 @@ def test_electricity_hybrid_future_forecast_rejects_unsupported_components(elec_
         )
 
 
-def test_hybrid_future_forecast_rejects_retail(retail_features: Path) -> None:
+def test_hybrid_future_forecast_retail_succeeds(retail_features: Path) -> None:
+    """Verify Retail Hybrid future forecast succeeds for 7d, 14d, and 30d with validation-derived weights."""
     from ml_engine.models.hybrid import HybridForecaster
+    from ml_engine.models.xgboost_model import XGBoostForecaster
+    from ml_engine.evaluation.metrics import evaluate_forecast
 
     train = pd.read_parquet(retail_features / "train.parquet")
+    val = pd.read_parquet(retail_features / "validation.parquet")
+
     m_rf = RandomForestForecaster(n_estimators=10, random_state=42).fit(train, target_column="sales")
+    m_xgb = XGBoostForecaster(n_estimators=10, max_depth=3, learning_rate=0.05, random_state=42).fit(train, target_column="sales")
+
+    v_rf = m_rf.predict(val)
+    v_xgb = m_xgb.predict(val)
+
+    comp_val = {
+        "random_forest": evaluate_forecast(val["sales"], v_rf),
+        "xgboost": evaluate_forecast(val["sales"], v_xgb),
+    }
+    weights = HybridForecaster.calculate_weights(comp_val, weighting_strategy="inverse_rmse")
 
     hyb = HybridForecaster(components=["random_forest", "xgboost"], domain="retail")
-    hyb.weights = {"random_forest": 0.5, "xgboost": 0.5}
-    hyb.component_models = {"random_forest": m_rf, "xgboost": m_rf}
+    hyb.weights = weights
+    hyb.component_models = {"random_forest": m_rf, "xgboost": m_xgb}
 
-    with pytest.raises(FutureForecastError, match="not currently supported"):
-        generate_future_forecast(
+    history = load_chronological_history(retail_features, "sales")
+    last_hist = pd.Timestamp(history["timestamp"].iloc[-1])
+
+    for h in (7, 14, 30):
+        result = generate_future_forecast(
             model=hyb,
             model_key="hybrid",
             domain="retail",
             features_dir=retail_features,
-            horizon=7,
+            horizon=h,
+        )
+        assert result["forecast_type"] == "future"
+        assert result["domain"] == "retail"
+        assert result["model"] == "hybrid"
+        assert result["horizon"] == h
+        assert len(result["predictions"]) == h
+        assert result["prediction_count"] == h
+        assert result["exogenous_policy"] == "last_observation_carried_forward"
+
+        timestamps = [pd.Timestamp(p["timestamp"]) for p in result["predictions"]]
+        assert timestamps[0] > last_hist
+        assert timestamps == sorted(timestamps)
+
+        for p in result["predictions"]:
+            assert "timestamp" in p
+            assert "predicted" in p
+            assert "actual" not in p
+            assert np.isfinite(p["predicted"])
+
+
+def test_hybrid_future_forecast_horizon_component_filtering(elec_features: Path) -> None:
+    """Verify SARIMA is filtered out at h=720 (exceeds h<=168), but Hybrid continues with RF + XGB."""
+    from ml_engine.models.hybrid import HybridForecaster
+    from ml_engine.models.xgboost_model import XGBoostForecaster
+    from ml_engine.evaluation.metrics import evaluate_forecast
+
+    train = pd.read_parquet(elec_features / "train.parquet")
+    val = pd.read_parquet(elec_features / "validation.parquet")
+
+    m_rf = RandomForestForecaster(n_estimators=10, random_state=42).fit(train, target_column="demand_mw")
+    m_xgb = XGBoostForecaster(n_estimators=10, max_depth=3, learning_rate=0.05, random_state=42).fit(train, target_column="demand_mw")
+
+    comp_val = {
+        "random_forest": evaluate_forecast(val["demand_mw"], m_rf.predict(val)),
+        "xgboost": evaluate_forecast(val["demand_mw"], m_xgb.predict(val)),
+        "sarima": {"rmse": 100.0, "mae": 80.0, "r2": 0.5},
+    }
+    weights = HybridForecaster.calculate_weights(comp_val, weighting_strategy="inverse_rmse")
+
+    hyb = HybridForecaster(components=["random_forest", "xgboost", "sarima"], domain="electricity")
+    hyb.weights = weights
+    # Mock sarima component model that should NOT be called at h=720
+    hyb.component_models = {"random_forest": m_rf, "xgboost": m_xgb, "sarima": None}
+
+    history = load_chronological_history(elec_features, "demand_mw")
+    last_hist = pd.Timestamp(history["timestamp"].iloc[-1])
+
+    # At h=720, SARIMA must be excluded, RF+XGB continue
+    result = generate_future_forecast(
+        model=hyb,
+        model_key="hybrid",
+        domain="electricity",
+        features_dir=elec_features,
+        horizon=720,
+    )
+    assert result["horizon"] == 720
+    assert len(result["predictions"]) == 720
+    timestamps = [pd.Timestamp(p["timestamp"]) for p in result["predictions"]]
+    assert timestamps[0] > last_hist
+
+
+def test_hybrid_future_forecast_fails_when_fewer_than_two_compatible(elec_features: Path) -> None:
+    """Verify Hybrid raises structured error when fewer than 2 compatible components remain."""
+    from ml_engine.models.hybrid import HybridForecaster
+
+    train = pd.read_parquet(elec_features / "train.parquet")
+    m_rf = RandomForestForecaster(n_estimators=10, random_state=42).fit(train, target_column="demand_mw")
+
+    hyb = HybridForecaster(components=["random_forest", "sarima"], domain="electricity")
+    hyb.weights = {"random_forest": 0.5, "sarima": 0.5}
+    hyb.component_models = {"random_forest": m_rf, "sarima": None}
+
+    with pytest.raises(FutureForecastError, match="Hybrid requires at least two future-compatible component models"):
+        generate_future_forecast(
+            model=hyb,
+            model_key="hybrid",
+            domain="electricity",
+            features_dir=elec_features,
+            horizon=720,
         )
 
 

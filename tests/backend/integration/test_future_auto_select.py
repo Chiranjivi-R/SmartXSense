@@ -57,17 +57,19 @@ def test_future_endpoint_auto_select_validation_winning_model(tmp_path):
         assert resp.status_code == 200
         data = resp.get_json()["data"]
 
-        assert "selected_model" in data
-        assert data["selected_model"] in ("xgboost", "random_forest")
+        assert data["selected_model"] in ("xgboost", "random_forest", "arima", "hybrid")
         assert "selection_reason" in data
         assert "validation_metrics" in data
         assert "test_metrics" in data
         assert "predictions" in data
         assert len(data["predictions"]) == 7
         assert "artifact" in data
-        assert data["artifact"]["used"] is True
-        assert data["artifact"]["source"] == "loaded"
-        assert data["artifact_reused"] is True
+        if data["selected_model"] in ("xgboost", "random_forest", "hybrid"):
+            assert data["artifact"]["used"] is True
+            assert data["artifact"]["source"] == "loaded"
+            assert data["artifact_reused"] is True
+        else:
+            assert data["artifact"]["used"] is False
         assert "dataset_context" in data
 
         # Check prediction structure
