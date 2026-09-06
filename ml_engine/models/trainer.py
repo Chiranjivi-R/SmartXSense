@@ -117,6 +117,8 @@ def _train_and_predict_single_model(
     kernel_size: int = 3,
     trend_mode: str | None = None,
     trend_knot_hour: float | None = None,
+    residual_ar: bool | None = None,
+    residual_ar_weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Internal helper to train a single component model and generate validation and test predictions."""
     model_key = model_key.lower().strip()
@@ -212,6 +214,12 @@ def _train_and_predict_single_model(
         if resolved_trend_mode in ("linear", "piecewise_linear") and domain == "retail":
             raise TrainerError(f"trend_mode='{resolved_trend_mode}' is only supported for the electricity domain")
 
+        # Residual AR resolution: backward-compatible default is False
+        resolved_residual_ar = bool(residual_ar) if residual_ar is not None else False
+
+        if resolved_residual_ar and domain == "retail":
+            raise TrainerError("residual_ar is only supported for the electricity domain")
+
         resolved_knot_hour = (
             float(trend_knot_hour)
             if trend_knot_hour is not None
@@ -239,6 +247,10 @@ def _train_and_predict_single_model(
             configuration["trend_mode"] = resolved_trend_mode
             if resolved_trend_mode == "piecewise_linear":
                 configuration["trend_knot_hour"] = resolved_knot_hour
+        if resolved_residual_ar:
+            configuration["residual_ar"] = True
+            if residual_ar_weights is not None:
+                configuration["residual_ar_weights"] = dict(residual_ar_weights)
 
         xgb_model = XGBoostForecaster(
             n_estimators=n_estimators,
@@ -249,12 +261,18 @@ def _train_and_predict_single_model(
             sample_weight_strategy=resolved_weight_strategy,
             trend_mode=resolved_trend_mode,
             trend_knot_hour=resolved_knot_hour,
+            residual_ar=resolved_residual_ar,
+            residual_ar_weights=residual_ar_weights,
         )
         xgb_model.fit(train_df, target_column=target_column)
         model = xgb_model
 
         val_pred = xgb_model.predict(val_df)
-        test_pred = xgb_model.predict(test_df)
+        if xgb_model.residual_ar and target_column in val_df.columns:
+            val_residuals = val_df[target_column].to_numpy(dtype=float) - val_pred.to_numpy(dtype=float)
+            test_pred = xgb_model.predict(test_df, residual_history=val_residuals[-168:])
+        else:
+            test_pred = xgb_model.predict(test_df)
         feature_importances = xgb_model.get_feature_importances()
         feature_names = xgb_model.feature_names
 
@@ -376,6 +394,8 @@ def run_training_pipeline(
     kernel_size: int = 3,
     trend_mode: str | None = None,
     trend_knot_hour: float | None = None,
+    residual_ar: bool | None = None,
+    residual_ar_weights: dict[str, float] | None = None,
     components: list[str] | None = None,
     hybrid_weighting: str = "inverse_rmse",
     prediction_limit: int = 100,
@@ -396,6 +416,8 @@ def run_training_pipeline(
         model_key = "naive"
     if model_key in ("trend_xgboost", "sarima") and domain == "retail":
         raise TrainerError(f"Model '{model_key}' is only supported for the electricity domain")
+    if residual_ar and domain == "retail":
+        raise TrainerError("residual_ar is only supported for the electricity domain")
 
     train_path = features_dir / "train.parquet"
     val_path = features_dir / "validation.parquet"
@@ -445,6 +467,8 @@ def run_training_pipeline(
         kernel_size=kernel_size,
         trend_mode=trend_mode,
         trend_knot_hour=trend_knot_hour,
+        residual_ar=residual_ar,
+        residual_ar_weights=residual_ar_weights,
         components=components,
         hybrid_weighting=hybrid_weighting,
     )
@@ -585,6 +609,8 @@ def run_training_pipeline(
                     kernel_size=kernel_size,
                     trend_mode=comp_config.get("trend_mode"),
                     trend_knot_hour=comp_config.get("trend_knot_hour"),
+                    residual_ar=comp_config.get("residual_ar"),
+                    residual_ar_weights=comp_config.get("residual_ar_weights"),
                 )
                 comp_model = res["model"]
                 v_pred = res["val_pred"]
@@ -758,6 +784,8 @@ def run_training_pipeline(
         kernel_size=kernel_size,
         trend_mode=trend_mode,
         trend_knot_hour=trend_knot_hour,
+        residual_ar=residual_ar,
+        residual_ar_weights=residual_ar_weights,
     )
 
     val_pred = res["val_pred"]
@@ -1088,6 +1116,8 @@ def expected_configuration_for_request(
     kernel_size: int = 3,
     trend_mode: str | None = None,
     trend_knot_hour: float | None = None,
+    residual_ar: bool | None = None,
+    residual_ar_weights: dict[str, float] | None = None,
     components: list[str] | None = None,
     hybrid_weighting: str = "inverse_rmse",
 ) -> dict[str, Any]:
@@ -1147,6 +1177,12 @@ def expected_configuration_for_request(
         if resolved_trend_mode in ("linear", "piecewise_linear") and domain == "retail":
             raise TrainerError(f"trend_mode='{resolved_trend_mode}' is only supported for the electricity domain")
 
+        # Residual AR resolution: backward-compatible default is False
+        resolved_residual_ar = bool(residual_ar) if residual_ar is not None else False
+
+        if resolved_residual_ar and domain == "retail":
+            raise TrainerError("residual_ar is only supported for the electricity domain")
+
         resolved_knot_hour = (
             float(trend_knot_hour)
             if trend_knot_hour is not None
@@ -1174,6 +1210,10 @@ def expected_configuration_for_request(
             cfg["trend_mode"] = resolved_trend_mode
             if resolved_trend_mode == "piecewise_linear":
                 cfg["trend_knot_hour"] = resolved_knot_hour
+        if resolved_residual_ar:
+            cfg["residual_ar"] = True
+            if residual_ar_weights is not None:
+                cfg["residual_ar_weights"] = dict(residual_ar_weights)
         return cfg
     if model_key == "lstm":
         effective_lookback = lookback if lookback is not None else DEFAULT_LOOKBACK.get(domain, 7)

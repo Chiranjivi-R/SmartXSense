@@ -113,6 +113,15 @@ class LimeTabularExplainer:
                 "weight": trend_val,
             })
 
+        # For residual AR models, add residual_ar_correction attribution
+        if getattr(self.forecaster, "residual_ar", False) and hasattr(self.forecaster, "predict_components"):
+            comps = self.forecaster.predict_components(eval_df.iloc[[sample_index]])
+            ar_corr_val = float(comps["ar_correction"][0])
+            feature_attributions.append({
+                "rule": "residual_ar_correction",
+                "weight": ar_corr_val,
+            })
+
         return {
             "explanation_type": "local",
             "method": "lime",

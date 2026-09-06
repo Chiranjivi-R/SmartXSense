@@ -87,7 +87,7 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "domains": ["electricity"],
         "test_forecast": True,
         "compare_default": True,
-        "notes": "Detrended residual XGBoost with conservative spike weighting for non-stationary electricity demand.",
+        "notes": "Piecewise linear trend XGBoost with conservative spike weighting and stationary AR(1, 24, 168) residual error dynamics for electricity demand.",
     },
     {
         "key": "lstm",

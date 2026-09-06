@@ -49,6 +49,9 @@ class XGBoostForecaster:
         sample_weight_strategy: str | None = None,
         trend_mode: str | None = None,
         trend_knot_hour: float | None = None,
+        residual_ar: bool = False,
+        residual_ar_weights: dict[str, float] | None = None,
+        residual_ar_lags: tuple[int, ...] = (1, 24, 168),
     ) -> None:
         if target_transform not in (None, "log1p"):
             raise XGBoostModelError(f"Unsupported target_transform '{target_transform}'. Supported: None, 'log1p'")
@@ -66,6 +69,18 @@ class XGBoostForecaster:
             if not isinstance(trend_knot_hour, (int, float)) or np.isnan(trend_knot_hour) or trend_knot_hour <= 0:
                 raise XGBoostModelError(f"trend_knot_hour must be a positive float, got '{trend_knot_hour}'")
 
+        if residual_ar:
+            if target_transform == "log1p":
+                raise XGBoostModelError("Residual AR correction is only supported for linear scale (electricity)")
+            if residual_ar_weights is not None:
+                if not isinstance(residual_ar_weights, dict):
+                    raise XGBoostModelError("residual_ar_weights must be a dict mapping lag names to float weights")
+                sum_w = sum(abs(float(v)) for v in residual_ar_weights.values())
+                if sum_w >= 1.0:
+                    raise XGBoostModelError(
+                        f"Residual AR weights sum to {sum_w:.4f} >= 1.0 (strictly non-stationary)"
+                    )
+
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.learning_rate = learning_rate
@@ -81,6 +96,10 @@ class XGBoostForecaster:
             if trend_knot_hour is not None
             else (30000.0 if trend_mode == "piecewise_linear" else None)
         )
+        self.residual_ar = bool(residual_ar)
+        self.residual_ar_weights = dict(residual_ar_weights) if residual_ar_weights is not None else None
+        self.residual_ar_lags = tuple(int(lag) for lag in residual_ar_lags)
+        self.tail_residuals: np.ndarray | None = None
 
         self.trend_t0: pd.Timestamp | None = None
         self.trend_intercept: float = 0.0
@@ -212,17 +231,56 @@ class XGBoostForecaster:
         except Exception as err:
             raise XGBoostModelError(f"Failed to fit XGBRegressor: {err}") from err
 
+        if self.residual_ar:
+            pred_train_detrended = self._model.predict(X_train)
+            t_hours_tr = (
+                (pd.to_datetime(train_df["timestamp"], utc=True) - self.trend_t0).dt.total_seconds().to_numpy() / 3600.0
+                if self.trend_mode in ("linear", "piecewise_linear") and self.trend_t0 is not None
+                else 0.0
+            )
+            trend_train = self.compute_trend(t_hours_tr) if self.trend_mode in ("linear", "piecewise_linear") else 0.0
+            pred_total_tr = trend_train + pred_train_detrended
+            res_tr = raw_y - pred_total_tr
+            self.tail_residuals = res_tr[-168:].copy()
+
+            if self.residual_ar_weights is None:
+                N_tr = len(res_tr)
+                if N_tr > 168:
+                    X_ar = np.column_stack([
+                        res_tr[168 - 1 : N_tr - 1],
+                        res_tr[168 - 24 : N_tr - 24],
+                        res_tr[168 - 168 : N_tr - 168],
+                    ])
+                    y_ar = res_tr[168:]
+                    coef, _, _, _ = np.linalg.lstsq(X_ar, y_ar, rcond=None)
+                    sum_w = float(np.sum(np.abs(coef)))
+                    if sum_w >= 1.0:
+                        coef = coef * (0.95 / sum_w)
+                    self.residual_ar_weights = {
+                        "lag_1": float(coef[0]),
+                        "lag_24": float(coef[1]),
+                        "lag_168": float(coef[2]),
+                    }
+                else:
+                    self.residual_ar_weights = {"lag_1": 0.0, "lag_24": 0.0, "lag_168": 0.0}
+
         return self
 
-    def predict(self, eval_df: pd.DataFrame) -> pd.Series:
-        """Generate point forecasts for evaluation dataset matching index and length."""
+    def predict_components(
+        self,
+        eval_df: pd.DataFrame,
+        *,
+        with_residual_ar: bool = True,
+        residual_history: Any = None,
+    ) -> dict[str, np.ndarray]:
+        """Generate breakdown of forecasts into trend, XGBoost residual, and AR error correction components."""
         if self._model is None or self._transformer is None:
             raise XGBoostModelError("XGBoostForecaster must be fitted before calling predict")
         if eval_df is None or eval_df.empty:
             raise XGBoostModelError("Evaluation dataset cannot be empty")
 
         df_eval_proc = eval_df
-        eval_trend = None
+        eval_trend = np.zeros(len(eval_df), dtype=float)
 
         if self.trend_mode in ("linear", "piecewise_linear"):
             if "timestamp" not in eval_df.columns:
@@ -234,20 +292,83 @@ class XGBoostForecaster:
             t_hours = (t_eval - self.trend_t0).dt.total_seconds().to_numpy() / 3600.0
 
             df_eval_proc = self.detrend_lag_features(eval_df)
-            eval_trend = self.compute_trend(t_hours)
+            eval_trend = np.asarray(self.compute_trend(t_hours), dtype=float)
 
         X_eval = self._transformer.transform(df_eval_proc)
         try:
-            preds = self._model.predict(X_eval)
+            xgb_residual = np.asarray(self._model.predict(X_eval), dtype=float)
             if self.target_transform == "log1p":
-                preds = np.expm1(preds)
-                preds = np.clip(preds, a_min=0.0, a_max=None)
-            if eval_trend is not None:
-                preds = eval_trend + preds
+                xgb_residual = np.expm1(xgb_residual)
+                xgb_residual = np.clip(xgb_residual, a_min=0.0, a_max=None)
         except Exception as err:
             raise XGBoostModelError(f"Failed to predict using XGBRegressor: {err}") from err
 
-        return pd.Series(preds, index=eval_df.index, dtype=float)
+        base_preds = eval_trend + xgb_residual
+        ar_correction = np.zeros(len(eval_df), dtype=float)
+
+        if self.residual_ar and with_residual_ar and self.residual_ar_weights is not None:
+            w1 = float(self.residual_ar_weights.get("lag_1", 0.0))
+            w24 = float(self.residual_ar_weights.get("lag_24", 0.0))
+            w168 = float(self.residual_ar_weights.get("lag_168", 0.0))
+
+            # Determine initial 168-lag residual buffer
+            if residual_history is not None:
+                init_tail = np.asarray(residual_history, dtype=float)[-168:]
+            elif self.tail_residuals is not None and len(self.tail_residuals) > 0:
+                init_tail = np.asarray(self.tail_residuals, dtype=float)[-168:]
+            else:
+                init_tail = np.zeros(168, dtype=float)
+
+            if len(init_tail) < 168:
+                init_tail = np.pad(init_tail, (168 - len(init_tail), 0), mode="constant")
+
+            # Causal 1-step evaluation when actual targets are present
+            if (
+                self.target_column in eval_df.columns
+                and not eval_df[self.target_column].isna().all()
+                and len(eval_df) > 1
+            ):
+                actual_y = eval_df[self.target_column].to_numpy(dtype=float)
+                eval_residuals = actual_y - base_preds
+                full_res = np.concatenate([init_tail, eval_residuals])
+                n_full = len(full_res)
+                ar_correction = (
+                    w1 * full_res[168 - 1 : n_full - 1]
+                    + w24 * full_res[168 - 24 : n_full - 24]
+                    + w168 * full_res[168 - 168 : n_full - 168]
+                )
+            else:
+                # Recursive forward simulation when targets are absent (future forecast or single step)
+                res_buf = list(init_tail[-168:])
+                ar_corr_list = []
+                for _ in range(len(eval_df)):
+                    e_hat = float(w1 * res_buf[-1] + w24 * res_buf[-24] + w168 * res_buf[-168])
+                    ar_corr_list.append(e_hat)
+                    res_buf.append(e_hat)
+                ar_correction = np.array(ar_corr_list, dtype=float)
+
+        total_preds = base_preds + ar_correction
+        return {
+            "trend": eval_trend,
+            "xgb_residual": xgb_residual,
+            "ar_correction": ar_correction,
+            "total": total_preds,
+        }
+
+    def predict(
+        self,
+        eval_df: pd.DataFrame,
+        *,
+        with_residual_ar: bool = True,
+        residual_history: Any = None,
+    ) -> pd.Series:
+        """Generate point forecasts for evaluation dataset matching index and length."""
+        components = self.predict_components(
+            eval_df,
+            with_residual_ar=with_residual_ar,
+            residual_history=residual_history,
+        )
+        return pd.Series(components["total"], index=eval_df.index, dtype=float)
 
     def get_feature_importances(self) -> dict[str, float]:
         """Return model-native feature importances mapping feature name to importance score."""

@@ -681,7 +681,11 @@ def predict_with_fitted_model(
         test_pred = model.predict(test_df, target_column=target_column, history=combined)
     elif model_key in ("random_forest", "xgboost", "trend_xgboost"):
         val_pred = model.predict(val_df)
-        test_pred = model.predict(test_df)
+        if getattr(model, "residual_ar", False) and target_column in val_df.columns:
+            val_residuals = val_df[target_column].to_numpy(dtype=float) - val_pred.to_numpy(dtype=float)
+            test_pred = model.predict(test_df, residual_history=val_residuals[-168:])
+        else:
+            test_pred = model.predict(test_df)
     elif model_key in ("lstm", "cnn_lstm"):
         val_pred = model.predict(val_df, target_column=target_column, history_df=train_df)
         combined_df = pd.concat([train_df, val_df], ignore_index=True)

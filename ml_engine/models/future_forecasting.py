@@ -486,6 +486,32 @@ def recursive_tabular_future_forecast(
     if transformer is not None and not getattr(transformer, "_is_fitted", False):
         raise FutureForecastError("Model preprocessing transformer is not fitted")
 
+    residual_buffer: list[float] | None = None
+    ar_weights: dict[str, float] | None = None
+    if getattr(model, "residual_ar", False) and getattr(model, "residual_ar_weights", None) is not None:
+        ar_weights = model.residual_ar_weights
+        init_res = None
+        if target_column in history_df.columns and len(history_df) >= 168:
+            try:
+                hist_tail_df = history_df.iloc[-168:]
+                if hasattr(model, "predict"):
+                    base_hist = model.predict(hist_tail_df, with_residual_ar=False).to_numpy(dtype=float)
+                    act_hist = hist_tail_df[target_column].to_numpy(dtype=float)
+                    init_res = [float(v) for v in (act_hist - base_hist)]
+            except Exception:
+                init_res = None
+
+        if init_res is None:
+            tail = getattr(model, "tail_residuals", None)
+            if tail is not None and len(tail) > 0:
+                init_res = [float(v) for v in tail[-168:]]
+            else:
+                init_res = [0.0] * 168
+
+        if len(init_res) < 168:
+            init_res = [0.0] * (168 - len(init_res)) + init_res
+        residual_buffer = init_res
+
     current_ts = last_ts
     for _ in range(horizon):
         current_ts = current_ts + offset
@@ -571,8 +597,22 @@ def recursive_tabular_future_forecast(
                 step_df[col] = np.nan
         step_df = step_df[history_df.columns]
 
-        pred_series = model.predict(step_df)
-        pred_value = float(pred_series.iloc[0])
+        if residual_buffer is not None and ar_weights is not None:
+            w1 = float(ar_weights.get("lag_1", 0.0))
+            w24 = float(ar_weights.get("lag_24", 0.0))
+            w168 = float(ar_weights.get("lag_168", 0.0))
+            e_hat = float(w1 * residual_buffer[-1] + w24 * residual_buffer[-24] + w168 * residual_buffer[-168])
+            residual_buffer.append(e_hat)
+
+            if hasattr(model, "predict"):
+                base_val = float(model.predict(step_df, with_residual_ar=False).iloc[0])
+            else:
+                base_val = float(model.predict(step_df).iloc[0])
+            pred_value = float(base_val + e_hat)
+        else:
+            pred_series = model.predict(step_df)
+            pred_value = float(pred_series.iloc[0])
+
         if not np.isfinite(pred_value):
             raise FutureForecastError("Future forecast produced a non-finite prediction")
 

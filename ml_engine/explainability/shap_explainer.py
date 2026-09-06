@@ -171,6 +171,19 @@ class ShapTreeExplainer:
                 "value": trend_val,
             })
 
+        # For residual AR models, add residual_ar_correction attribution
+        # to guarantee exact waterfall additivity (<0.05 MW difference).
+        if getattr(self.forecaster, "residual_ar", False) and hasattr(self.forecaster, "predict_components"):
+            comps = self.forecaster.predict_components(eval_df.iloc[[sample_index]])
+            ar_corr_val = float(comps["ar_correction"][0])
+            feature_values["residual_ar_correction"] = ar_corr_val
+            contributions["residual_ar_correction"] = ar_corr_val
+            items.append({
+                "feature": "residual_ar_correction",
+                "contribution": ar_corr_val,
+                "value": ar_corr_val,
+            })
+
         top_positive = sorted(
             [item for item in items if item["contribution"] > 0],
             key=lambda x: x["contribution"],
