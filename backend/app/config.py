@@ -25,7 +25,7 @@ class Config:
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(seconds=int(os.getenv("JWT_ACCESS_TOKEN_EXPIRES", "3600")))
     JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=int(os.getenv("JWT_REFRESH_TOKEN_EXPIRES_DAYS", "30")))
-    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:5174,http://127.0.0.1:5173,http://127.0.0.1:5174").split(",")
     UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", str(Path(__file__).resolve().parents[2] / "storage" / "uploads"))
     PROCESSED_DATA_FOLDER = os.getenv("PROCESSED_DATA_FOLDER", str(Path(__file__).resolve().parents[2] / "ml_engine" / "data" / "processed"))
     FEATURES_DATA_FOLDER = os.getenv("FEATURES_DATA_FOLDER", str(Path(__file__).resolve().parents[2] / "ml_engine" / "data" / "features"))

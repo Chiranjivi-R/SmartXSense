@@ -495,8 +495,11 @@ def run_training_pipeline(
 
     from .tabular_preprocessing import TabularFeatureTransformer
 
-    rf_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (model_key == "random_forest" and domain == "retail") else ()
-    expected_feature_names = TabularFeatureTransformer(target_column=target_column, extra_exclude=rf_exclusions).fit(train_df).feature_names
+    if model_key in ("arima", "sarima", "naive", "seasonal_naive"):
+        expected_feature_names = []
+    else:
+        rf_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (model_key == "random_forest" and domain == "retail") else ()
+        expected_feature_names = TabularFeatureTransformer(target_column=target_column, extra_exclude=rf_exclusions).fit(train_df).feature_names
 
     # Attempt to reuse existing artifact if force_retrain is False and persistence is supported
     if not force_retrain and is_persistence_supported(model_key):
@@ -576,8 +579,11 @@ def run_training_pipeline(
             )
             comp_loaded = None
             if not force_retrain and is_persistence_supported(comp):
-                comp_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (comp == "random_forest" and domain == "retail") else ()
-                comp_expected_features = TabularFeatureTransformer(target_column=target_column, extra_exclude=comp_exclusions).fit(train_df).feature_names
+                if comp in ("arima", "sarima", "naive", "seasonal_naive"):
+                    comp_expected_features = []
+                else:
+                    comp_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (comp == "random_forest" and domain == "retail") else ()
+                    comp_expected_features = TabularFeatureTransformer(target_column=target_column, extra_exclude=comp_exclusions).fit(train_df).feature_names
                 comp_loaded = try_load_compatible_artifact(
                     domain=domain,
                     model_key=comp,

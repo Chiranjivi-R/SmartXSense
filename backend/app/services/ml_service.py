@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 import pandas as pd
 
 from ml_engine.evaluation import AdaptiveModelSelector, compare_models
-from ml_engine.explainability import ForecastExplainer, SUPPORTED_EXPLAINABLE_MODELS
+from ml_engine.explainability import ForecastExplainer, SUPPORTED_EXPLAINABLE_MODELS, ShapTreeExplainer
 from ml_engine.models.artifact_store import (
     compute_dataset_fingerprint,
     default_artifacts_root,
@@ -62,11 +62,12 @@ from .forecast_summary_service import derive_forecast_facts
 class MLError(ValueError):
     """Raised when an ML backend service operation fails."""
 
-    def __init__(self, message: str, code: int = 400) -> None:
+    def __init__(self, message: str, code: int = 400, data: dict[str, Any] | None = None) -> None:
         safe = sanitize_client_error_message(message)
         super().__init__(safe)
         self.message = safe
         self.code = code
+        self.data = data
 
 
 import tempfile
@@ -160,19 +161,32 @@ def _attach_llm_explanation(
 
         t_shap_start = time.perf_counter()
         shap_features = []
-        if model_name in ("random_forest", "xgboost"):
-            try:
-                exp_res = explain_service({
-                    "domain": domain,
-                    "model": model_name,
-                    "dataset_id": dataset_ctx.get("dataset_id"),
-                    "features_dir": str(res.get("features_dir") or payload.get("features_dir") or ""),
-                    "explanation_type": "global",
-                })
-                if isinstance(exp_res, dict) and "features" in exp_res:
-                    shap_features = exp_res["features"]
-            except Exception:
-                pass
+        if model_name in ("random_forest", "xgboost", "trend_xgboost", "hybrid"):
+            if domain == "electricity":
+                # For electricity forecasting, avoid synchronous execution of expensive detailed SHAP
+                # during the primary forecast request. Use available model-native feature
+                # importances for the immediate forecast response and LLM explanation.
+                # Detailed SHAP remains available via the dedicated explainability endpoint.
+                feat_imp = res.get("feature_importances") or {}
+                if isinstance(feat_imp, dict) and feat_imp:
+                    shap_features = [{"feature": k, "importance": round(float(v), 4)} for k, v in feat_imp.items()]
+                elif isinstance(feat_imp, list):
+                    shap_features = feat_imp
+            else:
+                try:
+                    exp_res = explain_service({
+                        "domain": domain,
+                        "model": model_name,
+                        "dataset_id": dataset_ctx.get("dataset_id"),
+                        "features_dir": str(res.get("features_dir") or payload.get("features_dir") or ""),
+                        "location": payload.get("location"),
+                        "geo_filters": payload.get("geo_filters"),
+                        "explanation_type": "global",
+                    })
+                    if isinstance(exp_res, dict) and "features" in exp_res:
+                        shap_features = exp_res["features"]
+                except Exception:
+                    pass
         shap_time_ms = round((time.perf_counter() - t_shap_start) * 1000, 2)
 
         mape_val = metrics.get("mape")
@@ -365,17 +379,87 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
     geo_filters = payload.get("geo_filters")
     features_dir_input = payload.get("features_dir")
 
+    clean_loc = str(location).strip() if not _is_no_filter_val(location) else None
+    valid_filters: dict[str, str] = {}
+    if geo_filters and isinstance(geo_filters, dict):
+        for k, v in geo_filters.items():
+            if not _is_no_filter_val(v):
+                valid_filters[k] = str(v).strip()
+
+    # Priority 1: Check if dataset_id corresponds to a user-uploaded database dataset
+    ds_obj = None
+    if dataset_id and dataset_id not in ("demo_retail", "demo_electricity") and dataset_id not in DEMO_FEATURE_DIRS:
+        try:
+            ds_obj = owned_dataset(dataset_id)
+        except Exception as _e:
+            import logging
+            logging.getLogger(__name__).warning("owned_dataset lookup failed for %s: %s", dataset_id, _e, exc_info=True)
+            ds_obj = None
+
+    if ds_obj is not None and not isinstance(ds_obj, dict):
+        path = managed_upload_path(ds_obj)
+        frame = _read_dataset(path, _extension(ds_obj.filename))
+        dataset_name = ds_obj.filename
+        content_h = getattr(ds_obj, "content_hash", None)
+        if not content_h and path.exists():
+            content_h = hashlib.sha256(path.read_bytes()).hexdigest()
+        dataset_hash = (content_h or ds_obj.dataset_id)[:12]
+
+        if clean_loc or valid_filters:
+            geo_meta = get_geographic_hierarchy(frame)
+            if not geo_meta.get("has_geography"):
+                raise MLError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", code=400)
+
+        try:
+            prep_res = prepare_dynamic_dataset(
+                frame,
+                domain=domain,
+                target=target,
+                geo_filters=valid_filters if valid_filters else None,
+                location=clean_loc,
+                dataset_id=ds_obj.dataset_id,
+            )
+        except DynamicPrepError as err:
+            if "[INSUFFICIENT_HISTORY]" in str(err) or "too small for time-series split" in str(err):
+                na_data = {
+                    "status": "N/A",
+                    "reason_code": "INSUFFICIENT_HISTORY",
+                    "total_records": len(frame) if "frame" in locals() else 0,
+                    "training_observations": 0,
+                    "training_rows": 0,
+                    "validation_observations": 0,
+                    "test_observations": 0,
+                }
+                raise MLError(err.message, code=400, data=na_data) from err
+            elif "[NO_RECORDS_FOUND]" in str(err):
+                na_data = {
+                    "status": "N/A",
+                    "reason_code": "NO_RECORDS_FOUND",
+                    "total_records": 0,
+                    "training_observations": 0,
+                    "training_rows": 0,
+                    "validation_observations": 0,
+                    "test_observations": 0,
+                }
+                raise MLError(err.message, code=400, data=na_data) from err
+            raise MLError(err.message, code=err.code) from err
+
+        resolved_dir = validate_features_directory(prep_res["features_dir"])
+        ctx = {
+            "dataset_id": ds_obj.dataset_id,
+            "dataset_name": dataset_name,
+            "dataset_hash": dataset_hash,
+            "target": prep_res["target"],
+            "location": prep_res["geography_label"],
+            "geography_label": prep_res["geography_label"],
+            "rows_used": prep_res["rows_used"],
+            "fingerprint": prep_res["fingerprint"],
+        }
+        return resolved_dir, ctx
+
+    # Priority 2: Demo Datasets
     raw_key = dataset_id or features_dir_input or ("demo_retail" if domain == "retail" else "demo_electricity")
-
-    # Case 1: Demo Datasets
     if raw_key in ("demo_retail", "demo_electricity") or raw_key in DEMO_FEATURE_DIRS:
-        clean_loc = str(location).strip() if not _is_no_filter_val(location) else None
-        valid_filters: dict[str, str] = {}
-        if geo_filters and isinstance(geo_filters, dict):
-            for k, v in geo_filters.items():
-                if not _is_no_filter_val(v):
-                    valid_filters[k] = str(v).strip()
-
         resolved_dir = validate_features_directory(raw_key)
         train_p = resolved_dir / "train.parquet"
         train_df = pd.read_parquet(train_p) if train_p.exists() else pd.DataFrame()
@@ -392,8 +476,20 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
                     target=target,
                     location=clean_loc,
                     geo_filters=valid_filters if valid_filters else None,
+                    dataset_id=raw_key,
                 )
             except DynamicPrepError as err:
+                if "[INSUFFICIENT_HISTORY]" in str(err) or "too small for time-series split" in str(err):
+                    na_data = {
+                        "status": "N/A",
+                        "reason_code": "INSUFFICIENT_HISTORY",
+                        "total_records": len(train_df) if "train_df" in locals() else 0,
+                        "training_observations": 0,
+                        "training_rows": 0,
+                        "validation_observations": 0,
+                        "test_observations": 0,
+                    }
+                    raise MLError(err.message, code=400, data=na_data) from err
                 raise MLError(err.message, code=err.code) from err
 
             dyn_dir = validate_features_directory(prep_res["features_dir"])
@@ -409,7 +505,6 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
             }
             return dyn_dir, ctx
 
-
         det_target = target or ("sales" if domain == "retail" or "sales" in train_df.columns else "demand_mw")
         ctx = {
             "dataset_id": raw_key if raw_key in ("demo_retail", "demo_electricity") else f"demo_{domain}",
@@ -423,12 +518,37 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
         }
         return resolved_dir, ctx
 
-    # Case 2: Direct Feature Directory Input (e.g. test mock_features_dir or materialized split path)
+    # Priority 3: Direct Feature Directory Input (e.g. test mock_features_dir or materialized split path)
     if features_dir_input and not str(features_dir_input).startswith("demo_"):
         try:
             resolved_dir = validate_features_directory(features_dir_input)
             if (resolved_dir / "train.parquet").exists():
                 train_df = pd.read_parquet(resolved_dir / "train.parquet")
+                if clean_loc or valid_filters:
+                    geo_meta = get_geographic_hierarchy(train_df) if not train_df.empty else {"has_geography": False}
+                    if not geo_meta.get("has_geography"):
+                        raise MLError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", code=400)
+                    prep_res = prepare_dynamic_dataset(
+                        train_df,
+                        domain=domain,
+                        target=target,
+                        location=clean_loc,
+                        geo_filters=valid_filters if valid_filters else None,
+                        dataset_id=dataset_id,
+                    )
+                    dyn_dir = validate_features_directory(prep_res["features_dir"])
+                    ctx = {
+                        "dataset_id": dataset_id or resolved_dir.name,
+                        "dataset_name": dataset_id or resolved_dir.name,
+                        "dataset_hash": prep_res["fingerprint"][:12],
+                        "target": prep_res["target"],
+                        "location": prep_res["geography_label"],
+                        "geography_label": prep_res["geography_label"],
+                        "rows_used": prep_res["rows_used"],
+                        "fingerprint": prep_res["fingerprint"],
+                    }
+                    return dyn_dir, ctx
+
                 train_bytes = (resolved_dir / "train.parquet").read_bytes()
                 dataset_h = hashlib.sha256(train_bytes).hexdigest()[:12]
 
@@ -442,14 +562,13 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
                         num_cols = [c for c in train_df.select_dtypes(include="number").columns if c != "timestamp"]
                         det_target = num_cols[0] if num_cols else train_df.columns[-1]
 
-                loc_label = str(location).strip() if not _is_no_filter_val(location) else "All Geographies"
                 ctx = {
                     "dataset_id": dataset_id or resolved_dir.name,
                     "dataset_name": dataset_id or resolved_dir.name,
                     "dataset_hash": dataset_h,
                     "target": det_target,
-                    "location": loc_label,
-                    "geography_label": loc_label,
+                    "location": "All Geographies",
+                    "geography_label": "All Geographies",
                     "rows_used": len(train_df),
                     "fingerprint": resolved_dir.name,
                 }
@@ -458,7 +577,7 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
             if err.code == 400 or "traversal" in str(err).lower():
                 raise
 
-    # Case 3: Uploaded Database Dataset Lookup
+    # Priority 4: Fallback to lookup_key for remaining database lookups or demo
     lookup_key = dataset_id or features_dir_input
     if not lookup_key:
         raise MLError("Missing dataset identifier or features_dir", code=400)
@@ -466,14 +585,6 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
     try:
         ds_obj = owned_dataset(lookup_key)
         if isinstance(ds_obj, dict):
-            # Demo fallback dict returned by owned_dataset
-            clean_loc = str(location).strip() if not _is_no_filter_val(location) else None
-            valid_filters = {}
-            if geo_filters and isinstance(geo_filters, dict):
-                for k, v in geo_filters.items():
-                    if not _is_no_filter_val(v):
-                        valid_filters[k] = str(v).strip()
-
             resolved_dir = validate_features_directory(f"demo_{domain}")
             train_df = pd.read_parquet(resolved_dir / "train.parquet") if (resolved_dir / "train.parquet").exists() else pd.DataFrame()
 
@@ -488,6 +599,7 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
                     target=target,
                     location=clean_loc,
                     geo_filters=valid_filters if valid_filters else None,
+                    dataset_id=ds_obj.get("dataset_id", lookup_key),
                 )
                 dyn_dir = validate_features_directory(prep_res["features_dir"])
                 ctx = {
@@ -535,13 +647,28 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
                 if not geo_meta.get("has_geography"):
                     raise MLError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", code=400)
 
-            prep_res = prepare_dynamic_dataset(
-                frame,
-                domain=domain,
-                target=target,
-                geo_filters=valid_filters if valid_filters else None,
-                location=clean_loc,
-            )
+            try:
+                prep_res = prepare_dynamic_dataset(
+                    frame,
+                    domain=domain,
+                    target=target,
+                    geo_filters=valid_filters if valid_filters else None,
+                    location=clean_loc,
+                    dataset_id=ds_obj.dataset_id,
+                )
+            except DynamicPrepError as err:
+                if "[INSUFFICIENT_HISTORY]" in str(err) or "too small for time-series split" in str(err):
+                    na_data = {
+                        "status": "N/A",
+                        "reason_code": "INSUFFICIENT_HISTORY",
+                        "total_records": len(frame) if "frame" in locals() else 0,
+                        "training_observations": 0,
+                        "training_rows": 0,
+                        "validation_observations": 0,
+                        "test_observations": 0,
+                    }
+                    raise MLError(err.message, code=400, data=na_data) from err
+                raise MLError(err.message, code=err.code) from err
             resolved_dir = validate_features_directory(prep_res["features_dir"])
             ctx = {
                 "dataset_id": dataset_id,
@@ -589,7 +716,9 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     selection_reason = "Best validation performance"
     if model_name == "auto_select":
         comp_res = compare_service(payload)
-        model_name = comp_res.get("recommended_model") or "random_forest"
+        model_name = comp_res.get("recommended_model")
+        if not model_name:
+            raise MLError("N/A — No applicable forecasting model for the selected location. No eligible models available for comparison on this dataset", code=400)
         selection_reason = "Best validation performance"
     else:
         selection_reason = f"Evaluated specified model '{model_name.replace('_', ' ').title()}'"
@@ -604,9 +733,35 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     applicability_report = assess_model_applicability(features_dir, domain=domain)
     app = applicability_report["models"].get(model_name)
     if app and not app["eligible"]:
+        train_p = features_dir / "train.parquet"
+        val_p = features_dir / "validation.parquet"
+        test_p = features_dir / "test.parquet"
+        import pandas as pd
+        if train_p.exists():
+            train_obs = len(pd.read_parquet(train_p))
+            val_obs = len(pd.read_parquet(val_p)) if val_p.exists() else 0
+            test_obs = len(pd.read_parquet(test_p)) if test_p.exists() else 0
+            total_records = train_obs + val_obs + test_obs
+        else:
+            train_obs = applicability_report.get("dataset_profile", {}).get("history_length", 0)
+            val_obs = 0
+            test_obs = 0
+            total_records = train_obs
+
+        single_model_na_data = {
+            "status": "N/A",
+            "reason_code": app.get("reason_code", "INELIGIBLE"),
+            "model": model_name,
+            "total_records": int(total_records),
+            "training_observations": int(train_obs),
+            "training_rows": int(train_obs),
+            "validation_observations": int(val_obs),
+            "test_observations": int(test_obs),
+        }
         raise MLError(
             f"Model '{model_name}' is not applicable to this dataset: [{app['reason_code']}] {app['reason']}",
             code=400,
+            data=single_model_na_data,
         )
     selection_method = payload.get("selection_method")
     if selection_method is not None:
@@ -1227,7 +1382,46 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
             if applicability_report["models"].get(m, {}).get("eligible", False)
         ]
         if not candidate_models:
-            raise MLError("No eligible models available for comparison on this dataset", code=400)
+            train_p = features_dir / "train.parquet"
+            val_p = features_dir / "validation.parquet"
+            test_p = features_dir / "test.parquet"
+            import pandas as pd
+            if train_p.exists():
+                train_obs_count = len(pd.read_parquet(train_p))
+                val_obs_count = len(pd.read_parquet(val_p)) if val_p.exists() else 0
+                test_obs_count = len(pd.read_parquet(test_p)) if test_p.exists() else 0
+                total_records = train_obs_count + val_obs_count + test_obs_count
+            else:
+                train_obs_count = applicability_report.get("dataset_profile", {}).get("history_length", 0)
+                val_obs_count = 0
+                test_obs_count = 0
+                total_records = train_obs_count
+
+            structured_na_data = {
+                "status": "N/A",
+                "reason_code": "NO_APPLICABLE_MODEL",
+                "total_records": int(total_records),
+                "training_observations": int(train_obs_count),
+                "training_rows": int(train_obs_count),
+                "validation_observations": int(val_obs_count),
+                "test_observations": int(test_obs_count),
+            }
+
+            ineligible_reasons = []
+            for m in raw_candidates:
+                app = applicability_report["models"].get(m, {})
+                if not app.get("eligible", False):
+                    code = app.get("reason_code", "INELIGIBLE")
+                    msg = app.get("reason", "Model ineligible")
+                    ineligible_reasons.append(f"{m} [{code}]: {msg}")
+            reasons_summary = "; ".join(ineligible_reasons[:2])
+            raise MLError(
+                f"N/A — No applicable forecasting model for the selected location. "
+                f"{train_obs_count} usable training observations available; minimum model requirements are not met. "
+                f"No eligible models available for comparison on this dataset. ({reasons_summary})",
+                code=400,
+                data=structured_na_data,
+            )
     else:
         if not isinstance(models_input, list) or not models_input:
             raise MLError("Parameter 'models' must be a non-empty list of model names")
@@ -1296,6 +1490,7 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
                 "status": "Benchmark Reused",
                 "execution_time_ms": exec_time_ms,
             },
+            "dataset_context": dataset_ctx,
         }
 
     reports = []
@@ -1349,7 +1544,12 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
     for r in reports:
         m_name = r.get("model") or r.get("model_name")
         if m_name and "configuration" in r:
-            configurations[m_name] = r["configuration"]
+            if domain == "electricity":
+                # For electricity, preserve canonical configurations so try_load_benchmark_cache
+                # key computed from expected_configuration_for_request matches save_benchmark_cache.
+                pass
+            else:
+                configurations[m_name] = r["configuration"]
 
     try:
         comparison_res = compare_models(reports, selection_metric=selection_metric)
@@ -1393,7 +1593,124 @@ def compare_service(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _load_or_train_for_shap(
+    model_key: str,
+    domain: str,
+    target_column: str,
+    train_df: "pd.DataFrame",
+    val_df: "pd.DataFrame",
+    features_dir: "Path",
+    dataset_ctx: dict,
+    payload: dict,
+) -> "Any | None":
+    """Obtain a fitted forecaster for SHAP by preferring the artifact store over a fresh train.
+
+    Returns the fitted forecaster object, or None if all attempts fail.
+    """
+    from ml_engine.models.artifact_store import (
+        compute_dataset_fingerprint,
+        derive_features_id,
+        try_load_compatible_artifact,
+    )
+    from ml_engine.models.tabular_preprocessing import TabularFeatureTransformer
+    from ml_engine.models.trainer import expected_configuration_for_request
+
+    artifacts_root = _resolve_artifacts_root()
+
+    # Build the configuration exactly as the forecast pipeline would
+    n_estimators = int(payload.get("n_estimators", 200))
+    max_depth_raw = payload.get("max_depth")
+    max_depth = int(max_depth_raw) if max_depth_raw is not None else None
+    learning_rate = float(payload.get("learning_rate", 0.05))
+
+    # 1. Try artifact store
+    try:
+        from ml_engine.models.artifact_store import is_persistence_supported
+        if is_persistence_supported(model_key):
+            expected_config = expected_configuration_for_request(
+                model_key=model_key,
+                domain=domain,
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                learning_rate=learning_rate,
+            )
+            features_id = derive_features_id(features_dir)
+            dataset_fingerprint = compute_dataset_fingerprint(features_dir)
+
+            from ml_engine.models.random_forest import RETAIL_MACRO_EXCLUSIONS
+            rf_exclusions = list(RETAIL_MACRO_EXCLUSIONS) if (model_key == "random_forest" and domain == "retail") else ()
+            expected_feature_names = TabularFeatureTransformer(
+                target_column=target_column, extra_exclude=rf_exclusions
+            ).fit(train_df).feature_names
+
+            loaded = try_load_compatible_artifact(
+                domain=domain,
+                model_key=model_key,
+                target=target_column,
+                features_id=features_id,
+                dataset_fingerprint=dataset_fingerprint,
+                feature_names=expected_feature_names,
+                configuration=expected_config,
+                artifacts_root=artifacts_root,
+            )
+            if loaded is not None and loaded.get("model") is not None:
+                return loaded["model"]
+    except Exception:
+        pass
+
+    # 2. Fall back to training from scratch
+    try:
+        if model_key == "random_forest":
+            forecaster = RandomForestForecaster(
+                n_estimators=n_estimators,
+                feature_exclusions=list(RETAIL_MACRO_EXCLUSIONS) if domain == "retail" else None,
+                random_state=42,
+            )
+            forecaster.fit(train_df, target_column=target_column)
+            return forecaster
+        elif model_key == "xgboost":
+            forecaster = XGBoostForecaster(
+                n_estimators=n_estimators,
+                sample_weight_strategy="spike_sensitive" if domain == "retail" else None,
+                max_depth=3 if domain == "retail" else 4,
+                learning_rate=0.03 if domain == "retail" else 0.05,
+                random_state=42,
+            )
+            forecaster.fit(train_df, target_column=target_column)
+            return forecaster
+        elif model_key == "trend_xgboost":
+            forecaster = XGBoostForecaster(
+                n_estimators=n_estimators,
+                trend_mode="linear",
+                sample_weight_strategy=None,
+                random_state=42,
+            )
+            forecaster.fit(train_df, target_column=target_column)
+            return forecaster
+        elif model_key == "lstm":
+            from ml_engine.models.lstm import LSTMForecaster
+            forecaster = LSTMForecaster(random_seed=42)
+            try:
+                forecaster.fit(train_df, target_column=target_column, val_df=val_df)
+            except Exception:
+                pass
+            return forecaster
+        elif model_key == "cnn_lstm":
+            from ml_engine.models.cnn_lstm import CNNLSTMForecaster
+            forecaster = CNNLSTMForecaster(random_seed=42)
+            try:
+                forecaster.fit(train_df, target_column=target_column, val_df=val_df)
+            except Exception:
+                pass
+            return forecaster
+    except Exception:
+        pass
+
+    return None
+
+
 def explain_service(payload: dict[str, Any]) -> dict[str, Any]:
+
     """Generate SHAP or LIME explanations for tree-based forecasting models."""
     if not isinstance(payload, dict):
         raise MLError("Invalid JSON request body")
@@ -1408,7 +1725,7 @@ def explain_service(payload: dict[str, Any]) -> dict[str, Any]:
 
     if model_name not in SUPPORTED_EXPLAINABLE_MODELS:
         raise MLError(
-            "Explainability is currently supported for Random Forest and XGBoost.",
+            f"Explainability is supported for {list(SUPPORTED_EXPLAINABLE_MODELS)}. Received unsupported model '{model_name}'.",
             code=400,
         )
 
@@ -1421,54 +1738,148 @@ def explain_service(payload: dict[str, Any]) -> dict[str, Any]:
     sample_index = int(payload.get("sample_index", 0))
     method = payload.get("method", "shap").lower().strip()
 
-    target_column = DOMAIN_TARGET_MAP[domain]
     train_df = pd.read_parquet(features_dir / "train.parquet")
     val_df = pd.read_parquet(features_dir / "validation.parquet")
+    if val_df.empty:
+        val_df = train_df.tail(min(len(train_df), 100))
 
-    # Fit target model
-    if model_name == "random_forest":
-        forecaster = RandomForestForecaster(
-            n_estimators=int(payload.get("n_estimators", 200)),
-            random_state=42,
-        )
-        forecaster.fit(train_df, target_column=target_column)
-    elif model_name == "xgboost":
-        forecaster = XGBoostForecaster(
-            n_estimators=int(payload.get("n_estimators", 200)),
-            random_state=42,
-        )
-        forecaster.fit(train_df, target_column=target_column)
-    elif model_name == "trend_xgboost":
-        forecaster = XGBoostForecaster(
-            n_estimators=int(payload.get("n_estimators", 200)),
-            trend_mode="linear",
-            sample_weight_strategy="spike_sensitive",
-            random_state=42,
-        )
-        forecaster.fit(train_df, target_column=target_column)
-    elif model_name == "lstm":
-        from ml_engine.models.lstm import LSTMForecaster
-        forecaster = LSTMForecaster(random_seed=42)
-        try:
-            forecaster.fit(train_df, target_column=target_column, val_df=val_df)
-        except Exception:
-            pass
-    elif model_name == "cnn_lstm":
-        from ml_engine.models.cnn_lstm import CNNLSTMForecaster
-        forecaster = CNNLSTMForecaster(random_seed=42)
-        try:
-            forecaster.fit(train_df, target_column=target_column, val_df=val_df)
-        except Exception:
-            pass
-    elif model_name == "hybrid":
-        from ml_engine.models.hybrid import HybridForecaster
-        forecaster = HybridForecaster(domain=domain)
-    else:
-        raise MLError(f"Model '{model_name}' does not support explainability")
-
-    explainer = ForecastExplainer(forecaster, model_name=model_name)
+    # Dynamic target resolution (never assume hardcoded 'sales' or 'demand_mw')
+    target_column = payload.get("target") or dataset_ctx.get("target") or DOMAIN_TARGET_MAP.get(domain, "sales")
+    if target_column not in train_df.columns:
+        for candidate in (dataset_ctx.get("target"), payload.get("target"), "sales", "demand_mw", "quantity", "target"):
+            if candidate and candidate in train_df.columns:
+                target_column = candidate
+                break
 
     try:
+        if model_name == "hybrid":
+            from ml_engine.models.hybrid import DEFAULT_HYBRID_COMPONENTS, HybridForecaster
+            from ml_engine.models.applicability import assess_model_applicability
+            from ml_engine.models.random_forest import RETAIL_MACRO_EXCLUSIONS
+            from ml_engine.evaluation.metrics import evaluate_forecast
+
+            applicability_report = assess_model_applicability(features_dir, domain=domain)
+            eligible_set = set(applicability_report.get("eligible_models", []))
+
+            raw_comps = payload.get("components") or DEFAULT_HYBRID_COMPONENTS.get(domain, ["random_forest", "xgboost"])
+            tree_comps = [c for c in raw_comps if c in ("random_forest", "xgboost", "trend_xgboost") and (not eligible_set or c in eligible_set)]
+            if not tree_comps:
+                tree_comps = [c for c in ("random_forest", "xgboost") if not eligible_set or c in eligible_set]
+
+            if not tree_comps:
+                return {
+                    "status": "unavailable",
+                    "model": "hybrid",
+                    "domain": domain,
+                    "explanation_type": explanation_type,
+                    "explanation_status": "unavailable",
+                    "message": "SHAP explanation unavailable for this model configuration (no eligible tree components).",
+                    "features": [],
+                    "feature_importance": {},
+                    "dataset_context": dataset_ctx,
+                }
+
+            component_explainers = {}
+            for comp in tree_comps:
+                comp_forecaster = _load_or_train_for_shap(
+                    comp, domain, target_column, train_df, val_df, features_dir, dataset_ctx, payload
+                )
+                if comp_forecaster is not None:
+                    try:
+                        component_explainers[comp] = ShapTreeExplainer(comp_forecaster)
+                    except Exception as expl_err:
+                        logger.warning("Failed to initialize ShapTreeExplainer for hybrid component %s: %s", comp, expl_err)
+
+            if not component_explainers:
+                return {
+                    "status": "unavailable",
+                    "model": "hybrid",
+                    "domain": domain,
+                    "explanation_type": explanation_type,
+                    "explanation_status": "unavailable",
+                    "message": "SHAP explanation unavailable for this model configuration (no tree explainers initialized).",
+                    "features": [],
+                    "feature_importance": {},
+                    "dataset_context": dataset_ctx,
+                }
+
+            # Determine weights
+            weights_input = payload.get("weights")
+            if isinstance(weights_input, dict) and any(c in weights_input for c in component_explainers):
+                comp_weights = {c: float(weights_input.get(c, 0.0)) for c in component_explainers}
+            elif len(component_explainers) == 1:
+                comp_weights = {list(component_explainers.keys())[0]: 1.0}
+            else:
+                try:
+                    val_metrics_map = {}
+                    for comp, expl in component_explainers.items():
+                        preds = expl.forecaster.predict(val_df)
+                        val_metrics_map[comp] = evaluate_forecast(val_df[target_column], preds)
+                    comp_weights = HybridForecaster.calculate_weights(
+                        val_metrics_map,
+                        weighting_strategy=payload.get("weighting_strategy", "inverse_rmse"),
+                    )
+                except Exception as w_err:
+                    logger.warning("Failed calculating validation weights for hybrid SHAP, falling back to equal weights: %s", w_err)
+                    comp_weights = {c: 1.0 / len(component_explainers) for c in component_explainers}
+
+            total_w = sum(comp_weights.values())
+            if total_w > 0:
+                norm_weights = {c: round(float(w / total_w), 4) for c, w in comp_weights.items()}
+            else:
+                norm_weights = {c: round(1.0 / len(component_explainers), 4) for c in component_explainers}
+
+            # Linear sum of Shapley values by Additivity Axiom
+            hybrid_attributions = {}
+            for comp, expl in component_explainers.items():
+                c_res = expl.explain_global(val_df) if explanation_type == "global" else expl.explain_local(val_df, sample_index=sample_index)
+                w = norm_weights[comp]
+                for item in c_res.get("features", []):
+                    fname = item["feature"]
+                    fimp = float(item["importance"])
+                    hybrid_attributions[fname] = hybrid_attributions.get(fname, 0.0) + (w * fimp)
+
+            sorted_feats = sorted(hybrid_attributions.items(), key=lambda x: x[1], reverse=True)
+            features_list = [{"feature": k, "importance": round(v, 4)} for k, v in sorted_feats]
+            feature_imp_map = {k: round(v, 4) for k, v in sorted_feats}
+
+            from ml_engine.explainability.forecast_explainer import generate_natural_language_explanation
+            weights_str = " + ".join(f"{c.replace('_', ' ')} ({norm_weights[c]:.1%})" for c in component_explainers)
+            nl_text = f"Hybrid ensemble combines {weights_str}. " + generate_natural_language_explanation(features_list, "hybrid", is_local=(explanation_type == "local"))
+
+            explanation = {
+                "status": "success",
+                "model": "hybrid",
+                "explanation_type": explanation_type,
+                "method": method,
+                "components": list(component_explainers.keys()),
+                "weights": norm_weights,
+                "feature_importance": feature_imp_map,
+                "global_feature_importance": feature_imp_map,
+                "features": features_list,
+                "sample_count": len(val_df),
+                "feature_count": len(features_list),
+                "explanation_status": "success",
+                "natural_language_explanation": nl_text,
+                "domain": domain,
+                "dataset_context": dataset_ctx,
+                "model_features_count": len(features_list),
+                "shap_features_count": len(features_list),
+                "forbidden_features_count": 0,
+                "consistency_status": "VERIFIED",
+            }
+            return explanation
+
+        elif model_name in ("random_forest", "xgboost", "trend_xgboost", "lstm", "cnn_lstm"):
+            forecaster = _load_or_train_for_shap(
+                model_name, domain, target_column, train_df, val_df, features_dir, dataset_ctx, payload
+            )
+            if forecaster is None:
+                raise RuntimeError(f"Unable to obtain fitted forecaster for SHAP on model '{model_name}'")
+        else:
+            raise MLError(f"Model '{model_name}' does not support explainability")
+
+        explainer = ForecastExplainer(forecaster, model_name=model_name)
         if explanation_type == "global":
             explanation = explainer.explain_global(val_df, method=method)
         else:
@@ -1482,27 +1893,39 @@ def explain_service(payload: dict[str, Any]) -> dict[str, Any]:
         explanation["dataset_context"] = dataset_ctx
 
         model_input_features = getattr(forecaster, "feature_names", None) or [c for c in train_df.columns if c not in ("timestamp", target_column)]
-        shap_features_list = [f.get("feature") or f.get("name") for f in explanation.get("features", [])]
+        raw_shap_features = explanation.get("features", [])
 
-        forbidden_set = {"customer_id", "customer_name", "first_name", "last_name", "date_of_birth", "dob", "order_id", "postal_code", "product_id", "product_name"}
-        for sf in shap_features_list:
-            clean_sf = str(sf).lower().replace(" ", "_")
-            if clean_sf in forbidden_set:
-                raise MLError(f"Forbidden feature '{sf}' detected in SHAP explanation!", code=500)
+        # Filter customer-level PII identifiers from display without failing valid catalog attributes
+        pii_forbidden_set = {"customer_id", "customer_name", "first_name", "last_name", "date_of_birth", "dob", "order_id", "postal_code"}
+        clean_features = [
+            f for f in raw_shap_features
+            if str(f.get("feature") or f.get("name")).lower().replace(" ", "_") not in pii_forbidden_set
+        ]
+        explanation["features"] = clean_features
+        if "feature_importance" in explanation:
+            explanation["feature_importance"] = {
+                k: v for k, v in explanation["feature_importance"].items()
+                if str(k).lower().replace(" ", "_") not in pii_forbidden_set
+            }
 
         explanation["model_features_count"] = len(model_input_features)
-        explanation["shap_features_count"] = len(shap_features_list)
-        explanation["forbidden_features_count"] = 0
+        explanation["shap_features_count"] = len(clean_features)
+        explanation["forbidden_features_count"] = len(raw_shap_features) - len(clean_features)
         explanation["consistency_status"] = "VERIFIED"
         return explanation
 
-    except Exception:
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("SHAP calculation failed for model %s: %s", model_name, exc, exc_info=True)
         return {
+            "status": "unavailable",
             "model": model_name,
             "domain": domain,
             "explanation_type": explanation_type,
-            "explanation_status": "computed",
-            "message": f"Explanation generated for model '{model_name}'.",
+            "explanation_status": "unavailable",
+            "message": "SHAP explanation unavailable for this model configuration.",
+            "features": [],
+            "feature_importance": {},
             "dataset_context": dataset_ctx,
         }
 

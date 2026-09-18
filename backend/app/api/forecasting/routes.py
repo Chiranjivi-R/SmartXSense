@@ -15,7 +15,10 @@ from . import forecasting_bp
 
 
 def _error_response(err: MLError):
-    return jsonify({"status": "error", "code": err.code, "message": err.message}), err.code
+    resp = {"status": "error", "code": err.code, "message": err.message}
+    if getattr(err, "data", None) is not None:
+        resp["data"] = err.data
+    return jsonify(resp), err.code
 
 
 def _internal_error():

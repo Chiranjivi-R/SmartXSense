@@ -574,8 +574,11 @@ def profile_dataset_service(dataset: Dataset | dict, domain: str | None = None, 
     return profile
 
 
-def get_dataset_geography_service(dataset: Dataset | dict, geo_filters: dict[str, str] | None = None) -> dict:
+def get_dataset_geography_service(dataset: Dataset | dict | str, geo_filters: dict[str, str] | None = None) -> dict:
     from ml_engine.preprocessing.intelligence import get_geographic_hierarchy
+
+    if isinstance(dataset, str):
+        dataset = owned_dataset(dataset)
 
     if isinstance(dataset, dict):
         features_dir_rel = dataset.get("features_dir")

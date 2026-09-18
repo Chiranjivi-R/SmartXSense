@@ -825,18 +825,6 @@ def profile_dataset(df: pd.DataFrame, domain: str = "retail", requested_target: 
     }
 
 
-def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Inspect dataset geographic columns and return available cascading options, locations list, and row counts."""
-    filters = active_filters or {}
-    col_map: dict[str, str] = {}
-    for col in df.columns:
-        clean = _clean_name(col)
-        if clean in {"country", "country_name", "nation"} and "country" not in col_map:
-            col_map["country"] = str(col)
-        elif clean in {"state", "province", "state_name"} and "state" not in col_map:
-            col_map["state"] = str(col)
-        elif clean in {"district", "county", "district_name"} and "district" not in col_map:
-            col_map["district"] = str(col)
 def _is_no_filter_val(val: Any) -> bool:
     """Return True if the filter value represents an unselected / 'All' placeholder."""
     if val is None:
@@ -979,7 +967,12 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
         "available_locations": sorted(list(all_locs)),
         "active_filters": filters,
         "filtered_rows": len(filtered),
+        "total_records": len(filtered),
         "total_rows": len(df),
+        "training_rows": int(len(filtered) * 0.70),
+        "training_observations": int(len(filtered) * 0.70),
+        "validation_observations": int(len(filtered) * 0.15),
+        "test_observations": max(0, len(filtered) - int(len(filtered) * 0.70) - int(len(filtered) * 0.15)),
     }
 
 

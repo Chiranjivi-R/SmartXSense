@@ -35,7 +35,11 @@ async function parseJsonResponse(response) {
     const baseMessage = data.message || `Request failed with status ${response.status}`;
     // Include HTTP status code so the UI can display: "HTTP 500 — ..."
     const statusPrefix = !response.ok ? `HTTP ${response.status} — ` : '';
-    throw new Error(`${statusPrefix}${baseMessage}${details}`);
+    const err = new Error(`${statusPrefix}${baseMessage}${details}`);
+    err.status = response.status;
+    err.data = data.data;
+    err.raw = data;
+    throw err;
   }
   return data.data;
 }
@@ -154,7 +158,8 @@ export async function runForecast({
   selectionMethod,
   forceRetrain = false,
 }) {
-  const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
+  const isDemo = !datasetId || datasetId.startsWith('demo_');
+  const targetFeaturesDir = featuresDir || (isDemo ? (DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail) : undefined);
   const body = {
     domain,
     model,
@@ -191,7 +196,8 @@ export async function fetchForecastHistory({ domain, model, limit = 20 } = {}) {
 }
 
 export async function runFutureForecast({ domain, model, datasetId, target, location, geoFilters, horizon, featuresDir }) {
-  const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
+  const isDemo = !datasetId || datasetId.startsWith('demo_');
+  const targetFeaturesDir = featuresDir || (isDemo ? (DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail) : undefined);
   const response = await fetch(`${API_BASE_URL}/api/v1/forecasting/future`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -211,7 +217,8 @@ export async function runFutureForecast({ domain, model, datasetId, target, loca
 }
 
 export async function compareModels({ domain, datasetId, target, location, geoFilters, featuresDir, selectionMetric = 'rmse', models }) {
-  const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
+  const isDemo = !datasetId || datasetId.startsWith('demo_');
+  const targetFeaturesDir = featuresDir || (isDemo ? (DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail) : undefined);
   const body = {
     domain,
     dataset_id: datasetId,
@@ -234,7 +241,8 @@ export async function compareModels({ domain, datasetId, target, location, geoFi
 }
 
 export async function explainForecast({ domain, model, datasetId, target, location, geoFilters, featuresDir, explanationType = 'global', method = 'shap' }) {
-  const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
+  const isDemo = !datasetId || datasetId.startsWith('demo_');
+  const targetFeaturesDir = featuresDir || (isDemo ? (DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail) : undefined);
   const response = await fetch(`${API_BASE_URL}/api/v1/explainability/explain`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -255,7 +263,8 @@ export async function explainForecast({ domain, model, datasetId, target, locati
 }
 
 export async function fetchLlmExplanation({ domain, model, datasetId, target, location, geoFilters, featuresDir }) {
-  const targetFeaturesDir = featuresDir || DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail;
+  const isDemo = !datasetId || datasetId.startsWith('demo_');
+  const targetFeaturesDir = featuresDir || (isDemo ? (DOMAIN_FEATURE_ARTIFACTS[domain] || DOMAIN_FEATURE_ARTIFACTS.retail) : undefined);
   const response = await fetch(`${API_BASE_URL}/api/v1/explainability/llm-explanation`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

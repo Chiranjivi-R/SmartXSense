@@ -60,9 +60,18 @@ class ShapTreeExplainer:
 
     def explain_global(self, eval_df: pd.DataFrame, max_samples: int = 100) -> dict[str, Any]:
         """Compute global feature importances based on mean absolute SHAP values."""
+        effective_max = max_samples
+        if hasattr(self.model, "estimators_"):
+            try:
+                total_nodes = sum(getattr(t.tree_, "node_count", 0) for t in self.model.estimators_)
+                if total_nodes > 1_000_000:
+                    effective_max = min(max_samples, 5)
+            except Exception:
+                pass
+
         sample_df = eval_df
-        if len(eval_df) > max_samples:
-            sample_df = eval_df.iloc[-max_samples:]
+        if len(eval_df) > effective_max:
+            sample_df = eval_df.iloc[-effective_max:]
 
         X_trans = self._get_transformed_features(sample_df)
         try:

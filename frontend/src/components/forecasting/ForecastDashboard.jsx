@@ -26,6 +26,11 @@ import {
   exportTestForecastCsv,
   exportTestForecastJson,
 } from '../../utils/forecastExport';
+import {
+  isApplicabilityNaError,
+  parseApplicabilityDetails,
+  formatUserFacingError,
+} from '../../utils/applicabilityPresentation';
 
 const COLORS = {
   primary: '#00D4FF',
@@ -115,8 +120,97 @@ const DOMAIN_CONTEXTS = {
 };
 
 /**
- * Render a markdown-formatted LLM explanation (with ### headings) as styled React elements.
- * Prevents ### characters from appearing literally in the UI.
+ * Clean markdown emphasis and backticks from heading text, preserving emojis and titles.
+ */
+function cleanHeadingText(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replace(/\*\*\*/g, '')
+    .replace(/\*\*/g, '')
+    .replace(/(^|\s)\*([^*]+)\*(\s|$)/g, '$1$2$3')
+    .replace(/`([^`]+)`/g, '$1')
+    .trim();
+}
+
+/**
+ * Render inline markdown (bold, italic, code) into styled React elements.
+ * Transforms **text** to visually emphasized bold text and *text* to italic,
+ * preventing literal markdown asterisks from appearing in the UI while
+ * preserving mathematical notation (e.g. 2 * 3).
+ */
+function renderInlineMarkdown(text, keyPrefix = 'inline') {
+  if (typeof text !== 'string' || !text) return text;
+
+  // Match inline markdown tokens:
+  // 1. ***bold italic***
+  // 2. **bold**
+  // 3. *italic* (non-whitespace bounded to prevent matching arithmetic multiplication like `2 * 3`)
+  // 4. `inline code`
+  const tokenRegex = /(\*\*\*(?!\s)[^*]+?(?<!\s)\*\*\*|\*\*(?!\s)[^*]+?(?<!\s)\*\*|\*(?!\s)[^*]+?(?<!\s)\*|`[^`]+`)/g;
+
+  const elements = [];
+  let lastIndex = 0;
+  let match;
+
+  while ((match = tokenRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      const rawChunk = text.slice(lastIndex, match.index);
+      // Clean any accidental dangling unclosed ** markers in raw text chunk
+      elements.push(rawChunk.replace(/\*\*/g, ''));
+    }
+
+    const token = match[0];
+    const key = `${keyPrefix}-${match.index}`;
+
+    if (token.startsWith('***') && token.endsWith('***')) {
+      elements.push(
+        <strong key={key} style={{ fontWeight: 700, fontStyle: 'italic', color: COLORS.text.primary }}>
+          {token.slice(3, -3)}
+        </strong>
+      );
+    } else if (token.startsWith('**') && token.endsWith('**')) {
+      elements.push(
+        <strong key={key} style={{ fontWeight: 700, color: COLORS.text.primary }}>
+          {token.slice(2, -2)}
+        </strong>
+      );
+    } else if (token.startsWith('*') && token.endsWith('*')) {
+      elements.push(
+        <em key={key} style={{ fontStyle: 'italic' }}>
+          {token.slice(1, -1)}
+        </em>
+      );
+    } else if (token.startsWith('`') && token.endsWith('`')) {
+      elements.push(
+        <code
+          key={key}
+          style={{
+            fontFamily: "'Space Mono', monospace",
+            background: 'rgba(255, 255, 255, 0.08)',
+            padding: '1px 5px',
+            borderRadius: 4,
+            fontSize: '0.9em',
+          }}
+        >
+          {token.slice(1, -1)}
+        </code>
+      );
+    }
+
+    lastIndex = match.index + token.length;
+  }
+
+  if (lastIndex < text.length) {
+    const trailingChunk = text.slice(lastIndex);
+    elements.push(trailingChunk.replace(/\*\*/g, ''));
+  }
+
+  return elements.length > 0 ? elements : text.replace(/\*\*/g, '');
+}
+
+/**
+ * Render a markdown-formatted LLM explanation (with ### headings, bullets, and inline emphasis)
+ * as styled React elements. Prevents raw ### and ** characters from appearing literally in the UI.
  */
 function renderMarkdownExplanation(text) {
   if (!text) return null;
@@ -130,7 +224,7 @@ function renderMarkdownExplanation(text) {
       if (joined) {
         elements.push(
           <p key={`p-${key}`} style={{ margin: '0 0 6px 0', lineHeight: 1.65, color: COLORS.text.primary }}>
-            {joined}
+            {renderInlineMarkdown(joined, `p-${key}`)}
           </p>
         );
       }
@@ -139,14 +233,15 @@ function renderMarkdownExplanation(text) {
   };
 
   lines.forEach((line, idx) => {
-    const h3Match = line.match(/^###\s+(.+)/);
-    const h2Match = line.match(/^##\s+(.+)/);
-    const h1Match = line.match(/^#\s+(.+)/);
-    const bulletMatch = line.match(/^[-*]\s+(.+)/);
+    const headingMatch = line.match(/^\s*#{1,4}\s+(.+)/);
+    const standaloneHeadingMatch = !headingMatch && line.match(/^\s*(?:[^\w\s]+\s*)?\*\*(Situation|Why\s*(?:\/|or)?\s*Possible Causes|Recommended Actions\s*(?:\/|and|&)?\s*Remedies|Precautions|AI Forecast Summary)\*\*:?\s*$/i);
+    const bulletMatch = line.match(/^\s*[-*•]\s+(.+)/);
+    const numberedMatch = line.match(/^\s*(\d+\.)\s+(.+)/);
 
-    if (h1Match || h2Match || h3Match) {
+    if (headingMatch || standaloneHeadingMatch) {
       flushParagraph(idx);
-      const headingText = (h3Match || h2Match || h1Match)[1];
+      const headingRaw = headingMatch ? headingMatch[1] : standaloneHeadingMatch[0];
+      const headingText = cleanHeadingText(headingRaw);
       elements.push(
         <div key={`h-${idx}`} style={{
           fontSize: 13,
@@ -165,7 +260,15 @@ function renderMarkdownExplanation(text) {
       elements.push(
         <div key={`b-${idx}`} style={{ display: 'flex', gap: 6, marginBottom: 4, color: COLORS.text.primary, fontSize: 14, lineHeight: 1.6 }}>
           <span style={{ color: COLORS.primary, flexShrink: 0 }}>•</span>
-          <span>{bulletMatch[1]}</span>
+          <span>{renderInlineMarkdown(bulletMatch[1], `b-${idx}`)}</span>
+        </div>
+      );
+    } else if (numberedMatch) {
+      flushParagraph(idx);
+      elements.push(
+        <div key={`num-${idx}`} style={{ display: 'flex', gap: 6, marginBottom: 4, color: COLORS.text.primary, fontSize: 14, lineHeight: 1.6 }}>
+          <span style={{ color: COLORS.primary, fontWeight: 700, flexShrink: 0, minWidth: 18 }}>{numberedMatch[1]}</span>
+          <span>{renderInlineMarkdown(numberedMatch[2], `num-${idx}`)}</span>
         </div>
       );
     } else if (line.trim() === '') {
@@ -195,6 +298,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
   const [compareError, setCompareError] = useState(null);
 
   const [autoSelectedModel, setAutoSelectedModel] = useState(null);
+  const [autoSelectReason, setAutoSelectReason] = useState(null);
 
   const [explainLoading, setExplainLoading] = useState(false);
   const [explainData, setExplainData] = useState(null);
@@ -328,13 +432,13 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
   };
 
 
-  const getActiveFeaturesDir = (override) => {
+  const getActiveFeaturesDir = (override, activeDsId = selectedDatasetId) => {
     if (override !== undefined) return override;
-    const dsObj = datasetsList.find((d) => d.dataset_id === selectedDatasetId);
-    if (dsObj) {
-      return dsObj.features_dir || dsObj.dataset_id;
+    const dsObj = datasetsList.find((d) => d.dataset_id === activeDsId);
+    if (dsObj && dsObj.features_dir) {
+      return dsObj.features_dir;
     }
-    return customFeaturesDir || undefined;
+    return undefined;
   };
 
   const handleExport = (kind, format) => {
@@ -385,7 +489,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       const list = await loadDatasets(initialDomain);
       const defaultDs = list[0];
       if (defaultDs?.dataset_id) {
-        await handleDatasetChange(defaultDs.dataset_id, initialDomain, 'random_forest');
+        await handleDatasetChange(defaultDs.dataset_id, initialDomain, 'auto_select');
       }
       loadForecastHistory();
     };
@@ -396,11 +500,8 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
   const handleDomainSwitch = async (newDomain) => {
     if (!['retail', 'electricity'].includes(newDomain)) return;
     domainRequestToken.current += 1;
-    const validModel = newDomain === 'retail' && model === 'arima'
-      ? 'random_forest'
-      : model;
     setDomain(newDomain);
-    setModel(validModel);
+    setModel('auto_select');
     setUploadDomain(newDomain);
     setGeoFilters({ country: '', state: '', district: '', region: '', city: '', location: '' });
     setSelectedLocation('');
@@ -420,24 +521,29 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     const list = await loadDatasets(newDomain);
     const defaultDs = list[0];
     if (defaultDs?.dataset_id) {
-      await handleDatasetChange(defaultDs.dataset_id, newDomain, validModel);
+      await handleDatasetChange(defaultDs.dataset_id, newDomain, 'auto_select');
     }
   };
 
   // Unified dynamic dataset change handler
-  const handleDatasetChange = async (selectedId) => {
-    const targetDomain = domain;
-    const targetModel = model;
+  const handleDatasetChange = async (selectedId, newDomain = undefined, modelOverride = undefined) => {
+    const targetDomain = newDomain || domain;
+    const targetModel = modelOverride || 'auto_select';
     if (!selectedId) return;
     domainRequestToken.current += 1;
     const requestToken = domainRequestToken.current;
 
     // Step 1: Wipe all old state and graph immediately
     setSelectedDatasetId(selectedId);
+    setModel(targetModel);
+    setCustomFeaturesDir(null);
+    setGeoMeta(null);
     setForecastData(null);
     setCompareData(null);
     setExplainData(null);
     setFutureData(null);
+    setAutoSelectedModel(null);
+    setAutoSelectReason(null);
     setForecastError(null);
     setCompareError(null);
     setExplainError(null);
@@ -467,24 +573,23 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         targetFilters = { ...targetFilters, location: targetLoc };
         setSelectedLocation(targetLoc);
         setGeoFilters(targetFilters);
-        loadDatasetGeography(selectedId, targetFilters, targetLoc);
+        const locGeo = await loadDatasetGeography(selectedId, targetFilters, targetLoc);
+        handleRunForecast(targetModel, targetDomain, undefined, false, targetFilters, targetLoc, locGeo, selectedId);
       } else {
         setSelectedLocation('');
         setGeoFilters(targetFilters);
+        handleRunForecast(targetModel, targetDomain, undefined, false, targetFilters, '', geoRes, selectedId);
       }
-
-      // Step 3: Run forecast for the new dataset and automatically selected location (or All Data)
-      handleRunForecast(targetModel, targetDomain, selectedId, false, targetFilters, targetLoc);
     } catch (err) {
       console.error('Failed to resolve geography on dataset change:', err);
       if (requestToken !== domainRequestToken.current) return;
       setSelectedLocation('');
-      handleRunForecast(targetModel, targetDomain, selectedId, false, {}, '');
+      handleRunForecast(targetModel, targetDomain, undefined, false, {}, '', null, selectedId);
     }
   };
 
   // Location switch runner: immediately clears old location forecast and runs new forecast
-  const handleLocationChange = (nextFilters, locLabel = '') => {
+  const handleLocationChange = async (nextFilters, locLabel = '') => {
     setGeoFilters(nextFilters);
     setSelectedLocation(locLabel);
     setForecastData(null);
@@ -492,8 +597,10 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     setExplainData(null);
     setFutureData(null);
     setForecastError(null);
-    loadDatasetGeography(selectedDatasetId, nextFilters, locLabel);
-    handleRunForecast(model, domain, undefined, false, nextFilters, locLabel);
+    setAutoSelectedModel(null);
+    setAutoSelectReason(null);
+    const freshGeo = await loadDatasetGeography(selectedDatasetId, nextFilters, locLabel);
+    handleRunForecast(model, domain, undefined, false, nextFilters, locLabel, freshGeo, selectedDatasetId);
   };
 
 
@@ -505,16 +612,22 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     forceRetrain = false,
     overrideGeoFilters = undefined,
     overrideLocation = undefined,
+    overrideGeoMeta = undefined,
+    overrideDatasetId = undefined,
   ) => {
     const requestToken = domainRequestToken.current;
+    const activeDatasetId = overrideDatasetId !== undefined ? overrideDatasetId : selectedDatasetId;
     const activeGeo = overrideGeoFilters !== undefined ? overrideGeoFilters : geoFilters;
     const activeLoc = overrideLocation !== undefined ? overrideLocation : selectedLocation;
+    const activeGeoMeta = overrideGeoMeta !== undefined ? overrideGeoMeta : geoMeta;
 
     setForecastLoading(true);
     setForecastError(null);
     setExplainData(null);
     setExplainError(null);
     setForecastData(null); // Clear previous graph immediately
+    setAutoSelectedModel(null);
+    setAutoSelectReason(null);
 
     let actualModel = targetModel;
     let recModel = null;
@@ -527,7 +640,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         try {
           const compResult = await compareModels({
             domain: targetDomain,
-            datasetId: selectedDatasetId,
+            datasetId: activeDatasetId,
             target: selectedTargetOverride,
             location: activeLoc || undefined,
             geoFilters: activeGeo,
@@ -535,24 +648,39 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
           });
           if (requestToken !== domainRequestToken.current) return;
           setCompareData(compResult);
-          actualModel = compResult.recommended_model || 'random_forest';
+          actualModel = compResult.recommended_model;
+          if (!actualModel) {
+            throw new Error('No eligible models available for comparison on this dataset.');
+          }
           recModel = actualModel;
           setAutoSelectedModel(recModel);
         } catch (err) {
           console.error('Auto-select comparison failed:', err);
-          actualModel = 'random_forest';
+          if (requestToken !== domainRequestToken.current) return;
+          if (isApplicabilityNaError(err.message)) {
+            const details = parseApplicabilityDetails(err.message, err.data || activeGeoMeta);
+            setAutoSelectedModel('n/a');
+            setAutoSelectReason(details);
+            setForecastError(null);
+            return;
+          }
+          setAutoSelectedModel(null);
+          setAutoSelectReason(null);
+          setForecastError(err.message || 'Auto Select comparison failed. Please verify backend service.');
+          return;
         } finally {
           setCompareLoading(false);
         }
       } else {
         setAutoSelectedModel(null);
+        setAutoSelectReason(null);
       }
 
       // Execute forecast call
       const res = await runForecast({
         domain: targetDomain,
         model: actualModel,
-        datasetId: selectedDatasetId,
+        datasetId: activeDatasetId,
         target: selectedTargetOverride,
         location: activeLoc || undefined,
         geoFilters: activeGeo,
@@ -566,13 +694,35 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       setForecastData(res);
       loadForecastHistory();
 
-      // Trigger SHAP explainability for supported tree models
-      if (['random_forest', 'xgboost'].includes(actualModel)) {
-        fetchExplainability(targetDomain, actualModel, activeFeaturesDir, activeGeo, activeLoc);
+      // Trigger SHAP explainability for all supported tree/hybrid models
+      if (['random_forest', 'xgboost', 'trend_xgboost', 'hybrid'].includes(actualModel)) {
+        if (targetDomain === 'electricity') {
+          // For Electricity, display available model-native feature importances immediately
+          // without waiting for the expensive detailed SHAP TreeExplainer calculation.
+          // Detailed SHAP remains available on-demand via the explicit button below.
+          if (res?.feature_importances && Object.keys(res.feature_importances).length > 0) {
+            setExplainData({
+              model: actualModel,
+              domain: targetDomain,
+              method: 'native',
+              feature_importance: res.feature_importances,
+              dataset_context: res.dataset_context,
+              natural_language_explanation: 'Model-native feature importances (Gini/gain importance) computed during training. Detailed SHAP TreeExplainer values can be computed on demand below.',
+              is_native: true,
+            });
+          }
+        } else {
+          // Retail and other domains retain existing automatic SHAP calculation unchanged
+          fetchExplainability(targetDomain, actualModel, activeFeaturesDir, activeGeo, activeLoc, activeDatasetId);
+        }
       }
     } catch (err) {
       console.error('Forecast error:', err);
-      setForecastError(err.message || 'Forecast request failed. Please verify backend service.');
+      if (isApplicabilityNaError(err.message)) {
+        setForecastError(formatUserFacingError(err.message, err.data || activeGeoMeta, activeLoc));
+      } else {
+        setForecastError(err.message || 'Forecast request failed. Please verify backend service.');
+      }
     } finally {
       setForecastLoading(false);
     }
@@ -595,7 +745,11 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       if (requestToken === domainRequestToken.current) setCompareData(res);
     } catch (err) {
       console.error('Comparison error:', err);
-      setCompareError(err.message || 'Model comparison request failed. Please verify backend service.');
+      if (isApplicabilityNaError(err.message)) {
+        setCompareError(formatUserFacingError(err.message, err.data || geoMeta, selectedLocation));
+      } else {
+        setCompareError(err.message || 'Model comparison request failed. Please verify backend service.');
+      }
     } finally {
       setCompareLoading(false);
     }
@@ -608,6 +762,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     featuresDirOverride = undefined,
     expGeo = geoFilters,
     expLoc = selectedLocation,
+    expDatasetId = undefined,
   ) => {
     const requestToken = domainRequestToken.current;
     setExplainLoading(true);
@@ -616,7 +771,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       const res = await explainForecast({
         domain: expDomain,
         model: expModel,
-        datasetId: selectedDatasetId,
+        datasetId: expDatasetId || selectedDatasetId,
         target: selectedTargetOverride,
         location: expLoc || undefined,
         geoFilters: expGeo,
@@ -727,12 +882,8 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       setCustomFeaturesDir(processed.features_dir);
       setDomain(uploadDomain);
       setFutureHorizon(FUTURE_HORIZON_PRESETS[uploadDomain]?.[0] || 7);
-      const list = await loadDatasets(uploadDomain, uploaded.dataset_id);
-      setSelectedDatasetId(uploaded.dataset_id);
-      setForecastData(null);
-      setCompareData(null);
-      setExplainData(null);
-      await handleRunForecast(model, uploadDomain, uploaded.dataset_id);
+      await loadDatasets(uploadDomain, uploaded.dataset_id);
+      await handleDatasetChange(uploaded.dataset_id, uploadDomain, 'auto_select');
     } catch (err) {
       console.error('Upload pipeline error:', err);
       setUploadError(err.message || 'Dataset upload/processing failed.');
@@ -762,10 +913,10 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
   })) || [];
 
   const activeModelDisplay = autoSelectedModel
-    ? `${autoSelectedModel.replace('_', ' ')} (Auto Selected)`
+    ? (autoSelectedModel === 'n/a' ? 'Auto Select (N/A — No Applicable Model)' : `${autoSelectedModel.replace('_', ' ')} (Auto Selected)`)
     : (forecastData?.model || model).replace('_', ' ');
 
-  const isExplainableModel = ['random_forest', 'xgboost'].includes(forecastData?.model || model);
+  const isExplainableModel = ['random_forest', 'xgboost', 'trend_xgboost', 'hybrid'].includes(forecastData?.model || model);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
@@ -1210,7 +1361,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
                     </span>
                   )}
                   <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.primary, background: `${COLORS.primary}18`, padding: '2px 8px', borderRadius: 6, border: `1px solid ${COLORS.primary}44` }}>
-                    📊 {formatNumber(geoMeta.filtered_rows, 0)} / {formatNumber(geoMeta.total_rows, 0)} rows selected
+                    📊 {formatNumber(geoMeta.filtered_rows, 0)} records {selectedLocation ? `(${geoMeta.training_rows ?? (geoMeta.filtered_rows ? Math.floor(geoMeta.filtered_rows * 0.70) : 0)} training obs.)` : ''} / {formatNumber(geoMeta.total_rows, 0)} total
                   </div>
                 </div>
               ) : (
@@ -1508,7 +1659,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         </div>}
 
         {/* ─── Auto Select Explanation Banner ─── */}
-        {autoSelectedModel && (
+        {autoSelectedModel && autoSelectedModel !== 'n/a' && (
           <div style={{ background: `${COLORS.success}15`, border: `1px solid ${COLORS.success}44`, borderRadius: 10, padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 14 }}>
             <span style={{ fontSize: 24 }}>🏆</span>
             <div>
@@ -1521,12 +1672,31 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
             </div>
           </div>
         )}
+
+        {autoSelectedModel === 'n/a' && (
+          <div style={{ background: `${COLORS.warning}15`, border: `1px solid ${COLORS.warning}44`, borderRadius: 10, padding: '14px 18px', display: 'flex', alignItems: 'flex-start', gap: 14 }}>
+            <span style={{ fontSize: 24, lineHeight: 1 }}>⚠️</span>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.warning }}>
+                Auto Select: N/A — No Applicable Forecasting Model
+              </div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.text.primary, marginTop: 4, lineHeight: 1.4 }}>
+                {autoSelectReason?.criterion ||
+                  `${autoSelectReason?.training_observations ?? geoMeta?.training_observations ?? geoMeta?.training_rows ?? (geoMeta?.filtered_rows ? Math.floor(geoMeta.filtered_rows * 0.70) : 0)} usable training observations available; minimum model requirements are not met.`}
+              </div>
+              <div style={{ fontSize: 12, color: COLORS.text.secondary || '#94a3b8', marginTop: 4, lineHeight: 1.4 }}>
+                {autoSelectReason?.explanation ||
+                  'Forecasting cannot be performed for the selected location because the available training history does not satisfy the minimum requirements of the applicable models.'}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Presentation-Safe Error Alert */}
       {forecastError && (
         <div style={{ background: `${COLORS.accent}18`, border: `1px solid ${COLORS.accent}44`, borderRadius: 12, padding: '16px 20px', color: COLORS.accent, fontSize: 14, fontWeight: 600 }}>
-          ⚠️ {forecastError}
+          ⚠️ {formatUserFacingError(forecastError, geoMeta, selectedLocation)}
         </div>
       )}
 
@@ -2429,15 +2599,24 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
           <div>
             <h3 style={{ fontSize: 16, fontWeight: 700, color: COLORS.text.primary, margin: 0 }}>
-              Top Forecast Drivers (Explainable AI — SHAP)
+              Top Forecast Drivers ({explainData?.is_native ? 'Model Feature Importance' : 'Explainable AI — SHAP'})
             </h3>
             <p style={{ fontSize: 12, color: COLORS.text.secondary, margin: '2px 0 0' }}>
-              Mean |SHAP Value| — Higher values indicate features with greater influence on predictions.
+              {explainData?.is_native
+                ? 'Relative feature importance score (higher values indicate greater influence on predictions).'
+                : 'Mean |SHAP Value| — Higher values indicate features with greater influence on predictions.'}
             </p>
           </div>
           {isExplainableModel && (
             <button
-              onClick={() => fetchExplainability(domain, forecastData?.model || model)}
+              onClick={() => fetchExplainability(
+                domain,
+                forecastData?.model || model,
+                getActiveFeaturesDir(),
+                geoFilters,
+                selectedLocation,
+                selectedDatasetId,
+              )}
               disabled={explainLoading}
               style={{
                 background: COLORS.bg.dark,
@@ -2450,14 +2629,14 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
                 cursor: explainLoading ? 'not-allowed' : 'pointer',
               }}
             >
-              {explainLoading ? 'Computing SHAP...' : 'Recompute SHAP'}
+              {explainLoading ? 'Computing SHAP...' : (explainData?.is_native ? '⚡ Compute Detailed SHAP' : 'Recompute SHAP')}
             </button>
           )}
         </div>
 
         {!isExplainableModel ? (
           <div style={{ padding: '20px', background: COLORS.bg.dark, borderRadius: 12, border: `1px solid ${COLORS.bg.border}`, color: COLORS.text.secondary, fontSize: 13 }}>
-            ℹ️ Feature explainability via Tree SHAP is available for <span style={{ color: COLORS.primary, fontWeight: 700 }}>Random Forest</span> and <span style={{ color: COLORS.primary, fontWeight: 700 }}>XGBoost</span> tree ensemble models. Switch to one of these models to inspect top feature drivers.
+            ℹ️ Feature explainability via Tree SHAP is available for <span style={{ color: COLORS.primary, fontWeight: 700 }}>Random Forest</span>, <span style={{ color: COLORS.primary, fontWeight: 700 }}>XGBoost</span>, and <span style={{ color: COLORS.primary, fontWeight: 700 }}>Hybrid</span> ensemble models. Switch to one of these models to inspect top feature drivers.
           </div>
         ) : explainLoading ? (
           <div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: COLORS.text.secondary }}>
@@ -2522,7 +2701,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
                     tick={{ fill: COLORS.text.primary, fontSize: 11 }}
                     width={130}
                   />
-                  <Tooltip contentStyle={customTooltipStyle} formatter={(val) => [formatNumber(val, 4), 'Mean |SHAP|']} />
+                  <Tooltip contentStyle={customTooltipStyle} formatter={(val) => [formatNumber(val, 4), explainData?.is_native ? 'Importance' : 'Mean |SHAP|']} />
                   <Bar dataKey="importance" fill={COLORS.primary} radius={[0, 4, 4, 0]}>
                     {featureImportances.slice(0, 10).map((_, i) => (
                       <Cell key={i} fill={i < 3 ? COLORS.primary : COLORS.secondary} />
@@ -2535,7 +2714,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
 
         })() : (
           <div style={{ padding: '20px 0', color: COLORS.text.muted, fontSize: 13 }}>
-            Click "Recompute SHAP" to view feature importance analysis.
+            Click "{isExplainableModel && domain === 'electricity' ? '⚡ Compute Detailed SHAP' : 'Recompute SHAP'}" to view feature importance analysis.
           </div>
         )}
       </div>

@@ -65,11 +65,22 @@ class ForecastExplainer:
             )
         self.forecaster = forecaster
         self.shap_explainer = None
+        self.component_explainers: dict[str, Any] = {}
         if self.model_name in ("random_forest", "xgboost", "trend_xgboost") and hasattr(forecaster, "_model") and forecaster._model is not None:
             try:
                 self.shap_explainer = ShapTreeExplainer(forecaster)
             except Exception:
                 self.shap_explainer = None
+        elif self.model_name == "hybrid":
+            comps = getattr(forecaster, "components", []) or []
+            f_map = getattr(forecaster, "forecasters", {}) or getattr(forecaster, "component_models", {}) or {}
+            for c in comps:
+                sub_f = f_map.get(c)
+                if sub_f is not None and hasattr(sub_f, "_model") and sub_f._model is not None:
+                    try:
+                        self.component_explainers[c] = ShapTreeExplainer(sub_f)
+                    except Exception:
+                        pass
 
     def explain_global(self, eval_df: pd.DataFrame, method: str = "shap") -> dict[str, Any]:
         """Generate global feature importance explanation."""
@@ -84,7 +95,42 @@ class ForecastExplainer:
             except Exception:
                 pass
 
-        # Model-agnostic feature importance fallback for LSTM / Hybrid / tree fallback
+        if self.model_name == "hybrid" and self.component_explainers:
+            try:
+                raw_w = getattr(self.forecaster, "weights", None) or {c: 1.0 / len(self.component_explainers) for c in self.component_explainers}
+                total_w = sum(float(raw_w.get(c, 0.0)) for c in self.component_explainers)
+                norm_weights = {c: round((float(raw_w.get(c, 0.0)) / total_w), 4) if total_w > 0 else round(1.0 / len(self.component_explainers), 4) for c in self.component_explainers}
+
+                combined_attributions: dict[str, float] = {}
+                for c, exp in self.component_explainers.items():
+                    c_res = exp.explain_global(eval_df)
+                    w = norm_weights[c]
+                    for item in c_res.get("features", []):
+                        fname = item["feature"]
+                        combined_attributions[fname] = combined_attributions.get(fname, 0.0) + w * float(item["importance"])
+
+                sorted_items = sorted(combined_attributions.items(), key=lambda x: x[1], reverse=True)
+                features_list = [{"feature": k, "importance": round(v, 4)} for k, v in sorted_items]
+                feature_imp_map = {k: round(v, 4) for k, v in sorted_items}
+                weights_str = " + ".join(f"{c.replace('_', ' ')} ({norm_weights[c]:.1%})" for c in self.component_explainers)
+                nl_text = f"Hybrid ensemble combines {weights_str}. " + generate_natural_language_explanation(features_list, self.model_name, is_local=False)
+                return {
+                    "status": "success",
+                    "model": self.model_name,
+                    "method": method,
+                    "components": list(self.component_explainers.keys()),
+                    "weights": norm_weights,
+                    "feature_importance": feature_imp_map,
+                    "global_feature_importance": feature_imp_map,
+                    "features": features_list,
+                    "top_features": [f["feature"] for f in features_list[:10]],
+                    "natural_language_explanation": nl_text,
+                    "explanation_status": "success",
+                }
+            except Exception:
+                pass
+
+        # Model-agnostic feature importance fallback for LSTM / tree fallback
         feature_names = getattr(self.forecaster, "feature_names", None) or [c for c in eval_df.columns if c not in ("timestamp", "sales", "demand_mw")]
         if not feature_names:
             feature_names = list(eval_df.columns)
@@ -126,6 +172,44 @@ class ForecastExplainer:
                 features_list = res.get("features", [])
                 res["natural_language_explanation"] = generate_natural_language_explanation(features_list, self.model_name, is_local=True)
                 return res
+            except Exception:
+                pass
+
+        if method_clean == "shap" and self.model_name == "hybrid" and self.component_explainers:
+            try:
+                raw_w = getattr(self.forecaster, "weights", None) or {c: 1.0 / len(self.component_explainers) for c in self.component_explainers}
+                total_w = sum(float(raw_w.get(c, 0.0)) for c in self.component_explainers)
+                norm_weights = {c: round((float(raw_w.get(c, 0.0)) / total_w), 4) if total_w > 0 else round(1.0 / len(self.component_explainers), 4) for c in self.component_explainers}
+
+                combined_attributions: dict[str, float] = {}
+                for c, exp in self.component_explainers.items():
+                    c_res = exp.explain_local(eval_df, sample_index=sample_index)
+                    w = norm_weights[c]
+                    for item in c_res.get("features", []):
+                        fname = item["feature"]
+                        combined_attributions[fname] = combined_attributions.get(fname, 0.0) + w * float(item["importance"])
+
+                sorted_items = sorted(combined_attributions.items(), key=lambda x: x[1], reverse=True)
+                features_list = [{"feature": k, "importance": round(v, 4)} for k, v in sorted_items]
+                local_attributions = {k: round(v, 4) for k, v in sorted_items}
+                weights_str = " + ".join(f"{c.replace('_', ' ')} ({norm_weights[c]:.1%})" for c in self.component_explainers)
+                nl_text = f"Hybrid ensemble combines {weights_str}. " + generate_natural_language_explanation(features_list, self.model_name, is_local=True)
+                sample_idx = min(max(0, sample_index), len(eval_df) - 1) if not eval_df.empty else 0
+                sample_row = eval_df.iloc[sample_idx] if not eval_df.empty else {}
+                ts_val = str(sample_row.get("timestamp", sample_idx))
+                return {
+                    "status": "success",
+                    "model": self.model_name,
+                    "method": method_clean,
+                    "sample_index": sample_idx,
+                    "timestamp": ts_val,
+                    "components": list(self.component_explainers.keys()),
+                    "weights": norm_weights,
+                    "local_attributions": local_attributions,
+                    "features": features_list,
+                    "natural_language_explanation": nl_text,
+                    "explanation_status": "success",
+                }
             except Exception:
                 pass
 

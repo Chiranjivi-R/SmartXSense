@@ -386,7 +386,7 @@ def assess_model_applicability(
             eligible=False,
             status="unavailable",
             reason_code="INSUFFICIENT_HISTORY",
-            reason=f"Random Forest requires at least 15 training observations (got {min_rows}).",
+            reason=f"N/A — Eligible training observation criterion not met. {min_rows} usable training observations available; minimum 15 required for Random Forest (got {min_rows}).",
         )
     elif profile.usable_feature_count < 1:
         results["random_forest"] = ModelApplicabilityResult(
@@ -420,7 +420,7 @@ def assess_model_applicability(
             eligible=False,
             status="unavailable",
             reason_code="INSUFFICIENT_HISTORY",
-            reason=f"XGBoost requires at least 15 training observations (got {min_rows}).",
+            reason=f"N/A — Eligible training observation criterion not met. {min_rows} usable training observations available; minimum 15 required for XGBoost (got {min_rows}).",
         )
     elif profile.usable_feature_count < 1:
         results["xgboost"] = ModelApplicabilityResult(
@@ -489,7 +489,7 @@ def assess_model_applicability(
             eligible=False,
             status="unavailable",
             reason_code="INSUFFICIENT_SEQUENCE_HISTORY",
-            reason=f"LSTM requires sufficient sequential history for lookback window (got {min_rows} rows, requires > {lstm_lookback + 10}).",
+            reason=f"N/A — Eligible sequence history criterion not met. LSTM requires sufficient sequential history for lookback window ({min_rows} usable training observations available; requires > {lstm_lookback + 10}, got {min_rows} rows).",
         )
     else:
         results["lstm"] = ModelApplicabilityResult(
@@ -516,7 +516,7 @@ def assess_model_applicability(
             eligible=False,
             status="unavailable",
             reason_code="INSUFFICIENT_SEQUENCE_HISTORY",
-            reason=f"CNN-LSTM requires history > lookback + kernel_size + 10 (got {min_rows} rows, requires > {cnn_min_rows}).",
+            reason=f"N/A — Eligible sequence history criterion not met. CNN-LSTM requires history > lookback + kernel_size + 10 ({min_rows} usable training observations available; requires > {cnn_min_rows}, got {min_rows} rows).",
         )
     else:
         results["cnn_lstm"] = ModelApplicabilityResult(
@@ -538,7 +538,7 @@ def assess_model_applicability(
             eligible=False,
             status="unavailable",
             reason_code="FEWER_THAN_TWO_COMPONENTS",
-            reason=f"Hybrid ensemble requires at least 2 distinct eligible component models (only {eligible_components} eligible).",
+            reason=f"N/A — Eligible component criterion not met. Hybrid ensemble requires at least 2 distinct eligible component models (only {eligible_components} eligible).",
         )
     else:
         results["hybrid"] = ModelApplicabilityResult(

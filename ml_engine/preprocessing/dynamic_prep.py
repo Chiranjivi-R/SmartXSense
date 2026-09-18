@@ -86,11 +86,11 @@ def filter_df_by_geography(
         if not matched_col:
             avail = geo_meta.get("available_locations", [])[:8]
             hint = f" Available locations: {', '.join(avail)}" if avail else ""
-            raise DynamicPrepError(f"Selected location '{target_loc}' does not exist in dataset.{hint}", 400)
+            raise DynamicPrepError(f"[NO_RECORDS_FOUND] N/A — No records found for the selected location '{target_loc}'. 0 rows selected: Selected location '{target_loc}' does not exist in dataset.{hint}", 400)
 
         filtered = df[df[matched_col].astype(str).str.strip().str.lower() == loc_lower]
         if len(filtered) == 0:
-            raise DynamicPrepError(f"0 rows selected for location '{target_loc}'.", 400)
+            raise DynamicPrepError(f"[NO_RECORDS_FOUND] N/A — No records found for the selected location '{target_loc}'. 0 rows selected.", 400)
         return filtered, str(target_loc).strip()
 
     # Case 2: Cascading valid_filters provided
@@ -107,13 +107,13 @@ def filter_df_by_geography(
             if col and col in filtered.columns:
                 unique_vals = [str(v).strip().lower() for v in filtered[col].dropna().unique()]
                 if val_str.lower() not in unique_vals:
-                    raise DynamicPrepError(f"0 rows selected: Selected {level} '{val_str}' does not exist in dataset column '{col}'.", 400)
+                    raise DynamicPrepError(f"[NO_RECORDS_FOUND] N/A — No records found: 0 rows selected: Selected {level} '{val_str}' does not exist in dataset column '{col}'.", 400)
                 filtered = filtered[filtered[col].astype(str).str.strip().str.lower() == val_str.lower()]
                 applied_labels.append(val_str)
 
     geo_label = ", ".join(applied_labels) if applied_labels else "All Geographies"
     if len(filtered) == 0:
-        raise DynamicPrepError(f"0 rows selected for location scope '{geo_label}'. Select a broader location.", 400)
+        raise DynamicPrepError(f"[NO_RECORDS_FOUND] N/A — No records found for location scope '{geo_label}'. 0 rows selected. Select a broader location.", 400)
 
     return filtered, geo_label
 
@@ -126,9 +126,12 @@ def compute_dynamic_fingerprint(
     domain: str,
     target: str,
     geography_label: str = "All Geographies",
+    dataset_id: str | None = None,
 ) -> str:
     """Compute deterministic short fingerprint of preprocessed dataset."""
     hasher = hashlib.sha256()
+    if dataset_id:
+        hasher.update(str(dataset_id).strip().lower().encode("utf-8"))
     hasher.update(domain.lower().encode("utf-8"))
     hasher.update(target.lower().encode("utf-8"))
     hasher.update(geography_label.lower().encode("utf-8"))
@@ -147,6 +150,7 @@ def prepare_dynamic_dataset(
     geo_filters: dict[str, Any] | None = None,
     location: str | None = None,
     output_root: Path | None = None,
+    dataset_id: str | None = None,
 ) -> dict[str, Any]:
     """Filter, clean, prepare, and materialize feature splits for a dynamic dataset selection."""
     domain_clean = (domain or "retail").lower().strip()
@@ -156,7 +160,7 @@ def prepare_dynamic_dataset(
     raw_row_count = len(filtered_df)
 
     if raw_row_count == 0:
-        raise DynamicPrepError("0 rows selected after applying geographic filters. Select a broader geographic scope.", 400)
+        raise DynamicPrepError("[NO_RECORDS_FOUND] N/A — No records found for the selected location scope. 0 rows selected after applying geographic filters. Select a broader geographic scope.", 400)
 
 
     # Step 2: Exact Duplicate Row Removal
@@ -227,7 +231,7 @@ def prepare_dynamic_dataset(
 
 
     # Step 5: Compute Fingerprint & Materialize Feature Splits
-    fingerprint = compute_dynamic_fingerprint(processed, domain_clean, selected_target, geo_label)
+    fingerprint = compute_dynamic_fingerprint(processed, domain_clean, selected_target, geo_label, dataset_id=dataset_id)
     artifact_id = f"dyn_{fingerprint}"
 
     if output_root is None:
@@ -267,7 +271,11 @@ def prepare_dynamic_dataset(
             artifact_id=artifact_id,
         )
     except TimeSeriesSplitError as err:
-        raise DynamicPrepError(f"Geographic subset or dataset too small for time-series split: {err}", 400) from err
+        raise DynamicPrepError(f"[INSUFFICIENT_HISTORY] Geographic subset or dataset too small for time-series split: {err}", 400) from err
+    except Exception as err:
+        if isinstance(err, DynamicPrepError):
+            raise
+        raise DynamicPrepError(f"Feature materialization failed: {err}", 400) from err
     except Exception as err:
         if isinstance(err, DynamicPrepError):
             raise
