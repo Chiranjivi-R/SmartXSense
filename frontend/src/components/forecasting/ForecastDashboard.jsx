@@ -916,7 +916,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
     ? (autoSelectedModel === 'n/a' ? 'Auto Select (N/A — No Applicable Model)' : `${autoSelectedModel.replace('_', ' ')} (Auto Selected)`)
     : (forecastData?.model || model).replace('_', ' ');
 
-  const isExplainableModel = ['random_forest', 'xgboost', 'trend_xgboost', 'hybrid'].includes(forecastData?.model || model);
+  const isExplainableModel = ['random_forest', 'xgboost', 'trend_xgboost', 'lstm', 'cnn_lstm', 'hybrid'].includes(forecastData?.model || model);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
@@ -1108,11 +1108,16 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               }}
             >
               <option value="auto_select">⚡ Auto Select / Best Model (Validation Recommended)</option>
+              <option value="naive">Naive (Reference Baseline)</option>
+              <option value="seasonal_naive">Seasonal Naive (Periodic Baseline)</option>
+              <option value="arima">ARIMA (Autoregressive Integrated Moving Average)</option>
+              <option value="sarima">SARIMA (Seasonal ARIMA)</option>
               <option value="random_forest">Random Forest (Tree Ensemble)</option>
               <option value="xgboost">XGBoost (Gradient Boosted Trees)</option>
-              <option value="hybrid">Hybrid Ensemble (Validation-Weighted)</option>
+              <option value="trend_xgboost">Trend XGBoost (Piecewise Trend + Detrending)</option>
               <option value="lstm">LSTM (PyTorch Deep Sequence)</option>
-              <option value="arima">ARIMA (Time Series)</option>
+              <option value="cnn_lstm">CNN-LSTM (Deep Hybrid Sequence)</option>
+              <option value="hybrid">Hybrid Ensemble (Validation-Weighted)</option>
             </select>
           </div>
 
@@ -2234,11 +2239,14 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
                 outline: 'none',
               }}
             >
-              <option value="random_forest">Random Forest</option>
-              <option value="xgboost">XGBoost</option>
-              <option value="arima">ARIMA</option>
-              <option value="hybrid">Hybrid</option>
-              <option value="lstm">LSTM</option>
+              <option value="random_forest">Random Forest (Tree Ensemble)</option>
+              <option value="xgboost">XGBoost (Gradient Boosted Trees)</option>
+              <option value="trend_xgboost">Trend XGBoost (Piecewise Trend)</option>
+              <option value="arima">ARIMA (Time Series)</option>
+              <option value="sarima">SARIMA (Seasonal Time Series)</option>
+              <option value="hybrid">Hybrid Ensemble (Validation-Weighted)</option>
+              <option value="lstm">LSTM (PyTorch Deep Sequence)</option>
+              <option value="cnn_lstm">CNN-LSTM (Deep Hybrid Sequence)</option>
             </select>
           </div>
           <div>
