@@ -707,8 +707,10 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     raw_model = payload.get("model")
     if raw_model is None or str(raw_model).strip() == "" or str(raw_model).strip().lower() == "auto_select":
         model_name = "auto_select"
+        selection_method = "auto_select"
     else:
         model_name = str(raw_model).lower().strip()
+        selection_method = "manual"
 
     if model_name == "baseline":
         model_name = "naive"
@@ -846,6 +848,16 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             "model": model_name,
             "artifact_reused": is_reused,
         }
+        if "comp_res" in locals() and isinstance(comp_res, dict):
+            res["validation_benchmark"] = comp_res
+        else:
+            res["validation_benchmark"] = {
+                "candidate_models": [model_name],
+                "ranking": [{"model": model_name, "validation_metrics": res.get("validation_metrics") or {}, "rank": 1}],
+                "recommended_model": model_name,
+                "selection_metric": "rmse",
+                "selection_split": "validation",
+            }
         res = _attach_history(
             res,
             forecast_type="test_evaluation",
@@ -1219,8 +1231,10 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
     raw_model = payload.get("model")
     if raw_model is None or str(raw_model).strip() == "" or str(raw_model).strip().lower() in ("auto_select", "best", "auto"):
         model_name = "auto_select"
+        selection_method = "auto_select"
     else:
         model_name = str(raw_model).lower().strip()
+        selection_method = "manual"
 
     if model_name == "baseline":
         model_name = "naive"
@@ -1323,11 +1337,21 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             hybrid_weighting=hybrid_weighting,
             residual_ar=residual_ar,
         )
+        if "comp_res" in locals() and isinstance(comp_res, dict):
+            result["validation_benchmark"] = comp_res
+        else:
+            result["validation_benchmark"] = {
+                "candidate_models": [model_name],
+                "ranking": [{"model": model_name, "validation_metrics": result.get("validation_metrics") or {}, "rank": 1}],
+                "recommended_model": model_name,
+                "selection_metric": "rmse",
+                "selection_split": "validation",
+            }
         result = _attach_history(
             result,
             forecast_type="future",
             features_dir=features_dir,
-            selection_method=None,
+            selection_method=selection_method,
         )
         return _attach_llm_explanation(result, payload, dataset_ctx, "Future Horizon Projection")
 

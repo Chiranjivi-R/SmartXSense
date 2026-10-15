@@ -92,10 +92,10 @@ _MODEL_BASE: list[dict[str, Any]] = [
         "key": "trend_xgboost",
         "name": "Trend XGBoost",
         "model_type": "tabular_ensemble",
-        "domains": ["electricity"],
+        "domains": ["retail", "electricity"],
         "test_forecast": True,
         "compare_default": True,
-        "notes": "Piecewise linear trend XGBoost with causal trend detrending and canonical hourly lag architecture.",
+        "notes": "Piecewise linear trend XGBoost with causal trend detrending and canonical hourly lag architecture (dynamically evaluated based on dataset frequency and lag structure).",
     },
     {
         "key": "lstm",

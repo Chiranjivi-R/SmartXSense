@@ -151,9 +151,11 @@ def build_forecast_summary(record: dict[str, Any]) -> dict[str, Any]:
     mape = metrics.get("mape")
     if _number(mape) is not None:
         percentage = float(mape) * 100 if float(mape) <= 1 else float(mape)
-        interpretation = f"Average percentage error on the held-out test data was approximately {percentage:.2f}%."
+        interpretation = f"Average percentage error on the held-out test data was approximately {percentage:.2f}%. Forecast points and validation benchmark are retained for audit and export."
+    elif record.get("forecast_data", {}).get("points"):
+        interpretation = "Forecast observations, validation benchmark, and model performance metrics are retained for audit and export."
     else:
-        interpretation = "This report contains metadata only; prediction arrays are not stored in forecast history."
+        interpretation = "Forecast run metadata is retained for audit and reporting."
     if derived.get("recent_trend"):
         comparison = derived.get("recent_vs_previous_percent")
         detail = f" Recent observed demand {derived['recent_trend']} versus the preceding sampled period."

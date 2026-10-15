@@ -156,8 +156,14 @@ def build_history_record(
     artifact_source: str | None = None,
     selection_method: str | None = None,
     summary_facts: dict[str, Any] | None = None,
+    dataset_info: dict[str, Any] | None = None,
+    model_info: dict[str, Any] | None = None,
+    validation_benchmark: dict[str, Any] | None = None,
+    test_evaluation: dict[str, Any] | None = None,
+    forecast_data: dict[str, Any] | None = None,
+    explainability: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a metadata-only history record (no prediction arrays)."""
+    """Build a comprehensive forecast history and report record (never stores raw 'predictions' key)."""
     if forecast_type not in {"test_evaluation", "future"}:
         raise ForecastHistoryError("Invalid forecast_type")
     if model.lower().strip() == "auto_select":
@@ -176,9 +182,8 @@ def build_history_record(
         "artifact_source": artifact_source,
     }
     if metrics:
-        # Persist only standard scalar metrics; never prediction lists.
         clean_metrics = {}
-        for key in ("mae", "rmse", "mape", "r2"):
+        for key in ("mae", "rmse", "mape", "r2", "wape", "smape"):
             if key in metrics and metrics[key] is not None:
                 clean_metrics[key] = float(metrics[key])
         record["metrics"] = clean_metrics
@@ -188,6 +193,18 @@ def build_history_record(
         record["selection_method"] = str(selection_method)
     if summary_facts:
         record["summary_facts"] = {str(key): value for key, value in summary_facts.items() if isinstance(value, (str, int, float, bool)) or value is None}
+    if dataset_info:
+        record["dataset_info"] = dataset_info
+    if model_info:
+        record["model_info"] = model_info
+    if validation_benchmark:
+        record["validation_benchmark"] = validation_benchmark
+    if test_evaluation:
+        record["test_evaluation"] = test_evaluation
+    if forecast_data:
+        record["forecast_data"] = forecast_data
+    if explainability:
+        record["explainability"] = explainability
     return record
 
 
@@ -294,19 +311,119 @@ def safe_record_from_forecast_result(
         artifact = result.get("artifact") if isinstance(result.get("artifact"), dict) else {}
         metrics = None
         if forecast_type == "test_evaluation":
-            metrics = result.get("test_metrics")
+            metrics = result.get("test_metrics") or result.get("metrics")
+
+        # 1. Dataset information
+        ds_ctx = result.get("dataset_context") or {}
+        dataset_info = {
+            "dataset_id": ds_ctx.get("dataset_id"),
+            "dataset_name": ds_ctx.get("dataset_name") or ds_ctx.get("name") or f"{str(result.get('domain', '')).capitalize()} Dataset",
+            "dataset_hash": ds_ctx.get("dataset_hash"),
+            "domain": result.get("domain"),
+            "target": result.get("target"),
+            "frequency": ds_ctx.get("frequency") or ("Hourly (h)" if result.get("domain") == "electricity" else "Daily (D)"),
+            "geographic_scope": ds_ctx.get("geography_label") or ds_ctx.get("location") or "All Geographies",
+            "observation_count": int(result.get("prediction_count") or len(result.get("predictions") or [])),
+            "features_id": features_id,
+        }
+
+        # 2. Model information
+        raw_m = str(result.get("model", "")).lower().strip()
+        model_info = {
+            "model": raw_m,
+            "model_name": raw_m.replace("_", " ").title(),
+            "selection_method": selection_method or ("auto_select" if result.get("validation_benchmark") else "manual"),
+            "selection_criterion": "Lowest Validation RMSE" if (selection_method == "auto_select" or result.get("validation_benchmark")) else "User specified model",
+            "artifact_source": artifact.get("source"),
+            "artifact_key": result.get("artifact_key") or artifact.get("key"),
+            "artifact_reused": bool(result.get("execution", {}).get("artifact_reused", artifact.get("used", False))),
+            "configuration": result.get("configuration") or {},
+        }
+
+        # 3. Validation benchmark
+        val_bench = result.get("validation_benchmark")
+        if isinstance(val_bench, dict):
+            validation_benchmark = {
+                "candidate_models": val_bench.get("candidate_models") or [r.get("model") for r in val_bench.get("ranking", [])],
+                "ranking": val_bench.get("ranking") or [],
+                "recommended_model": val_bench.get("recommended_model") or raw_m,
+                "selection_metric": val_bench.get("selection_metric", "rmse"),
+                "selection_split": "validation",
+                "description": "Candidate models evaluated on chronologically separated validation set (Lowest RMSE selected).",
+            }
+        else:
+            validation_benchmark = None
+
+        # 4. Test evaluation
+        if forecast_type == "test_evaluation" and isinstance(metrics, dict):
+            test_evaluation = {
+                "split": "held_out_test",
+                "label": "Held-out Test Evaluation",
+                "description": "Performance metrics evaluated strictly on unseen chronologically held-out test data.",
+                "metrics": {k: float(v) for k, v in metrics.items() if v is not None and isinstance(v, (int, float))},
+            }
+        else:
+            test_evaluation = None
+
+        # 5. Forecast data (stored as 'forecast_data', never 'predictions' key)
+        raw_preds = result.get("predictions") or []
+        points = []
+        pred_values = []
+        for p in raw_preds:
+            if isinstance(p, dict):
+                p_val = float(p["predicted"]) if p.get("predicted") is not None else None
+                a_val = float(p["actual"]) if (forecast_type == "test_evaluation" and p.get("actual") is not None) else None
+                r_val = round(a_val - p_val, 4) if (a_val is not None and p_val is not None) else None
+                pt = {
+                    "timestamp": str(p.get("timestamp")),
+                    "predicted": p_val,
+                }
+                if forecast_type == "test_evaluation":
+                    pt["actual"] = a_val
+                    pt["residual"] = r_val
+                points.append(pt)
+                if p_val is not None:
+                    pred_values.append(p_val)
+
+        summary_stats = {
+            "count": len(points),
+            "forecast_type": forecast_type,
+            "horizon": result.get("horizon") if forecast_type == "future" else len(points),
+            "mean": round(float(sum(pred_values) / len(pred_values)), 2) if pred_values else None,
+            "min": round(float(min(pred_values)), 2) if pred_values else None,
+            "max": round(float(max(pred_values)), 2) if pred_values else None,
+        }
+        forecast_data = {
+            "summary": summary_stats,
+            "points": points,
+        }
+
+        # 6. Explainability
+        feat_imp = result.get("feature_importance") or result.get("feature_importances")
+        llm_exp = result.get("llm_explanation")
+        explainability = {
+            "feature_importance": feat_imp if isinstance(feat_imp, (dict, list)) else None,
+            "ai_explanation": llm_exp if isinstance(llm_exp, (dict, str)) else None,
+        }
+
         record = build_history_record(
             domain=str(result.get("domain", "")),
-            model=str(result.get("model", "")),
+            model=raw_m,
             target=str(result.get("target", "")),
             forecast_type=forecast_type,
             features_id=features_id,
-            prediction_count=int(result.get("prediction_count") or len(result.get("predictions") or [])),
+            prediction_count=int(result.get("prediction_count") or len(raw_preds)),
             metrics=metrics if isinstance(metrics, dict) else None,
             horizon=result.get("horizon") if forecast_type == "future" else None,
             artifact_source=artifact.get("source"),
             selection_method=selection_method,
             summary_facts=result.get("summary_facts") if isinstance(result.get("summary_facts"), dict) else None,
+            dataset_info=dataset_info,
+            model_info=model_info,
+            validation_benchmark=validation_benchmark,
+            test_evaluation=test_evaluation,
+            forecast_data=forecast_data,
+            explainability=explainability,
         )
         summary = record_forecast_run(record, history_root=history_root)
         return summary

@@ -310,6 +310,48 @@ export async function fetchReport(runId) {
   return parseJsonResponse(response);
 }
 
+export function getReportPdfUrl(runId) {
+  return `${API_BASE_URL}/api/v1/reports/${encodeURIComponent(runId)}/pdf`;
+}
+
+export function getReportExportUrl(runId, format = 'csv') {
+  return `${API_BASE_URL}/api/v1/reports/${encodeURIComponent(runId)}/export/${encodeURIComponent(format)}`;
+}
+
+export async function downloadReportPdf(runId) {
+  const url = getReportPdfUrl(runId);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to download PDF report (HTTP ${response.status})`);
+  }
+  const blob = await response.blob();
+  const downloadUrl = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = downloadUrl;
+  a.download = `SmartXSense_Report_${runId}.pdf`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(downloadUrl);
+}
+
+export async function exportReportData(runId, format = 'csv') {
+  const url = getReportExportUrl(runId, format);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Failed to export report as ${format.toUpperCase()} (HTTP ${response.status})`);
+  }
+  const blob = await response.blob();
+  const downloadUrl = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = downloadUrl;
+  a.download = format === 'json' ? `SmartXSense_Report_${runId}.json` : `SmartXSense_Forecast_${runId}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(downloadUrl);
+}
+
 export async function fetchSystemSettings() {
   const response = await fetch(`${API_BASE_URL}/api/v1/settings`);
   return parseJsonResponse(response);
