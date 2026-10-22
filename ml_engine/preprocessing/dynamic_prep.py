@@ -59,11 +59,36 @@ def filter_df_by_geography(
                 valid_filters[k] = str(v).strip()
 
     if not clean_loc and not valid_filters:
+        geo_meta = get_geographic_hierarchy(df)
+        if geo_meta.get("has_geography") and geo_meta.get("dataset_format") == "wide_multiseries":
+            geo_level = geo_meta.get("geographic_level", "state")
+            if not geo_meta.get("allow_aggregate", True):
+                avail = geo_meta.get("available_locations", [])
+                if avail:
+                    return df, avail[0]
+            return df, geo_meta.get("aggregate_label", f"All {geo_level.title()}s (Aggregate)")
         return df, "All Geographies"
 
     geo_meta = get_geographic_hierarchy(df)
     if not geo_meta["has_geography"]:
         raise DynamicPrepError("Location-specific forecasting is unavailable for this dataset (no location or geographic column found).", 400)
+
+    # Wide-format multi-series handling
+    if geo_meta.get("dataset_format") == "wide_multiseries":
+        avail = geo_meta.get("available_locations", [])
+        geo_level = geo_meta.get("geographic_level", "state")
+        target_loc = clean_loc or valid_filters.get("location") or valid_filters.get(geo_level)
+        if target_loc and str(target_loc).strip().lower() not in ("__aggregate__", "aggregate"):
+            loc_lower = str(target_loc).strip().lower()
+            matched = next((c for c in avail if c.lower() == loc_lower), None)
+            if not matched:
+                avail_hint = f" Available locations: {', '.join(avail[:8])}" if avail else ""
+                raise DynamicPrepError(f"[NO_RECORDS_FOUND] N/A — No records found for the selected location '{target_loc}'. 0 rows selected: Selected location '{target_loc}' does not exist in dataset.{avail_hint}", 400)
+            return df, matched
+        if not geo_meta.get("allow_aggregate", True):
+            reason = geo_meta.get("aggregation_disabled_reason", "geographic aggregation is restricted")
+            raise DynamicPrepError(f"Geographic aggregation is unavailable for this dataset: {reason}. Please select an individual series from: {', '.join(avail[:8])}", 400)
+        return df, geo_meta.get("aggregate_label", f"All {geo_level.title()}s (Aggregate)")
 
     all_geo_cols = detect_geographic_columns(df)
     col_map = geo_meta["geographic_columns"]
@@ -170,82 +195,122 @@ def prepare_dynamic_dataset(
 
     # Step 3: Missing Value Imputation & Invalid Row Removal
     from ml_engine.preprocessing.feature_discovery import discover_features_and_resolve_schema
+    effective_explicit_target = target
+    if effective_explicit_target in ("__aggregate__", "aggregate"):
+        effective_explicit_target = None
+    if not effective_explicit_target and geo_label != "All Geographies" and not geo_label.endswith("(Aggregate)") and geo_label in dedup_df.columns:
+        effective_explicit_target = geo_label
+
     resolved_schema = discover_features_and_resolve_schema(
         dedup_df,
         domain=domain_clean,
-        explicit_target=target,
+        explicit_target=effective_explicit_target,
     )
 
-    if resolved_schema.is_ambiguous_target and not target:
-        raise DynamicPrepError(
-            f"Multiple candidate targets detected: {resolved_schema.ambiguous_targets}. "
-            f"Please specify the target column explicitly.",
-            400,
+    if resolved_schema.is_multiseries:
+        canonical_target = "demand_mw" if domain_clean == "electricity" else "sales"
+        prep_df = resolved_schema.adapt_frame(dedup_df)
+        selected_target = resolved_schema.target_column or geo_label or ("demand_mw" if domain_clean == "electricity" else "sales")
+        if selected_target in ("__aggregate__", "aggregate"):
+            selected_target = geo_label
+        time_col = "timestamp"
+
+        clean_df, missing_report = clean_and_impute_missing_values(
+            prep_df, time_col=time_col, target_col=canonical_target, domain=domain_clean
         )
 
-    if resolved_schema.target_profile and resolved_schema.target_profile.is_constant:
-        raise DynamicPrepError(
-            f"Target column '{resolved_schema.target_column}' is constant (zero variance). "
-            f"Forecasting models require a target with non-constant variation.",
-            400,
+        suitability = analyze_forecasting_suitability(clean_df, domain=domain_clean, requested_target=canonical_target)
+        if not suitability["is_suitable"] or suitability["classification"] == "UNSUITABLE":
+            raise DynamicPrepError(suitability["explanation"], 400)
+
+        prep_df, agg_summary = aggregate_duplicate_timestamps(clean_df, "timestamp", canonical_target, domain=domain_clean)
+
+        cleaning_summary = {
+            "raw_row_count": raw_row_count,
+            "exact_duplicates_removed": exact_duplicates_count,
+            "cleaned_row_count_after_dedup": cleaned_row_count_after_dedup,
+            "missing_values_before": missing_report["missing_values_before"],
+            "missing_values_handled": missing_report["missing_values_handled"],
+            "rows_removed_due_to_invalid_data": missing_report["rows_removed_due_to_invalid_data"],
+            "duplicate_timestamps_count": agg_summary.get("duplicate_timestamp_count", 0),
+            "rows_before_timestamp_agg": agg_summary.get("rows_before_aggregation", len(prep_df)),
+            "final_cleaned_rows": len(prep_df),
+            "excluded_features": list(resolved_schema.excluded_series_info.keys()),
+            "excluded_features_count": len(resolved_schema.excluded_series_info),
+            "aggregation_methods": agg_summary.get("methods", {}),
+            "coverage_meta": resolved_schema.aggregation_coverage,
+        }
+    else:
+        if resolved_schema.is_ambiguous_target and not target:
+            raise DynamicPrepError(
+                f"Multiple candidate targets detected: {resolved_schema.ambiguous_targets}. "
+                f"Please specify the target column explicitly.",
+                400,
+            )
+
+        if resolved_schema.target_profile and resolved_schema.target_profile.is_constant:
+            raise DynamicPrepError(
+                f"Target column '{resolved_schema.target_column}' is constant (zero variance). "
+                f"Forecasting models require a target with non-constant variation.",
+                400,
+            )
+
+        time_col = resolved_schema.time_column or detect_time_column(dedup_df)[0]
+        selected_target = resolved_schema.target_column or detect_target_column(dedup_df, domain=domain_clean)[0]
+        if target and target in dedup_df.columns:
+            selected_target = target
+
+        clean_df, missing_report = clean_and_impute_missing_values(
+            dedup_df, time_col=time_col, target_col=selected_target, domain=domain_clean
         )
 
-    time_col = resolved_schema.time_column or detect_time_column(dedup_df)[0]
-    selected_target = resolved_schema.target_column or detect_target_column(dedup_df, domain=domain_clean)[0]
-    if target and target in dedup_df.columns:
-        selected_target = target
+        # Step 4: Forecasting Suitability Analysis on clean_df
+        suitability = analyze_forecasting_suitability(clean_df, domain=domain_clean, requested_target=selected_target)
+        if not suitability["is_suitable"] or suitability["classification"] == "UNSUITABLE":
+            raise DynamicPrepError(suitability["explanation"], 400)
 
-    clean_df, missing_report = clean_and_impute_missing_values(
-        dedup_df, time_col=time_col, target_col=selected_target, domain=domain_clean
-    )
+        time_col = suitability["detected_time_column"] or time_col
+        selected_target = suitability["detected_target_column"] or selected_target
 
-    # Step 4: Forecasting Suitability Analysis on clean_df
-    suitability = analyze_forecasting_suitability(clean_df, domain=domain_clean, requested_target=selected_target)
-    if not suitability["is_suitable"] or suitability["classification"] == "UNSUITABLE":
-        raise DynamicPrepError(suitability["explanation"], 400)
+        if not time_col:
+            raise DynamicPrepError(f"Dataset has no parseable date/time column for {domain_clean.capitalize()} forecasting.", 400)
+        if not selected_target or selected_target not in clean_df.columns:
+            raise DynamicPrepError(f"No valid numeric target column found in dataset for {domain_clean.capitalize()} forecasting.", 400)
 
-    time_col = suitability["detected_time_column"] or time_col
-    selected_target = suitability["detected_target_column"] or selected_target
+        # Step 5: Feature Governance - Exclude personal/identifier/unsuitable columns
+        classifications = classify_columns(clean_df, time_column=time_col, target_column=selected_target)
+        ignored_cols = classifications["ignored_columns"]
 
-    if not time_col:
-        raise DynamicPrepError(f"Dataset has no parseable date/time column for {domain_clean.capitalize()} forecasting.", 400)
-    if not selected_target or selected_target not in clean_df.columns:
-        raise DynamicPrepError(f"No valid numeric target column found in dataset for {domain_clean.capitalize()} forecasting.", 400)
+        canonical_target = "sales" if domain_clean == "retail" else "demand_mw"
+        prep_df = clean_df.copy()
 
-    # Step 5: Feature Governance - Exclude personal/identifier/unsuitable columns
-    classifications = classify_columns(clean_df, time_column=time_col, target_column=selected_target)
-    ignored_cols = classifications["ignored_columns"]
+        cols_to_drop = [c for c in ignored_cols if c in prep_df.columns and c not in (time_col, selected_target, canonical_target, "timestamp")]
+        if cols_to_drop:
+            prep_df = prep_df.drop(columns=cols_to_drop)
 
-    canonical_target = "sales" if domain_clean == "retail" else "demand_mw"
-    prep_df = clean_df.copy()
+        if selected_target != canonical_target and canonical_target not in prep_df.columns:
+            prep_df = prep_df.rename(columns={selected_target: canonical_target})
 
-    cols_to_drop = [c for c in ignored_cols if c in prep_df.columns and c not in (time_col, selected_target, canonical_target, "timestamp")]
-    if cols_to_drop:
-        prep_df = prep_df.drop(columns=cols_to_drop)
+        if time_col != "timestamp" and "timestamp" not in prep_df.columns:
+            prep_df = prep_df.rename(columns={time_col: "timestamp"})
 
-    if selected_target != canonical_target and canonical_target not in prep_df.columns:
-        prep_df = prep_df.rename(columns={selected_target: canonical_target})
+        # Step 6: Semantic Duplicate Timestamp Aggregation (once)
+        prep_df, agg_summary = aggregate_duplicate_timestamps(prep_df, "timestamp", canonical_target, domain=domain_clean)
 
-    if time_col != "timestamp" and "timestamp" not in prep_df.columns:
-        prep_df = prep_df.rename(columns={time_col: "timestamp"})
-
-    # Step 6: Semantic Duplicate Timestamp Aggregation (once)
-    prep_df, agg_summary = aggregate_duplicate_timestamps(prep_df, "timestamp", canonical_target, domain=domain_clean)
-
-    cleaning_summary = {
-        "raw_row_count": raw_row_count,
-        "exact_duplicates_removed": exact_duplicates_count,
-        "cleaned_row_count_after_dedup": cleaned_row_count_after_dedup,
-        "missing_values_before": missing_report["missing_values_before"],
-        "missing_values_handled": missing_report["missing_values_handled"],
-        "rows_removed_due_to_invalid_data": missing_report["rows_removed_due_to_invalid_data"],
-        "duplicate_timestamps_count": agg_summary.get("duplicate_timestamp_count", 0),
-        "rows_before_timestamp_agg": agg_summary.get("rows_before_aggregation", len(prep_df)),
-        "final_cleaned_rows": len(prep_df),
-        "excluded_features": ignored_cols,
-        "excluded_features_count": len(ignored_cols),
-        "aggregation_methods": agg_summary.get("methods", {}),
-    }
+        cleaning_summary = {
+            "raw_row_count": raw_row_count,
+            "exact_duplicates_removed": exact_duplicates_count,
+            "cleaned_row_count_after_dedup": cleaned_row_count_after_dedup,
+            "missing_values_before": missing_report["missing_values_before"],
+            "missing_values_handled": missing_report["missing_values_handled"],
+            "rows_removed_due_to_invalid_data": missing_report["rows_removed_due_to_invalid_data"],
+            "duplicate_timestamps_count": agg_summary.get("duplicate_timestamp_count", 0),
+            "rows_before_timestamp_agg": agg_summary.get("rows_before_aggregation", len(prep_df)),
+            "final_cleaned_rows": len(prep_df),
+            "excluded_features": ignored_cols,
+            "excluded_features_count": len(ignored_cols),
+            "aggregation_methods": agg_summary.get("methods", {}),
+        }
 
 
     processed, features, _ = preprocess_frame(prep_df, domain_clean, target=canonical_target, time_column="timestamp")
@@ -282,6 +347,13 @@ def prepare_dynamic_dataset(
             "suitability": suitability,
             "aggregation_summary": agg_summary,
             "cleaning_summary": cleaning_summary,
+            "unit": getattr(resolved_schema, "unit", "Unspecified in source"),
+            "unit_source": getattr(resolved_schema, "unit_source", "unspecified"),
+            "unit_label": getattr(resolved_schema, "unit_label", ""),
+            "allow_aggregate": getattr(resolved_schema, "allow_aggregate", True),
+            "aggregation_disabled_reason": getattr(resolved_schema, "aggregation_disabled_reason", ""),
+            "coverage_meta": getattr(resolved_schema, "aggregation_coverage", {}),
+            "is_multiseries": getattr(resolved_schema, "is_multiseries", False),
         }
 
     try:
@@ -297,11 +369,6 @@ def prepare_dynamic_dataset(
         if isinstance(err, DynamicPrepError):
             raise
         raise DynamicPrepError(f"Feature materialization failed: {err}", 400) from err
-    except Exception as err:
-        if isinstance(err, DynamicPrepError):
-            raise
-        raise DynamicPrepError(f"Feature materialization failed: {err}", 400) from err
-
 
     return {
         "features_dir": str(materialized["features_dir"]),
@@ -319,5 +386,12 @@ def prepare_dynamic_dataset(
         "suitability": suitability,
         "aggregation_summary": agg_summary,
         "cleaning_summary": cleaning_summary,
+        "unit": getattr(resolved_schema, "unit", "Unspecified in source"),
+        "unit_source": getattr(resolved_schema, "unit_source", "unspecified"),
+        "unit_label": getattr(resolved_schema, "unit_label", ""),
+        "allow_aggregate": getattr(resolved_schema, "allow_aggregate", True),
+        "aggregation_disabled_reason": getattr(resolved_schema, "aggregation_disabled_reason", ""),
+        "coverage_meta": getattr(resolved_schema, "aggregation_coverage", {}),
+        "is_multiseries": getattr(resolved_schema, "is_multiseries", False),
     }
 

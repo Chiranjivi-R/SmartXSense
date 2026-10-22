@@ -130,6 +130,62 @@ def _clean_name(name: Any) -> str:
     return re.sub(r"_+", "_", s)
 
 
+def detect_target_unit(
+    col_name: str | None,
+    domain: str = "retail",
+    user_unit: str | None = None,
+) -> tuple[str, str, str]:
+    """Detect target measurement unit, source of knowledge, and user-facing display label.
+    
+    Returns (unit, unit_source, unit_label):
+    - unit: 'MW', 'kWh', 'MWh', 'GW', 'INR', 'USD', 'units', or 'Unspecified in source'
+    - unit_source: 'user_confirmed', 'source_metadata', or 'unspecified'
+    - unit_label: e.g. 'Demand (MW)', 'Electricity Demand (unit unspecified)', 'Sales (INR)', etc.
+    """
+    clean_dom = (domain or "retail").lower().strip()
+
+    if user_unit and str(user_unit).strip():
+        u = str(user_unit).strip()
+        lbl = f"Demand ({u})" if clean_dom == "electricity" else f"Sales / Quantity ({u})"
+        return u, "user_confirmed", lbl
+
+    if not col_name:
+        def_lbl = "Electricity Demand (unit unspecified)" if clean_dom == "electricity" else "Sales / Quantity (unit unspecified)"
+        return "Unspecified in source", "unspecified", def_lbl
+
+    clean = _clean_name(col_name)
+    raw_lower = str(col_name).lower()
+
+    if clean_dom == "electricity":
+        # 1. Check explicit Megawatts markers in header
+        if any(m in clean for m in ("load_mw", "demand_mw", "grid_load_mw", "_mw", "mw_", "megawatts", "in_mw")) or any(p in raw_lower for p in ("(mw)", "[mw]", " mw", "_mw", "megawatt")):
+            return "MW", "source_metadata", "Demand (MW)"
+        # 2. Check explicit Kilowatt-hours markers
+        if any(m in clean for m in ("_kwh", "kwh_", "in_kwh", "kilowatt_hours", "kwh")) or any(p in raw_lower for p in ("(kwh)", "[kwh]", " kwh", "_kwh")):
+            return "kWh", "source_metadata", "Demand (kWh)"
+        # 3. Check explicit Megawatt-hours markers
+        if any(m in clean for m in ("_mwh", "mwh_", "in_mwh")) or any(p in raw_lower for p in ("(mwh)", "[mwh]", " mwh", "_mwh")):
+            return "MWh", "source_metadata", "Demand (MWh)"
+        # 4. Check explicit Gigawatts markers
+        if any(m in clean for m in ("_gw", "gw_", "in_gw")) or any(p in raw_lower for p in ("(gw)", "[gw]", " gw")):
+            return "GW", "source_metadata", "Demand (GW)"
+
+        # Default for electricity when unit is unverified in source column name
+        return "Unspecified in source", "unspecified", "Electricity Demand (unit unspecified)"
+
+    if clean_dom == "retail":
+        if any(m in clean for m in ("_inr", "inr_", "price_inr", "sales_inr", "revenue_inr")) or any(p in raw_lower for p in ("(inr)", "[inr]", " inr", "₹", "rs")):
+            return "INR", "source_metadata", "Sales (INR)"
+        if any(m in clean for m in ("_usd", "usd_")) or any(p in raw_lower for p in ("(usd)", "[usd]", " usd", "$")):
+            return "USD", "source_metadata", "Sales (USD)"
+        if any(m in clean for m in ("_eur", "eur_")) or any(p in raw_lower for p in ("(eur)", "[eur]", " eur", "€")):
+            return "EUR", "source_metadata", "Sales (EUR)"
+        if any(m in clean for m in ("units_sold", "quantity", "qty", "item_count", "sales_units")):
+            return "units", "source_metadata", "Quantity (units)"
+
+        return "Unspecified in source", "unspecified", "Retail Sales (unit unspecified)"
+
+
 # ---------------------------------------------------------------------------
 # Data Structures
 # ---------------------------------------------------------------------------
@@ -188,6 +244,19 @@ class ResolvedSchema:
     validation_warnings: list[str] = field(default_factory=list)
     explanation: str = ""
     column_profiles: dict[str, Any] = field(default_factory=dict)
+    is_multiseries: bool = False
+    dataset_format: str = "tabular_single"
+    detected_geographic_series: list[str] = field(default_factory=list)
+    geographic_level: str | None = None
+    parent_level: str | None = None
+    detected_parent_totals: list[str] = field(default_factory=list)
+    excluded_series_info: dict[str, str] = field(default_factory=dict)
+    aggregation_coverage: dict[str, Any] = field(default_factory=dict)
+    unit: str = "Unspecified in source"
+    unit_source: str = "unspecified"
+    unit_label: str = ""
+    allow_aggregate: bool = True
+    aggregation_disabled_reason: str = ""
 
     @property
     def frequency(self) -> str:
@@ -247,7 +316,52 @@ class ResolvedSchema:
         Maps the identified timestamp and target to internal canonical roles
         ('timestamp' and 'demand_mw' / 'sales').
         If preserve_original=True, adds canonical alias columns without removing original columns.
+        Handles both row-based and wide-format multi-series geographic datasets transparently.
         """
+        # Wide-format geographic dataset adaptation
+        if getattr(self, "is_multiseries", False):
+            res = pd.DataFrame()
+            # 1. Timestamp column
+            if self.time_column and self.time_column in df.columns:
+                res["timestamp"] = pd.to_datetime(df[self.time_column], errors="coerce")
+            else:
+                res["timestamp"] = pd.date_range("2024-01-01", periods=len(df), freq="D")
+
+            # 2. Target variable adaptation
+            canonical = self.canonical_target or ("demand_mw" if self.domain == "electricity" else "sales")
+            target_col = getattr(self, "target_column", None)
+
+            if target_col and target_col in df.columns:
+                # Single location series selected
+                s = pd.to_numeric(df[target_col], errors="coerce")
+                # Bounded interpolation (limit=3, no silent 0 fill or indefinite forward fill)
+                res[canonical] = s.interpolate(method="linear", limit=3).bfill(limit=2)
+            else:
+                # Aggregation requested: verify allow_aggregate
+                if not getattr(self, "allow_aggregate", True):
+                    reason = getattr(self, "aggregation_disabled_reason", "aggregation restricted due to incompatible series units or scale disparity")
+                    raise ValueError(f"Geographic aggregation is unavailable for this dataset: {reason}")
+
+                # Valid aggregate across detected compatible component series
+                valid_series = [c for c in getattr(self, "detected_geographic_series", []) if c in df.columns]
+                if valid_series:
+                    comp_df = df[valid_series].apply(pd.to_numeric, errors="coerce")
+                    # Transparent bounded interpolation per series (limit=3)
+                    comp_interp = comp_df.interpolate(method="linear", limit=3).bfill(limit=2)
+                    res[canonical] = comp_interp.sum(axis=1)
+                elif target_col and target_col in df.columns:
+                    res[canonical] = pd.to_numeric(df[target_col], errors="coerce").interpolate(method="linear", limit=3).bfill(limit=2)
+                else:
+                    res[canonical] = 0.0
+
+            if preserve_original:
+                out = df.copy()
+                out["timestamp"] = res["timestamp"]
+                out[canonical] = res[canonical]
+                return out
+
+            return res
+
         result = df.copy()
 
         # Handle column drop of excluded personal attributes if requested
@@ -441,6 +555,14 @@ def detect_candidate_timestamps(
                 except Exception:
                     pass
 
+        # Check generic headers (e.g. Unnamed: 0, index) containing valid timestamps
+        is_generic_header = clean in {"unnamed_0", "unnamed", "index", "col_0", "column_0"} or clean.startswith("unnamed")
+        if is_generic_header and prof.is_temporal:
+            score += 0.45
+            reason_parts.append(f"Generic header '{col_str}' contains valid chronological timestamps")
+        elif is_generic_header and prof.inferred_type == "integer":
+            score -= 0.60
+
         # Penalize integer IDs masquerading as timestamps
         if prof.inferred_type == "integer" and clean not in {"year", "date", "time", "datetime", "timestamp"}:
             score -= 0.30
@@ -580,6 +702,268 @@ def detect_frequency_and_temporal_stats(
     return detected_freq, unique_ts, dup_ts, is_chronological
 
 
+def detect_wide_geographic_series(
+    df: pd.DataFrame,
+    profiles: dict[str, ColumnProfile],
+    time_col: str | None,
+    domain: str = "electricity",
+) -> dict[str, Any]:
+    """Detect independent geographic time series formatted as separate numeric columns.
+
+    Guarantees:
+    - Never hardcodes specific countries, states, or location lists.
+    - Excludes index columns (e.g. 'Unnamed: 0', auto-increment integers) and time columns.
+    - Excludes non-geographic metrics (temperature, price, promo, holiday, identifiers).
+    - Detects parent-level totals (via name keyword or mathematical scale check where column mean approx sum of child means) to prevent double-counting.
+    - Validates unit and scale compatibility across component series.
+    - Transparently measures missingness and reports coverage percentage.
+    """
+    n_rows = len(df)
+    if n_rows < 5 or len(df.columns) < 3:
+        return {
+            "is_multiseries": False,
+            "dataset_format": "tabular_single",
+            "geographic_level": None,
+            "parent_level": None,
+            "component_series": [],
+            "parent_totals": [],
+            "excluded_series": {},
+            "coverage_meta": {},
+            "allow_aggregate": False,
+        }
+
+    # If the dataset contains row-based non-numeric geographic columns (e.g. City, State, Country),
+    # it is row-based and must not be treated as wide-multiseries.
+    row_geo_cols = [
+        c for c in df.columns
+        if not pd.api.types.is_numeric_dtype(df[c])
+        and (
+            any(_clean_name(c) == kw for kw in GEOGRAPHIC_KEYWORDS)
+            or any(kw in _clean_name(c) for kw in ("country", "state", "city", "region", "district", "location", "zone"))
+        )
+    ]
+    if row_geo_cols:
+        return {
+            "is_multiseries": False,
+            "dataset_format": "tabular_single",
+            "geographic_level": None,
+            "parent_level": None,
+            "component_series": [],
+            "parent_totals": [],
+            "excluded_series": {},
+            "coverage_meta": {},
+            "allow_aggregate": False,
+        }
+
+    excluded_info: dict[str, str] = {}
+    candidate_cols: list[str] = []
+
+    NON_GEO_KEYWORDS = {
+        "temp", "temperature", "humidity", "wind", "pressure", "rainfall", "rain",
+        "price", "cost", "fee", "mrp", "rate", "holiday", "promo", "discount",
+        "order_id", "customer_id", "sku", "code", "index", "row_id", "unnamed",
+        "cpi", "ewma", "lag", "rolling", "mean", "std", "min", "max", "var", "diff",
+        "sales", "revenue", "demand", "quantity", "qty", "count", "day", "month",
+        "year", "week", "hour", "minute", "dayofweek", "weekday", "weekend", "is_weekend"
+    }
+
+    for col_str, prof in profiles.items():
+        if col_str == time_col:
+            continue
+
+        clean = prof.clean_name
+        clean_low = col_str.strip().lower()
+
+        # 1. Exclude index columns
+        if (
+            clean_low.startswith("unnamed")
+            or clean in ("index", "id", "row_id", "level_0", "record_id")
+            or re.match(r"^unnamed[_\s:]*\d+$", clean_low)
+        ):
+            excluded_info[col_str] = "Identified as row index / identifier column"
+            continue
+
+        if prof.inferred_type == "integer" and prof.unique_ratio > 0.95:
+            s_num = pd.to_numeric(df[col_str], errors="coerce").dropna()
+            if len(s_num) > 10 and (
+                (s_num.min() == 0 and s_num.max() == len(s_num) - 1)
+                or (s_num.min() == 1 and s_num.max() == len(s_num))
+            ):
+                excluded_info[col_str] = "Identified as sequential row index integer"
+                continue
+
+        # 2. Exclude non-numeric or constant columns
+        if not prof.is_numeric:
+            excluded_info[col_str] = "Non-numeric column"
+            continue
+        if prof.is_constant or prof.numeric_variance <= 0:
+            excluded_info[col_str] = "Constant column with zero variance"
+            continue
+
+        # 3. Exclude non-geographic metrics
+        is_non_geo = any(clean == k or clean.startswith(f"{k}_") or clean.endswith(f"_{k}") for k in NON_GEO_KEYWORDS)
+        if is_non_geo:
+            excluded_info[col_str] = "Non-geographic physical metric / parameter"
+            continue
+
+        # 4. Canonical target name in already formatted tabular single datasets
+        if domain == "electricity" and clean in {"demand_mw", "load_mw", "grid_load_mw"}:
+            continue
+
+        candidate_cols.append(col_str)
+
+    if len(candidate_cols) < 2:
+        return {
+            "is_multiseries": False,
+            "dataset_format": "tabular_single",
+            "geographic_level": None,
+            "parent_level": None,
+            "component_series": [],
+            "parent_totals": [],
+            "excluded_series": excluded_info,
+            "coverage_meta": {},
+            "allow_aggregate": False,
+        }
+
+    # Classify candidate columns via LLM routing / deterministic fallback
+    llm_map: dict[str, dict[str, Any]] = {}
+    try:
+        from backend.app.services.llm_service import classify_geographic_columns_llm
+        llm_map = classify_geographic_columns_llm(candidate_cols)
+    except Exception:
+        llm_map = {}
+
+    geo_units: list[str] = []
+    parent_totals: list[str] = []
+    detected_levels: list[str] = []
+
+    TOTAL_KWS = {"total", "sum", "all", "overall", "aggregate", "national", "grand_total", "all_india", "us_total", "world_total"}
+
+    means = {}
+    for col in candidate_cols:
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        means[col] = float(s.mean()) if not s.empty else 0.0
+
+    for col in candidate_cols:
+        clean = _clean_name(col)
+        meta = llm_map.get(col, {})
+        is_geo = meta.get("is_geographic", True)
+        geo_level = meta.get("geographic_level", "state")
+
+        # Check total / aggregate keywords
+        is_total_kw = clean in TOTAL_KWS or clean.startswith("total_") or clean.endswith("_total")
+        if is_total_kw or geo_level == "aggregate_total":
+            parent_totals.append(col)
+            excluded_info[col] = "Parent aggregate total column (excluded from child summation to prevent double-counting)"
+            continue
+
+        if not is_geo:
+            excluded_info[col] = "Classified as non-geographic parameter"
+            continue
+
+        geo_units.append(col)
+        if geo_level and geo_level not in ("none", "aggregate_total"):
+            detected_levels.append(geo_level)
+
+    # Scale check for parent-level totals:
+    # If a column's mean is approximately equal to the sum of the means of the other candidate series (+- 15%),
+    # it is a pre-aggregated total!
+    sum_child_means = sum(means[c] for c in geo_units)
+    verified_children: list[str] = []
+    for c in geo_units:
+        c_mean = means[c]
+        other_means_sum = sum_child_means - c_mean
+        if other_means_sum > 0 and abs(c_mean - other_means_sum) / other_means_sum <= 0.15:
+            parent_totals.append(c)
+            excluded_info[c] = "Parent aggregate total column detected by mathematical scale check (preventing double-counting)"
+        else:
+            verified_children.append(c)
+
+    if len(verified_children) < 2:
+        return {
+            "is_multiseries": False,
+            "dataset_format": "tabular_single",
+            "geographic_level": None,
+            "parent_level": None,
+            "component_series": [],
+            "parent_totals": parent_totals,
+            "excluded_series": excluded_info,
+            "coverage_meta": {},
+            "allow_aggregate": False,
+            "aggregation_disabled_reason": "Fewer than 2 independent geographic series detected",
+            "unit": "Unspecified in source",
+            "unit_source": "unspecified",
+            "unit_label": "Electricity Demand (unit unspecified)" if domain == "electricity" else "Sales / Quantity (unit unspecified)",
+        }
+
+    # Unit compatibility check across child series
+    allow_aggregate = True
+    aggregation_disabled_reason = ""
+    dataset_unit = "Unspecified in source"
+    dataset_unit_source = "unspecified"
+    dataset_unit_label = "Electricity Demand (unit unspecified)" if domain == "electricity" else "Sales / Quantity (unit unspecified)"
+
+    child_units = {}
+    verified_unit_names = set()
+    for c in verified_children:
+        u, u_src, u_lbl = detect_target_unit(c, domain=domain)
+        child_units[c] = (u, u_src, u_lbl)
+        if u_src in ("source_metadata", "user_confirmed"):
+            verified_unit_names.add(u)
+
+    if len(verified_unit_names) > 1:
+        # Incompatible verified units across candidate series
+        allow_aggregate = False
+        aggregation_disabled_reason = f"Conflicting measurement units ({', '.join(sorted(verified_unit_names))}) detected across series. Incompatible units cannot be summed."
+    elif len(verified_unit_names) == 1:
+        dataset_unit = next(iter(verified_unit_names))
+        dataset_unit_source = "source_metadata"
+        dataset_unit_label = f"Demand ({dataset_unit})" if domain == "electricity" else f"Sales ({dataset_unit})"
+
+    # Scale compatibility check across child series
+    valid_means = [means[c] for c in verified_children if means[c] > 0]
+    if valid_means and allow_aggregate:
+        min_m, max_m = min(valid_means), max(valid_means)
+        if min_m > 0 and (max_m / min_m) > 1000:
+            allow_aggregate = False
+            aggregation_disabled_reason = f"Extreme scale disparity (ratio {max_m / min_m:.1f}x > 1000x) across geographic series indicates differing measurement schemes or mixed physical quantities."
+
+    # Determine dominant geographic level
+    primary_level = "state"
+    if detected_levels:
+        from collections import Counter
+        primary_level = Counter(detected_levels).most_common(1)[0][0]
+
+    parent_level = "country" if primary_level in ("state", "province") else ("state" if primary_level == "city" else "national")
+
+    # Coverage metrics
+    total_cells = len(df) * len(verified_children)
+    missing_cells = int(df[verified_children].isna().sum().sum())
+    coverage_pct = round(100.0 * (1.0 - (missing_cells / max(1, total_cells))), 2)
+
+    return {
+        "is_multiseries": True,
+        "dataset_format": "wide_multiseries",
+        "geographic_level": primary_level,
+        "parent_level": parent_level,
+        "component_series": sorted(verified_children),
+        "parent_totals": sorted(parent_totals),
+        "excluded_series": excluded_info,
+        "coverage_meta": {
+            "coverage_pct": coverage_pct,
+            "total_cells": total_cells,
+            "missing_cells": missing_cells,
+            "included_count": len(verified_children),
+            "assumptions": f"Sum across compatible {primary_level} series with bounded linear interpolation" if allow_aggregate else f"Individual series forecasting only (aggregation disabled: {aggregation_disabled_reason})",
+        },
+        "unit": dataset_unit,
+        "unit_source": dataset_unit_source,
+        "unit_label": dataset_unit_label,
+        "allow_aggregate": allow_aggregate,
+        "aggregation_disabled_reason": aggregation_disabled_reason,
+    }
+
+
 def discover_features_and_resolve_schema(
     df: pd.DataFrame,
     domain: str = "retail",
@@ -645,6 +1029,15 @@ def discover_features_and_resolve_schema(
         )
 
     # 3. Target column discovery, resolution & ambiguity handling
+    is_multiseries = False
+    dataset_format = "tabular_single"
+    detected_geographic_series: list[str] = []
+    geographic_level: str | None = None
+    parent_level: str | None = None
+    detected_parent_totals: list[str] = []
+    excluded_series_info: dict[str, str] = {}
+    aggregation_coverage: dict[str, Any] = {}
+
     target_candidates = detect_candidate_targets(df, profiles, domain=domain_clean)
     selected_target: str | None = None
     target_conf = 0.0
@@ -652,6 +1045,31 @@ def discover_features_and_resolve_schema(
     ambiguous_targets: list[str] = []
 
     canonical_target = CANONICAL_TARGETS.get(domain_clean, "target")
+
+    # Inspect for wide-format geographic multi-series
+    wide_geo_meta = detect_wide_geographic_series(df, profiles, selected_time, domain=domain_clean)
+    allow_aggregate = True
+    aggregation_disabled_reason = ""
+    unit = "Unspecified in source"
+    unit_source = "unspecified"
+    unit_label = "Electricity Demand (unit unspecified)" if domain_clean == "electricity" else "Sales / Quantity (unit unspecified)"
+
+    if wide_geo_meta["is_multiseries"]:
+        is_multiseries = True
+        dataset_format = "wide_multiseries"
+        detected_geographic_series = wide_geo_meta["component_series"]
+        geographic_level = wide_geo_meta["geographic_level"]
+        parent_level = wide_geo_meta["parent_level"]
+        detected_parent_totals = wide_geo_meta["parent_totals"]
+        excluded_series_info = wide_geo_meta["excluded_series"]
+        aggregation_coverage = wide_geo_meta["coverage_meta"]
+        allow_aggregate = wide_geo_meta.get("allow_aggregate", True)
+        aggregation_disabled_reason = wide_geo_meta.get("aggregation_disabled_reason", "")
+        unit = wide_geo_meta.get("unit", "Unspecified in source")
+        unit_source = wide_geo_meta.get("unit_source", "unspecified")
+        unit_label = wide_geo_meta.get("unit_label", "Electricity Demand (unit unspecified)")
+
+    aggregate_label = f"All {str(geographic_level or 'state').replace('_', ' ').title()}s (Aggregate)"
 
     if explicit_target and explicit_target in original_cols:
         # User explicit selection takes absolute precedence
@@ -674,20 +1092,43 @@ def discover_features_and_resolve_schema(
             selected_target = explicit_target
             target_conf = 1.0
             is_ambiguous = False
+            unit, unit_source, unit_label = detect_target_unit(explicit_target, domain=domain_clean)
+    elif (explicit_target in ("__aggregate__", "aggregate") or (explicit_target and str(explicit_target).strip().endswith("(Aggregate)"))) and is_multiseries:
+        selected_target = aggregate_label
+        target_conf = 0.95
+        is_ambiguous = False
+        if not allow_aggregate:
+            validation_warnings.append(
+                f"Geographic aggregation is unavailable: {aggregation_disabled_reason}. Please select an individual series."
+            )
     else:
         # Automatic inference with strict ambiguity safety
         if not target_candidates:
-            # Check if all numeric columns were constant
-            constant_nums = [c for c, p in profiles.items() if p.is_numeric and p.is_constant and c != selected_time] if n_rows > 1 else []
-            if constant_nums:
-                validation_issues.append(
-                    f"Target column candidate '{constant_nums[0]}' has zero variance (constant value). "
-                    "Forecasting requires a varying numerical target."
-                )
+            if is_multiseries:
+                if allow_aggregate:
+                    selected_target = aggregate_label
+                    target_conf = 0.95
+                else:
+                    selected_target = detected_geographic_series[0] if detected_geographic_series else None
+                    target_conf = 0.85
+                    validation_warnings.append(
+                        f"Geographic aggregation is unavailable: {aggregation_disabled_reason}. Selected individual series '{selected_target}'."
+                    )
+                    if selected_target:
+                        unit, unit_source, unit_label = detect_target_unit(selected_target, domain=domain_clean)
+                is_ambiguous = False
             else:
-                validation_issues.append(
-                    f"No valid numeric target column detected in dataset for {domain_clean.capitalize()} domain."
-                )
+                # Check if all numeric columns were constant
+                constant_nums = [c for c, p in profiles.items() if p.is_numeric and p.is_constant and c != selected_time] if n_rows > 1 else []
+                if constant_nums:
+                    validation_issues.append(
+                        f"Target column candidate '{constant_nums[0]}' has zero variance (constant value). "
+                        "Forecasting requires a varying numerical target."
+                    )
+                else:
+                    validation_issues.append(
+                        f"No valid numeric target column detected in dataset for {domain_clean.capitalize()} domain."
+                    )
         elif len(target_candidates) == 1:
             selected_target, target_conf, _ = target_candidates[0]
             is_ambiguous = False
@@ -711,6 +1152,9 @@ def discover_features_and_resolve_schema(
                     f"Multiple plausible target columns detected: {ambiguous_targets}. "
                     f"Please confirm or select which variable to forecast."
                 )
+
+    if selected_target and not (is_multiseries and selected_target == aggregate_label):
+        unit, unit_source, unit_label = detect_target_unit(selected_target, domain=domain_clean)
 
     # 4. Temporal Profile
     temporal_freq, unique_ts, dup_ts, is_chronological = detect_frequency_and_temporal_stats(df, selected_time)
@@ -850,10 +1294,15 @@ def discover_features_and_resolve_schema(
             is_panel = True
 
     # 7. Final Validity Decision
-    is_valid = len(validation_issues) == 0 and selected_time is not None and selected_target is not None
+    is_valid = len(validation_issues) == 0 and selected_time is not None and (selected_target is not None or is_multiseries)
 
     if not is_valid:
         explanation = f"Dataset validation failed for {domain_clean.capitalize()} forecasting: " + " ".join(validation_issues)
+    elif is_multiseries and (selected_target == aggregate_label or not selected_target):
+        explanation = (
+            f"Dataset adaptive schema: Wide-format geographic dataset detected with {len(detected_geographic_series)} {geographic_level} series. "
+            f"National/parent aggregate forecasting ({parent_level.title()}) and individual {geographic_level} forecasting enabled."
+        )
     elif is_ambiguous:
         explanation = f"Ambiguous target selection: Dataset has multiple plausible target variables ({', '.join(ambiguous_targets)}). Please confirm target selection."
     elif validation_warnings:
@@ -914,4 +1363,17 @@ def discover_features_and_resolve_schema(
         validation_warnings=validation_warnings,
         explanation=explanation,
         column_profiles={c: asdict(p) for c, p in profiles.items()},
+        is_multiseries=is_multiseries,
+        dataset_format=dataset_format,
+        detected_geographic_series=detected_geographic_series,
+        geographic_level=geographic_level,
+        parent_level=parent_level,
+        detected_parent_totals=detected_parent_totals,
+        excluded_series_info=excluded_series_info,
+        aggregation_coverage=aggregation_coverage,
+        unit=unit,
+        unit_source=unit_source,
+        unit_label=unit_label,
+        allow_aggregate=allow_aggregate,
+        aggregation_disabled_reason=aggregation_disabled_reason,
     )

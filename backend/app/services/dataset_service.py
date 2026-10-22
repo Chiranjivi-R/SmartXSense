@@ -80,7 +80,7 @@ def _ensure_content_hash_column() -> None:
             # PRAGMA table_info returns one row per column.
             rows = conn.execute(text("PRAGMA table_info(datasets)")).fetchall()
             existing_columns = {row[1] for row in rows}  # column name is index 1
-            if "content_hash" not in existing_columns:
+            if rows and "content_hash" not in existing_columns:
                 log.info(
                     "[dataset_service] datasets.content_hash column missing — "
                     "applying auto-migration (ALTER TABLE)"
@@ -441,7 +441,7 @@ def _schema_issues(frame: pd.DataFrame, domain: str, strict_mode: bool) -> tuple
     missing = []
     if not schema_res.time_column:
         missing.append("timestamp / date column")
-    if not schema_res.target_column:
+    if not schema_res.target_column and not getattr(schema_res, "is_multiseries", False):
         missing.append(f"{domain} target column")
 
     if missing:
@@ -459,6 +459,12 @@ def _schema_issues(frame: pd.DataFrame, domain: str, strict_mode: bool) -> tuple
         "is_ambiguous_target": schema_res.is_ambiguous_target,
         "ambiguous_targets": schema_res.ambiguous_targets,
         "column_roles": schema_res.column_roles,
+        "is_multiseries": getattr(schema_res, "is_multiseries", False),
+        "dataset_format": getattr(schema_res, "dataset_format", "tabular_single"),
+        "detected_geographic_series": getattr(schema_res, "detected_geographic_series", []),
+        "geographic_level": getattr(schema_res, "geographic_level", None),
+        "parent_level": getattr(schema_res, "parent_level", None),
+        "aggregation_coverage": getattr(schema_res, "aggregation_coverage", {}),
     }
 
     return issues, schema_metadata

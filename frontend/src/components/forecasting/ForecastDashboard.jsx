@@ -568,13 +568,20 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
       let targetFilters = { country: '', state: '', district: '', region: '', city: '', location: '' };
 
       if (geoRes?.has_geography && geoRes?.available_locations?.length > 0) {
-        // Automatically select the FIRST available location from the newly selected dataset
-        targetLoc = geoRes.available_locations[0];
-        targetFilters = { ...targetFilters, location: targetLoc };
-        setSelectedLocation(targetLoc);
-        setGeoFilters(targetFilters);
-        const locGeo = await loadDatasetGeography(selectedId, targetFilters, targetLoc);
-        handleRunForecast(targetModel, targetDomain, undefined, false, targetFilters, targetLoc, locGeo, selectedId);
+        if (geoRes?.dataset_format === 'wide_multiseries') {
+          // For wide-format multi-series datasets, default to valid national/group aggregate
+          setSelectedLocation('');
+          setGeoFilters(targetFilters);
+          handleRunForecast(targetModel, targetDomain, undefined, false, targetFilters, '', geoRes, selectedId);
+        } else {
+          // Automatically select the FIRST available location from the newly selected row-based dataset
+          targetLoc = geoRes.available_locations[0];
+          targetFilters = { ...targetFilters, location: targetLoc };
+          setSelectedLocation(targetLoc);
+          setGeoFilters(targetFilters);
+          const locGeo = await loadDatasetGeography(selectedId, targetFilters, targetLoc);
+          handleRunForecast(targetModel, targetDomain, undefined, false, targetFilters, targetLoc, locGeo, selectedId);
+        }
       } else {
         setSelectedLocation('');
         setGeoFilters(targetFilters);
@@ -1360,6 +1367,21 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               </div>
               {geoMeta.has_geography ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  {geoMeta.unit && (
+                    <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.secondary, background: `${COLORS.secondary}18`, padding: '2px 8px', borderRadius: 6, border: `1px solid ${COLORS.secondary}44` }}>
+                      ⚡ {geoMeta.unit_label || (geoMeta.unit === 'Unspecified in source' ? 'Electricity Demand (unit unspecified)' : `Unit: ${geoMeta.unit}`)}
+                    </span>
+                  )}
+                  {geoMeta.allow_aggregate === false && (
+                    <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.warning, background: `${COLORS.warning}18`, padding: '2px 8px', borderRadius: 6, border: `1px solid ${COLORS.warning}44` }} title={geoMeta.aggregation_disabled_reason}>
+                      ⚠️ Aggregation Disabled: {geoMeta.aggregation_disabled_reason || 'Incompatible series'}
+                    </span>
+                  )}
+                  {geoMeta.coverage_meta?.coverage_pct !== undefined && (
+                    <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.accent, background: `${COLORS.accent}18`, padding: '2px 8px', borderRadius: 6, border: `1px solid ${COLORS.accent}44` }}>
+                      📈 {geoMeta.coverage_meta.coverage_pct}% Coverage ({geoMeta.coverage_meta.included_count} series)
+                    </span>
+                  )}
                   {selectedLocation && (
                     <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.success, background: `${COLORS.success}18`, padding: '2px 8px', borderRadius: 6, border: `1px solid ${COLORS.success}44` }}>
                       📍 Active: {selectedLocation}
@@ -1399,7 +1421,7 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
                             textDecoration: 'underline',
                           }}
                         >
-                          Reset to All Geographies
+                          {geoMeta.dataset_format === 'wide_multiseries' ? (geoMeta.allow_aggregate === false ? 'Clear Selection' : 'Reset to Aggregate') : 'Reset to All Geographies'}
                         </button>
                       )}
                     </div>
@@ -1424,7 +1446,13 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
                         fontWeight: 700,
                       }}
                     >
-                      <option value="">-- All Geographies (Global Dataset) --</option>
+                      <option value="" disabled={geoMeta.allow_aggregate === false}>
+                        {geoMeta.dataset_format === 'wide_multiseries'
+                          ? (geoMeta.allow_aggregate === false
+                              ? `⚠️ Aggregate Disabled (${geoMeta.aggregation_disabled_reason || 'Incompatible series'})`
+                              : (geoMeta.aggregate_label ? `-- ${geoMeta.aggregate_label} --` : '-- All (Aggregate) --'))
+                          : '-- All Geographies (Global Dataset) --'}
+                      </option>
                       {geoMeta.available_locations.map((loc) => (
                         <option key={loc} value={loc}>📍 {loc}</option>
                       ))}

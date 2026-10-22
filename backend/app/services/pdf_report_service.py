@@ -451,6 +451,28 @@ def _extract_dataset_intelligence(report: dict[str, Any]) -> dict[str, Any]:
         or f"Dataset inspected and verified for {report.get('domain', 'forecasting').capitalize()} time-series forecasting."
     )
 
+    unit = (
+        ds_intel.get("unit")
+        or ds_ctx.get("unit")
+        or ds_info.get("unit")
+        or report.get("unit")
+        or "Unspecified in source"
+    )
+    unit_source = (
+        ds_intel.get("unit_source")
+        or ds_ctx.get("unit_source")
+        or ds_info.get("unit_source")
+        or report.get("unit_source")
+        or "unspecified"
+    )
+    unit_label = (
+        ds_intel.get("unit_label")
+        or ds_ctx.get("unit_label")
+        or ds_info.get("unit_label")
+        or report.get("unit_label")
+        or ""
+    )
+
     return {
         "dataset_name": ds_name,
         "original_row_count": orig_rows,
@@ -477,6 +499,9 @@ def _extract_dataset_intelligence(report: dict[str, Any]) -> dict[str, Any]:
         "suitability_warnings": suit_warnings,
         "suitability_reasons": suit_reasons,
         "explanation": explanation,
+        "unit": unit,
+        "unit_source": unit_source,
+        "unit_label": unit_label,
     }
 
 
@@ -714,24 +739,33 @@ def build_pdf_document(report: dict[str, Any]) -> io.BytesIO:
     # Metadata & Context Grid
     ds_info = report.get("dataset_info") or {}
     model_info = report.get("model_info") or {}
-    geography = ds_info.get("geographic_scope") or "All Geographies"
+    geography = ds_info.get("geographic_scope") or report.get("geography_label") or report.get("location") or "All Geographies"
     horizon_val = report.get("horizon") or report.get("prediction_count") or "—"
     artifact_source = report.get("artifact_source") or model_info.get("artifact_source") or "trained"
 
+    intel = _extract_dataset_intelligence(report)
+    unit_val = intel.get("unit") or "Unspecified in source"
+    if unit_val == "Unspecified in source" or not unit_val:
+        unit_display = "Unspecified in source"
+        val_rmse_suffix = " (unit unspecified)"
+    else:
+        unit_display = unit_val
+        val_rmse_suffix = f" {unit_val}"
+
     xai = _extract_explainability(report)
     val_rmse_val = xai.get("validation_rmse")
-    val_rmse_str = f"{_format_num(val_rmse_val)} {target}" if val_rmse_val is not None else "Not available"
+    val_rmse_str = f"{_format_num(val_rmse_val)}{val_rmse_suffix}" if val_rmse_val is not None else "Not available"
 
     meta_rows = [
         [
             Paragraph(f"<b>Domain:</b> {_escape(domain)}", body_style),
             Paragraph(f"<b>Target Variable:</b> {_escape(target)}", body_style),
-            Paragraph(f"<b>Selected Model:</b> {_escape(model_name)}", body_style),
+            Paragraph(f"<b>Measurement Unit:</b> {_escape(unit_display)}", body_style),
         ],
         [
             Paragraph(f"<b>Forecast Type:</b> {_escape(type_label)}", body_style),
             Paragraph(f"<b>Geographic Scope:</b> {_escape(geography)}", body_style),
-            Paragraph(f"<b>Artifact Source:</b> {_escape(artifact_source).capitalize()}", body_style),
+            Paragraph(f"<b>Selected Model:</b> {_escape(model_name)}", body_style),
         ],
         [
             Paragraph(f"<b>Horizon / Points:</b> {_escape(horizon_val)} observations", body_style),
@@ -769,7 +803,6 @@ def build_pdf_document(report: dict[str, Any]) -> io.BytesIO:
     story.append(Spacer(1, 8))
 
     # Section 2: Dataset Intelligence & Data Quality Audit
-    intel = _extract_dataset_intelligence(report)
     story.append(Paragraph("2. Dataset Intelligence & Data Quality Audit", h2_style))
     story.append(
         Paragraph(
@@ -813,26 +846,32 @@ def build_pdf_document(report: dict[str, Any]) -> io.BytesIO:
         [
             Paragraph("<b>Detected Target Column:</b>", small_bold),
             Paragraph(_escape(target_display), table_cell),
-            Paragraph("<b>Forecast Features:</b>", small_bold),
-            Paragraph(_format_int(intel.get("final_forecasting_features_count"), default="Not available") + (" features" if intel.get("final_forecasting_features_count") is not None else ""), table_cell),
+            Paragraph("<b>Measurement Unit:</b>", small_bold),
+            Paragraph(_escape(unit_display), table_cell),
         ],
         [
-            Paragraph("<b>Unique Timestamps:</b>", small_bold),
-            Paragraph(_format_int(intel.get("unique_timestamps"), default="Not available"), table_cell),
+            Paragraph("<b>Forecast Features:</b>", small_bold),
+            Paragraph(_format_int(intel.get("final_forecasting_features_count"), default="Not available") + (" features" if intel.get("final_forecasting_features_count") is not None else ""), table_cell),
             Paragraph("<b>Domain-Fit Score:</b>", small_bold),
             Paragraph(_escape(fit_str), table_cell),
         ],
         [
-            Paragraph("<b>Duplicates Removed:</b>", small_bold),
-            Paragraph(_format_int(intel.get("duplicate_rows_removed"), default="Not available") + (" rows" if intel.get("duplicate_rows_removed") is not None else ""), table_cell),
+            Paragraph("<b>Unique Timestamps:</b>", small_bold),
+            Paragraph(_format_int(intel.get("unique_timestamps"), default="Not available"), table_cell),
             Paragraph("<b>Suitability Status:</b>", small_bold),
             Paragraph(_escape(suit_status_label), small_bold if "suitable" in suit_status_label.lower() else table_cell),
         ],
         [
-            Paragraph("<b>Timestamps Handled:</b>", small_bold),
-            Paragraph(_format_int(intel.get("duplicate_timestamps_count"), default="Not available") + (" handled" if intel.get("duplicate_timestamps_count") is not None else ""), table_cell),
+            Paragraph("<b>Duplicates Removed:</b>", small_bold),
+            Paragraph(_format_int(intel.get("duplicate_rows_removed"), default="Not available") + (" rows" if intel.get("duplicate_rows_removed") is not None else ""), table_cell),
             Paragraph("<b>Missing Values Imputed:</b>", small_bold),
             Paragraph(_format_int(intel.get("missing_values_handled"), default="Not available") + (" imputed" if intel.get("missing_values_handled") is not None else ""), table_cell),
+        ],
+        [
+            Paragraph("<b>Timestamps Handled:</b>", small_bold),
+            Paragraph(_format_int(intel.get("duplicate_timestamps_count"), default="Not available") + (" handled" if intel.get("duplicate_timestamps_count") is not None else ""), table_cell),
+            Paragraph("<b>Unit Source:</b>", small_bold),
+            Paragraph(_escape(intel.get("unit_source") or "unspecified").replace("_", " ").title(), table_cell),
         ],
     ]
 

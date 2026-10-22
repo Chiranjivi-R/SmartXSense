@@ -139,12 +139,21 @@ def preprocess_dataset(dataset: Dataset, payload: object) -> tuple[DatasetPrepro
                 },
             )
 
+        if getattr(schema_res, "is_multiseries", False):
+            adapted_frame = schema_res.adapt_frame(frame)
+            eff_target = schema_res.canonical_target
+            eff_time = "timestamp"
+        else:
+            adapted_frame = frame
+            eff_target = schema_res.target_column
+            eff_time = schema_res.time_column
+
         processed, features, _removed_rows = preprocess_frame(
-            frame,
+            adapted_frame,
             dataset.domain,
             region=options["dataset_region"],
-            target=schema_res.target_column,
-            time_column=schema_res.time_column,
+            target=eff_target,
+            time_column=eff_time,
         )
         # Region travels with the existing feature artifact.  It is a declared
         # dataset attribute, not inferred from the source or silently assumed.

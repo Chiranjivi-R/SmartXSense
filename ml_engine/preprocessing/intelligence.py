@@ -299,6 +299,15 @@ def detect_time_column(df: pd.DataFrame) -> tuple[str | None, list[str], float]:
         if clean in {"date_of_birth", "dob", "birth_date", "birthdate"}:
             continue
 
+        # Skip sequential integer index columns (0, 1, 2... or 1, 2, 3...)
+        if pd.api.types.is_numeric_dtype(df[col]):
+            s_num = pd.to_numeric(df[col].dropna(), errors="coerce")
+            if not s_num.empty and len(s_num) > 5:
+                if s_num.min() in (0, 1) and s_num.max() <= len(df) + 5:
+                    diffs = s_num.diff().dropna()
+                    if (diffs == 1).mean() > 0.8:
+                        continue
+
         score = 0.0
 
         kw_exact_match = any(clean == kw or clean_no_sep == kw.replace("_", "") for kw in TIME_NAME_KEYWORDS if kw != "year")
@@ -317,13 +326,21 @@ def detect_time_column(df: pd.DataFrame) -> tuple[str | None, list[str], float]:
             sample = df[col].dropna().head(100)
             if not sample.empty:
                 try:
-                    parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
+                    try:
+                        parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
+                    except Exception:
+                        parsed = pd.to_datetime(sample, errors="coerce")
                     valid_ratio = float(parsed.notna().mean())
-                    if valid_ratio > 0.7:
-                        score += 0.45 * valid_ratio
-                        # Extra bonus for actual full date string columns over single year integers
-                        if not pd.api.types.is_integer_dtype(df[col]) and sample.nunique() > 10:
-                            score += 0.2
+                    if valid_ratio >= 0.65:
+                        # Check that the parsed dates are genuine calendar years (>= 1990)
+                        years = parsed.dropna().dt.year
+                        if not years.empty and years.min() >= 1990:
+                            score += 0.45 * valid_ratio
+                            if clean.startswith("unnamed") or clean in ("index", "col_0"):
+                                score += 0.40  # Support generic headers like Unnamed: 0 when content validates as timestamps
+                            # Extra bonus for actual full date string columns over single year integers
+                            if not pd.api.types.is_integer_dtype(df[col]) and sample.nunique() > 10:
+                                score += 0.2
                 except (ValueError, TypeError, OverflowError):
                     pass
 
@@ -771,11 +788,27 @@ def profile_dataset(df: pd.DataFrame, domain: str = "retail", requested_target: 
     target_col = schema_res.target_column
     target_candidates = [c["name"] for c in schema_res.target_candidates]
 
-    # Missing value cleaning & report
-    cleaned_df, missing_report = clean_and_impute_missing_values(df, time_col=time_col, target_col=target_col, domain=domain)
+    if schema_res.is_multiseries:
+        try:
+            eval_df = schema_res.adapt_frame(df)
+            eval_time = "timestamp"
+            eval_target = schema_res.canonical_target
+        except Exception:
+            eval_df = df
+            eval_time = time_col
+            eval_target = target_col
+    else:
+        eval_df = df
+        eval_time = time_col
+        eval_target = target_col
 
-    suitability = analyze_forecasting_suitability(cleaned_df, domain=domain, requested_target=requested_target)
-    classifications = classify_columns(df, time_column=time_col, target_column=target_col)
+    # Missing value cleaning & report
+    cleaned_df, missing_report = clean_and_impute_missing_values(eval_df, time_col=eval_time, target_col=eval_target, domain=domain)
+
+    suitability = analyze_forecasting_suitability(cleaned_df, domain=domain, requested_target=eval_target)
+    suitability["detected_time_column"] = time_col
+    suitability["detected_target_column"] = target_col
+    classifications = classify_columns(df, time_column=time_col, target_column=target_col if target_col in df.columns else None)
 
     exact_dup_count = int(df.duplicated().sum())
     dup_timestamp_count = suitability.get("duplicate_timestamps", 0)
@@ -830,6 +863,17 @@ def profile_dataset(df: pd.DataFrame, domain: str = "retail", requested_target: 
         "cleaned_rows": cleaned_rows,
         "issues": suitability["reasons"],
         "explanation": explanation,
+        "unit": schema_res.unit,
+        "unit_source": schema_res.unit_source,
+        "unit_label": schema_res.unit_label,
+        "allow_aggregate": schema_res.allow_aggregate,
+        "aggregation_disabled_reason": schema_res.aggregation_disabled_reason,
+        "coverage_meta": schema_res.aggregation_coverage,
+        "is_multiseries": schema_res.is_multiseries,
+        "dataset_format": schema_res.dataset_format,
+        "detected_geographic_series": schema_res.detected_geographic_series,
+        "geographic_level": schema_res.geographic_level,
+        "parent_level": schema_res.parent_level,
     }
 
 
@@ -851,9 +895,81 @@ def _is_no_filter_val(val: Any) -> bool:
 def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | None = None) -> dict[str, Any]:
     """Inspect dataset geographic columns and return available cascading options, locations list, and row counts."""
     filters = active_filters or {}
+
+    # 1. Check for row-based geographic data first
     all_geo_cols = detect_geographic_columns(df)
+    row_geo_cols = [c for c in all_geo_cols if c in df.columns and not pd.api.types.is_numeric_dtype(df[c])]
+
+    if not row_geo_cols:
+        # Check if dataset has wide-format geographic series
+        from .feature_discovery import profile_columns, detect_wide_geographic_series
+        t_col, _, _ = detect_time_column(df)
+        profs = profile_columns(df)
+        wide_info = detect_wide_geographic_series(df, profs, t_col)
+
+        if wide_info.get("is_multiseries"):
+            comp_series = wide_info.get("component_series", [])
+            geo_level = wide_info.get("geographic_level", "state")
+            parent_lvl = wide_info.get("parent_level", "country")
+            cov_meta = wide_info.get("coverage_meta", {})
+
+            # Check if active filter / location is specified
+            loc_val = filters.get("location") or filters.get(geo_level)
+            filtered_rows = len(df)
+            active_loc = ""
+            if not _is_no_filter_val(loc_val):
+                loc_clean = str(loc_val).strip()
+                matched = next((c for c in comp_series if c.lower() == loc_clean.lower()), None)
+                if matched:
+                    active_loc = matched
+                    filtered_rows = int(df[matched].notna().sum())
+                else:
+                    filtered_rows = 0
+
+            return {
+                "has_geography": True,
+                "dataset_format": "wide_multiseries",
+                "geographic_level": geo_level,
+                "parent_level": parent_lvl,
+                "geographic_columns": {geo_level: geo_level},
+                "hierarchy_levels": [{
+                    "level_key": geo_level,
+                    "column_name": geo_level,
+                    "label": geo_level.replace("_", " ").title(),
+                    "values": comp_series,
+                    "active_value": active_loc,
+                }],
+                "levels": {
+                    "countries": [parent_lvl.title()] if parent_lvl else [],
+                    "states": comp_series if geo_level == "state" else [],
+                    "districts": comp_series if geo_level == "district" else [],
+                    "regions": comp_series if geo_level == "region" else [],
+                    "cities": comp_series if geo_level == "city" else [],
+                    "locations": comp_series,
+                },
+                "available_locations": comp_series,
+                "active_filters": filters,
+                "coverage_meta": cov_meta,
+                "allow_aggregate": wide_info.get("allow_aggregate", True),
+                "aggregation_disabled_reason": wide_info.get("aggregation_disabled_reason", ""),
+                "unit": wide_info.get("unit", "Unspecified in source"),
+                "unit_source": wide_info.get("unit_source", "unspecified"),
+                "unit_label": wide_info.get("unit_label", "Electricity Demand (unit unspecified)"),
+                "aggregate_label": f"All {geo_level.replace('_', ' ').title()}s (Aggregate)",
+                "filtered_rows": filtered_rows,
+                "total_records": filtered_rows,
+                "total_rows": len(df),
+                "training_rows": int(filtered_rows * 0.70),
+                "training_observations": int(filtered_rows * 0.70),
+                "validation_observations": int(filtered_rows * 0.15),
+                "test_observations": max(0, filtered_rows - int(filtered_rows * 0.70) - int(filtered_rows * 0.15)),
+            }
+
+    # 2. Row-based geographic data processing
     col_map: dict[str, str] = {}
     for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            continue
         clean = _clean_name(col)
         if clean in {"country", "country_name", "nation"} and "country" not in col_map:
             col_map["country"] = str(col)
@@ -869,6 +985,8 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
             col_map["location"] = str(col)
 
     for g_col in all_geo_cols:
+        if g_col in df.columns and pd.api.types.is_numeric_dtype(df[g_col]):
+            continue
         if g_col not in col_map.values():
             clean = _clean_name(g_col)
             if "city" not in col_map and any(k in clean for k in ("city", "town")):
@@ -884,7 +1002,7 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
 
     # Compile all unique available individual location values from unfiltered dataset
     all_locs = set()
-    for col_name in list(col_map.values()) + [c for c in all_geo_cols if c in df.columns]:
+    for col_name in list(col_map.values()) + [c for c in all_geo_cols if c in df.columns and not pd.api.types.is_numeric_dtype(df[c])]:
         if col_name in df.columns:
             for val in df[col_name].dropna().unique():
                 val_str = str(val).strip()
@@ -896,6 +1014,7 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
     if not has_geo:
         return {
             "has_geography": False,
+            "dataset_format": "tabular_single",
             "geographic_columns": {},
             "hierarchy_levels": [],
             "levels": {"countries": [], "states": [], "districts": [], "regions": [], "cities": [], "locations": []},
@@ -906,7 +1025,7 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
             "message": "Geographic filtering is not available for this dataset.",
         }
 
-    # Sequential cascading filter
+    # Sequential cascading filter for row-based geographic datasets
     filtered = df
 
     # Direct location matching: if location is given, dynamically find which column contains it
@@ -962,6 +1081,7 @@ def get_geographic_hierarchy(df: pd.DataFrame, active_filters: dict[str, Any] | 
 
     return {
         "has_geography": len(all_locs) > 0,
+        "dataset_format": "row_based",
         "geographic_columns": col_map,
         "hierarchy_levels": hierarchy_levels,
         "levels": {

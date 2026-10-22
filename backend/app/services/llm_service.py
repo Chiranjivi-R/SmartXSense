@@ -16,8 +16,10 @@ Guarantees:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from typing import Any
 import requests
 
@@ -520,4 +522,128 @@ def semantic_match_columns_llm(
             logger.warning(f"Failed to parse LLM semantic match response: {err}")
             
     return results
+
+
+def classify_geographic_columns_llm(
+    columns: list[str],
+    sample_data: dict[str, list[Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Use LLM routing (Groq -> Ollama -> Deterministic fallback) to determine which columns
+    represent geographic entities (states, provinces, regions, cities, countries, or parent aggregate totals)
+    versus non-geographic parameters.
+
+    Guarantees:
+    - Strictly constrained to input column names.
+    - Identifies geographic level (state, province, region, city, country, aggregate_total).
+    - Reusable across any domain and dataset structure without hard-coding specific states or countries.
+    """
+    import json
+    
+    valid_cols_set = set(columns)
+    if not columns:
+        return {}
+
+    groq_key = _get_config_var("GROQ_API_KEY")
+    groq_model = _get_config_var("GROQ_MODEL", "openai/gpt-oss-120b")
+    ollama_url = _get_config_var("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_model = _get_config_var("OLLAMA_MODEL", "qwen3:8b")
+
+    sys_prompt = (
+        "You are an expert geographical data engineer for time-series forecasting systems. "
+        "Your task is to analyze dataset column names and determine which represent geographic entities "
+        "(such as states, provinces, regions, districts, cities, countries, territories, or parent aggregate totals) "
+        "versus non-geographic parameters (metrics, dates, indices, temperatures, sensor readings, identifiers). "
+        "RULES:\n"
+        "1. You MUST only analyze columns from the provided AVAILABLE COLUMNS list.\n"
+        "2. Do NOT invent or alter column names.\n"
+        "3. Output ONLY a valid JSON object mapping each column to:\n"
+        "   {\"is_geographic\": true|false, \"geographic_level\": \"state\"|\"province\"|\"region\"|\"city\"|\"country\"|\"district\"|\"aggregate_total\"|\"none\", \"confidence\": <float_0_to_1>}.\n"
+        "4. Columns representing a summary or sum total across areas (e.g., Total, All, National, Overall) should have geographic_level=\"aggregate_total\"."
+    )
+
+    user_prompt = f"AVAILABLE COLUMNS IN DATASET:\n{json.dumps(columns)}\n\n"
+    if sample_data:
+        user_prompt += f"SAMPLE PREVIEW VALUES:\n{json.dumps(sample_data)}\n\n"
+    user_prompt += "Return JSON mapping of geographic classification:"
+
+    raw_response = None
+    if groq_key and groq_key.strip():
+        raw_response = call_groq_api(groq_key.strip(), groq_model, sys_prompt, user_prompt)
+
+    if not raw_response and check_ollama_model_available(ollama_url, ollama_model):
+        raw_response = call_ollama_api(ollama_url, ollama_model, sys_prompt, user_prompt)
+
+    results: dict[str, dict[str, Any]] = {}
+    if raw_response:
+        try:
+            json_match = re.search(r"\{[\s\S]*\}", raw_response)
+            if json_match:
+                parsed = json.loads(json_match.group(0))
+                for col_name, meta in parsed.items():
+                    if col_name in valid_cols_set and isinstance(meta, dict):
+                        is_geo = bool(meta.get("is_geographic", False))
+                        geo_lvl = str(meta.get("geographic_level", "none")).lower()
+                        conf = float(meta.get("confidence", 0.0))
+                        if is_geo and conf >= 0.5:
+                            results[col_name] = {
+                                "is_geographic": True,
+                                "geographic_level": geo_lvl,
+                                "confidence": min(1.0, conf),
+                                "method": "llm_semantic",
+                            }
+                if results:
+                    return results
+        except Exception as err:
+            logger.warning(f"Failed to parse LLM geographic classification response: {err}")
+
+    # Deterministic fallback classification using linguistic and semantic cues
+    TOTAL_KEYWORDS = {"total", "sum", "all", "overall", "aggregate", "national", "grand_total", "all_india", "us_total", "world_total"}
+    EXCLUDED_METRIC_KEYWORDS = {
+        "index", "id", "unnamed", "temp", "temperature", "humidity", "wind", "pressure", "rainfall",
+        "price", "cost", "date", "time", "hour", "day", "month", "year", "holiday", "promo", "discount",
+        "load_mw", "demand_mw", "sales", "revenue", "qty", "quantity", "units", "target"
+    }
+
+    for col in columns:
+        clean = re.sub(r"[^a-zA-Z0-9]+", "_", str(col)).lower().strip("_")
+        if not clean or clean.startswith("unnamed") or clean in ("index", "id", "row_id", "level_0"):
+            continue
+
+        # Check total / parent aggregate keywords
+        if clean in TOTAL_KEYWORDS or clean.startswith("total_") or clean.endswith("_total"):
+            results[col] = {
+                "is_geographic": True,
+                "geographic_level": "aggregate_total",
+                "confidence": 0.95,
+                "method": "rule_heuristic",
+            }
+            continue
+
+        if any(clean == k or clean.startswith(f"{k}_") or clean.endswith(f"_{k}") for k in EXCLUDED_METRIC_KEYWORDS):
+            continue
+
+        # Check level explicit markers
+        if any(marker in clean for marker in ("state", "prov")):
+            results[col] = {"is_geographic": True, "geographic_level": "state", "confidence": 0.90, "method": "rule_heuristic"}
+        elif any(marker in clean for marker in ("region", "zone", "territory")):
+            results[col] = {"is_geographic": True, "geographic_level": "region", "confidence": 0.88, "method": "rule_heuristic"}
+        elif any(marker in clean for marker in ("city", "town", "metro", "area")):
+            results[col] = {"is_geographic": True, "geographic_level": "city", "confidence": 0.88, "method": "rule_heuristic"}
+        elif any(marker in clean for marker in ("district", "county")):
+            results[col] = {"is_geographic": True, "geographic_level": "district", "confidence": 0.88, "method": "rule_heuristic"}
+        elif any(marker in clean for marker in ("country", "nation")):
+            results[col] = {"is_geographic": True, "geographic_level": "country", "confidence": 0.90, "method": "rule_heuristic"}
+        else:
+            # Check geographic suffixes or capitalized proper nouns
+            geo_morphemes = ("land", "stan", "burg", "ville", "shire", "ton", "bad", "pur", "nagar", "garh", "wood", "field", "port", "bay", "ford", "berg")
+            if any(clean.endswith(m) for m in geo_morphemes) or (len(str(col)) >= 2 and str(col)[0].isupper() and not any(char.isdigit() for char in str(col))):
+                results[col] = {
+                    "is_geographic": True,
+                    "geographic_level": "state",  # Default geographic level candidate
+                    "confidence": 0.75,
+                    "method": "linguistic_heuristic",
+                }
+
+    return results
+
 

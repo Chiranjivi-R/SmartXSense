@@ -519,6 +519,13 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
             "geography_label": prep_res["geography_label"],
             "rows_used": prep_res["rows_used"],
             "fingerprint": prep_res["fingerprint"],
+            "unit": prep_res.get("unit", "Unspecified in source"),
+            "unit_source": prep_res.get("unit_source", "unspecified"),
+            "unit_label": prep_res.get("unit_label", ""),
+            "allow_aggregate": prep_res.get("allow_aggregate", True),
+            "aggregation_disabled_reason": prep_res.get("aggregation_disabled_reason", ""),
+            "coverage_meta": prep_res.get("coverage_meta", {}),
+            "is_multiseries": prep_res.get("is_multiseries", False),
         }
         return resolved_dir, ctx
 
@@ -567,6 +574,13 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
                 "geography_label": prep_res["geography_label"],
                 "rows_used": prep_res["rows_used"],
                 "fingerprint": prep_res["fingerprint"],
+                "unit": prep_res.get("unit", "MW" if domain == "electricity" else "INR"),
+                "unit_source": prep_res.get("unit_source", "source_metadata"),
+                "unit_label": prep_res.get("unit_label", "Demand (MW)" if domain == "electricity" else "Sales (INR)"),
+                "allow_aggregate": prep_res.get("allow_aggregate", True),
+                "aggregation_disabled_reason": prep_res.get("aggregation_disabled_reason", ""),
+                "coverage_meta": prep_res.get("coverage_meta", {}),
+                "is_multiseries": prep_res.get("is_multiseries", False),
             }
             return dyn_dir, ctx
 
@@ -580,6 +594,13 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
             "geography_label": "All Geographies",
             "rows_used": len(train_df),
             "fingerprint": resolved_dir.name,
+            "unit": "MW" if domain == "electricity" else "INR",
+            "unit_source": "source_metadata",
+            "unit_label": "Demand (MW)" if domain == "electricity" else "Sales (INR)",
+            "allow_aggregate": True,
+            "aggregation_disabled_reason": "",
+            "coverage_meta": {},
+            "is_multiseries": False,
         }
         return resolved_dir, ctx
 
@@ -926,6 +947,10 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
         if dataset_ctx.get("target"):
             res["target"] = dataset_ctx["target"]
             res["canonical_target"] = DOMAIN_TARGET_MAP.get(domain, "demand_mw" if domain == "electricity" else "sales")
+        if dataset_ctx.get("unit"):
+            res["unit"] = dataset_ctx["unit"]
+            res["unit_source"] = dataset_ctx.get("unit_source", "unspecified")
+            res["unit_label"] = dataset_ctx.get("unit_label", "")
         if "comp_res" in locals() and isinstance(comp_res, dict):
             res["validation_benchmark"] = comp_res
         else:

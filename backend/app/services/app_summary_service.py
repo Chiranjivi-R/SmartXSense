@@ -152,6 +152,23 @@ def get_report(run_id: str) -> dict[str, Any]:
     clean = {key: value for key, value in record.items() if key != "predictions"}
     clean["report_id"] = clean.get("run_id")
     clean["forecast_summary"] = build_forecast_summary(clean)
+
+    ds_info = clean.get("dataset_info") or {}
+    ds_intel = clean.get("dataset_intelligence") or {}
+    unit = ds_info.get("unit") or ds_intel.get("unit") or clean.get("unit") or "Unspecified in source"
+    unit_source = ds_info.get("unit_source") or ds_intel.get("unit_source") or clean.get("unit_source") or "unspecified"
+    unit_label = ds_info.get("unit_label") or ds_intel.get("unit_label") or clean.get("unit_label") or ""
+    clean["unit"] = unit
+    clean["unit_source"] = unit_source
+    clean["unit_label"] = unit_label
+    if isinstance(clean.get("dataset_intelligence"), dict):
+        clean["dataset_intelligence"]["unit"] = unit
+        clean["dataset_intelligence"]["unit_source"] = unit_source
+        clean["dataset_intelligence"]["unit_label"] = unit_label
+    if isinstance(clean.get("dataset_info"), dict):
+        clean["dataset_info"]["unit"] = unit
+        clean["dataset_info"]["unit_source"] = unit_source
+        clean["dataset_info"]["unit_label"] = unit_label
     return clean
 
 
