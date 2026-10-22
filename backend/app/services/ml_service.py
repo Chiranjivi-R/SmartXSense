@@ -397,6 +397,16 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
             ds_obj = None
 
     if ds_obj is not None and not isinstance(ds_obj, dict):
+        if not target and hasattr(ds_obj, "preprocessing_runs") and ds_obj.preprocessing_runs:
+            try:
+                import json
+                latest_prep = ds_obj.preprocessing_runs[-1]
+                if latest_prep and latest_prep.lags_generated_json:
+                    lags_meta = json.loads(latest_prep.lags_generated_json)
+                    target = lags_meta.get("target") or lags_meta.get("canonical_target")
+            except Exception:
+                pass
+
         path = managed_upload_path(ds_obj)
         frame = _read_dataset(path, _extension(ds_obj.filename))
         dataset_name = ds_obj.filename
@@ -626,6 +636,16 @@ def resolve_dynamic_features_and_context(payload: dict[str, Any]) -> tuple[Path,
             }
             return resolved_dir, ctx
         elif ds_obj is not None:
+            if not target and hasattr(ds_obj, "preprocessing_runs") and ds_obj.preprocessing_runs:
+                try:
+                    import json
+                    latest_prep = ds_obj.preprocessing_runs[-1]
+                    if latest_prep and latest_prep.lags_generated_json:
+                        lags_meta = json.loads(latest_prep.lags_generated_json)
+                        target = lags_meta.get("target") or lags_meta.get("canonical_target")
+                except Exception:
+                    pass
+
             path = managed_upload_path(ds_obj)
             frame = _read_dataset(path, _extension(ds_obj.filename))
             dataset_name = ds_obj.filename
@@ -848,6 +868,9 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             "model": model_name,
             "artifact_reused": is_reused,
         }
+        if dataset_ctx.get("target"):
+            res["target"] = dataset_ctx["target"]
+            res["canonical_target"] = DOMAIN_TARGET_MAP.get(domain, "demand_mw" if domain == "electricity" else "sales")
         if "comp_res" in locals() and isinstance(comp_res, dict):
             res["validation_benchmark"] = comp_res
         else:
@@ -1324,6 +1347,9 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
             "model": model_name,
             "artifact_reused": artifact_info.get("used", False),
         }
+        if dataset_ctx.get("target"):
+            result["target"] = dataset_ctx["target"]
+            result["canonical_target"] = DOMAIN_TARGET_MAP.get(domain, "demand_mw" if domain == "electricity" else "sales")
         result["configuration"] = expected_configuration_for_request(
             model_key=model_name,
             domain=domain,

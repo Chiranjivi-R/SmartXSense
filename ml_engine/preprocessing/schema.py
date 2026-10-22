@@ -100,10 +100,42 @@ def _combine_electricity_year(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def normalise_domain_schema(frame: pd.DataFrame, domain: str) -> pd.DataFrame:
-    """Apply the single supported alias map for a dataset domain."""
-    if domain == "retail":
-        return rename_aliases(normalise_columns(frame), RETAIL_ALIASES)
-    if domain == "electricity":
-        return _combine_electricity_year(rename_aliases(normalise_columns(frame), ELECTRICITY_ALIASES))
-    raise ValueError(f"Unsupported dataset domain: {domain}")
+def normalise_domain_schema(
+    frame: pd.DataFrame,
+    domain: str,
+    *,
+    target: str | None = None,
+    time_column: str | None = None,
+) -> pd.DataFrame:
+    """Apply automatic feature-role resolution and alias mapping for a dataset domain."""
+    domain_clean = (domain or "retail").lower().strip()
+    if domain_clean not in ("retail", "electricity"):
+        raise ValueError(f"Unsupported dataset domain: {domain}")
+
+    # Step 1: Use centralized feature discovery to resolve target and timestamp roles
+    from .feature_discovery import discover_features_and_resolve_schema
+
+    try:
+        resolved = discover_features_and_resolve_schema(
+            frame,
+            domain=domain_clean,
+            explicit_target=target,
+            explicit_time_col=time_column,
+        )
+        if resolved.time_column and resolved.target_column:
+            # Adapt frame non-destructively
+            adapted = resolved.adapt_frame(frame)
+        else:
+            adapted = normalise_columns(frame)
+    except Exception:
+        adapted = normalise_columns(frame)
+
+    # Step 2: Apply legacy alias mapping for secondary concept normalization (store, product, price, etc.)
+    norm_frame = normalise_columns(adapted)
+    aliases = RETAIL_ALIASES if domain_clean == "retail" else ELECTRICITY_ALIASES
+    result = rename_aliases(norm_frame, aliases)
+
+    if domain_clean == "electricity":
+        result = _combine_electricity_year(result)
+
+    return result

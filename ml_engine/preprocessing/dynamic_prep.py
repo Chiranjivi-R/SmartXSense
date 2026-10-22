@@ -169,8 +169,29 @@ def prepare_dynamic_dataset(
     cleaned_row_count_after_dedup = len(dedup_df)
 
     # Step 3: Missing Value Imputation & Invalid Row Removal
-    time_col, _, _ = detect_time_column(dedup_df)
-    selected_target, _, _ = detect_target_column(dedup_df, domain=domain_clean)
+    from ml_engine.preprocessing.feature_discovery import discover_features_and_resolve_schema
+    resolved_schema = discover_features_and_resolve_schema(
+        dedup_df,
+        domain=domain_clean,
+        explicit_target=target,
+    )
+
+    if resolved_schema.is_ambiguous_target and not target:
+        raise DynamicPrepError(
+            f"Multiple candidate targets detected: {resolved_schema.ambiguous_targets}. "
+            f"Please specify the target column explicitly.",
+            400,
+        )
+
+    if resolved_schema.target_profile and resolved_schema.target_profile.is_constant:
+        raise DynamicPrepError(
+            f"Target column '{resolved_schema.target_column}' is constant (zero variance). "
+            f"Forecasting models require a target with non-constant variation.",
+            400,
+        )
+
+    time_col = resolved_schema.time_column or detect_time_column(dedup_df)[0]
+    selected_target = resolved_schema.target_column or detect_target_column(dedup_df, domain=domain_clean)[0]
     if target and target in dedup_df.columns:
         selected_target = target
 
@@ -179,12 +200,12 @@ def prepare_dynamic_dataset(
     )
 
     # Step 4: Forecasting Suitability Analysis on clean_df
-    suitability = analyze_forecasting_suitability(clean_df, domain=domain_clean, requested_target=target)
+    suitability = analyze_forecasting_suitability(clean_df, domain=domain_clean, requested_target=selected_target)
     if not suitability["is_suitable"] or suitability["classification"] == "UNSUITABLE":
         raise DynamicPrepError(suitability["explanation"], 400)
 
-    time_col = suitability["detected_time_column"]
-    selected_target = suitability["detected_target_column"]
+    time_col = suitability["detected_time_column"] or time_col
+    selected_target = suitability["detected_target_column"] or selected_target
 
     if not time_col:
         raise DynamicPrepError(f"Dataset has no parseable date/time column for {domain_clean.capitalize()} forecasting.", 400)
@@ -227,7 +248,7 @@ def prepare_dynamic_dataset(
     }
 
 
-    processed, features, _ = preprocess_frame(prep_df, domain_clean)
+    processed, features, _ = preprocess_frame(prep_df, domain_clean, target=canonical_target, time_column="timestamp")
 
 
     # Step 5: Compute Fingerprint & Materialize Feature Splits

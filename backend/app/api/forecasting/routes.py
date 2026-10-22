@@ -42,7 +42,9 @@ def forecast_route():
         return jsonify({"status": "success", "code": 200, "data": result}), 200
     except MLError as err:
         return _error_response(err)
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception("Forecast route error: %s", e)
         return _internal_error()
 
 

@@ -45,7 +45,10 @@ def reports_pdf(run_id: str):
         from flask import send_file
         from ...services.pdf_report_service import generate_pdf_for_run_id
         from ml_engine.history.forecast_history import ForecastHistoryError
+    except ImportError as e:
+        return jsonify({"status": "error", "code": 500, "message": f"PDF report dependencies unavailable: {e}"}), 500
 
+    try:
         pdf_buffer = generate_pdf_for_run_id(run_id)
         filename = f"SmartXSense_Report_{run_id}.pdf"
         return send_file(

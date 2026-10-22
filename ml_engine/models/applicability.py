@@ -98,7 +98,21 @@ def profile_dataset_for_applicability(
     row_count = len(df)
 
     # 2. Timestamp analysis
-    has_timestamp = "timestamp" in df.columns
+    time_col = "timestamp" if "timestamp" in df.columns else None
+    resolved_target = target_column
+
+    if (time_col is None or resolved_target is None) and row_count > 0:
+        try:
+            from ml_engine.preprocessing.feature_discovery import discover_features_and_resolve_schema
+            discovered = discover_features_and_resolve_schema(df, domain=domain, explicit_target=target_column)
+            if time_col is None and discovered.time_column and discovered.time_column in df.columns:
+                time_col = discovered.time_column
+            if resolved_target is None and discovered.target_column and discovered.target_column in df.columns:
+                resolved_target = discovered.target_column
+        except Exception:
+            pass
+
+    has_timestamp = bool(time_col and time_col in df.columns)
     unique_timestamps = 0
     dup_timestamps = 0
     uniqueness_ratio = 0.0
@@ -106,7 +120,7 @@ def profile_dataset_for_applicability(
     detected_freq = "unknown"
 
     if has_timestamp and row_count > 0:
-        ts_parsed = pd.to_datetime(df["timestamp"], errors="coerce")
+        ts_parsed = pd.to_datetime(df[time_col], errors="coerce")
         valid_ts = ts_parsed.dropna()
         unique_timestamps = int(valid_ts.nunique())
         dup_timestamps = int(len(valid_ts) - unique_timestamps)
@@ -139,7 +153,6 @@ def profile_dataset_for_applicability(
     target_variance = 0.0
     is_constant_target = True
 
-    resolved_target = target_column
     if not resolved_target:
         if "sales" in df.columns:
             resolved_target = "sales"
@@ -151,7 +164,7 @@ def profile_dataset_for_applicability(
             resolved_target = "demand_mw"
         else:
             # Fallback to numeric columns
-            num_cols = [c for c in df.select_dtypes(include="number").columns if c not in ("timestamp", "year", "month", "day")]
+            num_cols = [c for c in df.select_dtypes(include="number").columns if c not in ("timestamp", "year", "month", "day", time_col)]
             if num_cols:
                 resolved_target = num_cols[0]
 
@@ -173,6 +186,8 @@ def profile_dataset_for_applicability(
 
     # 4. Usable feature count (excluding timestamp, target, revenue)
     excluded = {"timestamp", "revenue", target_name}
+    if time_col:
+        excluded.add(time_col)
     feature_cols = [c for c in df.columns if c not in excluded]
     usable_feature_count = len(feature_cols)
 

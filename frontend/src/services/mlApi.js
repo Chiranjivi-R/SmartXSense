@@ -118,17 +118,28 @@ export async function validateDataset({ datasetId, domain, accessToken }) {
   return parseJsonResponse(response);
 }
 
-export async function preprocessDataset({ datasetId, accessToken }) {
+export async function preprocessDataset({
+  datasetId,
+  accessToken,
+  target,
+  timeColumn,
+  columnMapping,
+}) {
+  const body = {
+    generate_lags: false,
+    generate_forecast_features: true,
+  };
+  if (target) body.target = target;
+  if (timeColumn) body.time_column = timeColumn;
+  if (columnMapping) body.column_mapping = columnMapping;
+
   const response = await fetch(`${API_BASE_URL}/api/v1/datasets/${datasetId}/preprocess`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      generate_lags: false,
-      generate_forecast_features: true,
-    }),
+    body: JSON.stringify(body),
   });
   return parseJsonResponse(response);
 }

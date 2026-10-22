@@ -28,7 +28,7 @@ from ml_engine.models.applicability import (
 
 # Models included in default Compare / Auto Select candidate lists (filtered dynamically by applicability).
 DEFAULT_COMPARE_MODELS: dict[str, list[str]] = {
-    "electricity": ["random_forest", "xgboost", "trend_xgboost", "hybrid"],
+    "electricity": ["arima", "sarima", "random_forest", "xgboost", "trend_xgboost", "hybrid"],
     "retail": ["arima", "sarima", "random_forest", "xgboost", "lstm", "hybrid"],
 }
 

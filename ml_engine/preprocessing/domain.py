@@ -8,18 +8,30 @@ from .cleaner import PreprocessingError, add_calendar_features, clean_timestamp_
 from .schema import normalise_domain_schema
 
 
-def preprocess_retail(frame: pd.DataFrame, *, region: str = "other") -> tuple[pd.DataFrame, list[str], int]:
+def preprocess_retail(
+    frame: pd.DataFrame,
+    *,
+    region: str = "other",
+    target: str | None = None,
+    time_column: str | None = None,
+) -> tuple[pd.DataFrame, list[str], int]:
     """Normalize heterogeneous retail datasets to timestamp and numeric sales."""
-    result = normalise_domain_schema(frame, "retail")
+    result = normalise_domain_schema(frame, "retail", target=target, time_column=time_column)
     require_columns(result, {"timestamp", "sales"})
     cleaned, removed = clean_timestamp_and_target(result, "sales")
     cleaned, features = add_calendar_features(cleaned, region=region)
     return cleaned, features, removed
 
 
-def preprocess_electricity(frame: pd.DataFrame, *, region: str = "other") -> tuple[pd.DataFrame, list[str], int]:
-    """Normalize Indian hourly demand profiles to timestamp and demand_mw."""
-    result = normalise_domain_schema(frame, "electricity")
+def preprocess_electricity(
+    frame: pd.DataFrame,
+    *,
+    region: str = "other",
+    target: str | None = None,
+    time_column: str | None = None,
+) -> tuple[pd.DataFrame, list[str], int]:
+    """Normalize hourly demand profiles to timestamp and demand_mw."""
+    result = normalise_domain_schema(frame, "electricity", target=target, time_column=time_column)
     require_columns(result, {"timestamp", "demand_mw"})
     cleaned, removed = clean_timestamp_and_target(result, "demand_mw")
     # An exact source-row duplicate is already removed above. Timestamp-only
@@ -31,9 +43,16 @@ def preprocess_electricity(frame: pd.DataFrame, *, region: str = "other") -> tup
     return cleaned, features, removed
 
 
-def preprocess_frame(frame: pd.DataFrame, domain: str, *, region: str = "other") -> tuple[pd.DataFrame, list[str], int]:
+def preprocess_frame(
+    frame: pd.DataFrame,
+    domain: str,
+    *,
+    region: str = "other",
+    target: str | None = None,
+    time_column: str | None = None,
+) -> tuple[pd.DataFrame, list[str], int]:
     if domain == "retail":
-        return preprocess_retail(frame, region=region)
+        return preprocess_retail(frame, region=region, target=target, time_column=time_column)
     if domain == "electricity":
-        return preprocess_electricity(frame, region=region)
+        return preprocess_electricity(frame, region=region, target=target, time_column=time_column)
     raise PreprocessingError("Unsupported dataset domain")

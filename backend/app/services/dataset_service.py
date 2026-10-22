@@ -427,28 +427,41 @@ def delete_dataset(dataset: Dataset) -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _schema_issues(frame: pd.DataFrame, domain: str, strict_mode: bool) -> list[dict]:
-    from ml_engine.preprocessing.intelligence import detect_target_column, detect_time_column
+def _schema_issues(frame: pd.DataFrame, domain: str, strict_mode: bool) -> tuple[list[dict], dict[str, Any]]:
+    from ml_engine.preprocessing.feature_discovery import discover_features_and_resolve_schema
 
     issues: list[dict] = []
     if frame.empty:
         if strict_mode:
             issues.append({"type": "empty_dataset", "message": "Dataset contains 0 rows."})
-        return issues
+        return issues, {}
 
-    time_col, _, _ = detect_time_column(frame)
-    target_col, _, _ = detect_target_column(frame, domain=domain)
+    schema_res = discover_features_and_resolve_schema(frame, domain=domain)
 
     missing = []
-    if not time_col:
+    if not schema_res.time_column:
         missing.append("timestamp / date column")
-    if not target_col:
+    if not schema_res.target_column:
         missing.append(f"{domain} target column")
 
     if missing:
         issues.append({"type": "missing_required_columns", "columns": missing})
+    elif not schema_res.is_valid:
+        for err in schema_res.validation_issues:
+            issues.append({"type": "invalid_schema", "message": err})
 
-    return issues
+    schema_metadata = {
+        "target": schema_res.target_column,
+        "time_column": schema_res.time_column,
+        "target_column": schema_res.target_column,
+        "canonical_target": schema_res.canonical_target,
+        "target_candidates": [c["name"] for c in schema_res.target_candidates],
+        "is_ambiguous_target": schema_res.is_ambiguous_target,
+        "ambiguous_targets": schema_res.ambiguous_targets,
+        "column_roles": schema_res.column_roles,
+    }
+
+    return issues, schema_metadata
 
 
 def validate_dataset(dataset: Dataset, payload: object) -> tuple[DatasetValidation, dict]:
@@ -463,6 +476,7 @@ def validate_dataset(dataset: Dataset, payload: object) -> tuple[DatasetValidati
     issues: list[dict]
     missing_summary: dict[str, int]
     duplicate_rows = 0
+    schema_meta: dict[str, Any] = {}
     try:
         if not _is_managed_upload(path) or not path.is_file():
             issues = [{"type": "file_unavailable"}]
@@ -471,7 +485,7 @@ def validate_dataset(dataset: Dataset, payload: object) -> tuple[DatasetValidati
             frame = _read_dataset(path, _extension(dataset.filename))
             missing_summary = {str(column): int(count) for column, count in frame.isna().sum().items()}
             duplicate_rows = int(frame.duplicated().sum())
-            issues = _schema_issues(frame, dataset.domain, strict_mode)
+            issues, schema_meta = _schema_issues(frame, dataset.domain, strict_mode)
     except DatasetError as exc:
         issues = [{"type": "unreadable_file", "message": exc.message}]
         missing_summary = {}
@@ -495,6 +509,8 @@ def validate_dataset(dataset: Dataset, payload: object) -> tuple[DatasetValidati
         raise DatasetError("Unable to save validation results", 500) from exc
 
     logs = ["Schema check passed"] if valid else ["Schema validation failed"]
+    if schema_meta.get("is_ambiguous_target"):
+        logs.append(f"Multiple candidate targets detected: {schema_meta['ambiguous_targets']}. Confirm target selection if needed.")
     logs.extend(f"{count} missing values flagged in {column}" for column, count in missing_summary.items() if count)
     return validation, {
         "dataset_id": dataset.dataset_id,
@@ -502,6 +518,7 @@ def validate_dataset(dataset: Dataset, payload: object) -> tuple[DatasetValidati
         "missing_value_summary": missing_summary,
         "duplicate_rows": duplicate_rows,
         "validation_logs": logs,
+        **schema_meta,
     }
 
 

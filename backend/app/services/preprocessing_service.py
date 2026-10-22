@@ -37,6 +37,9 @@ def _options(payload: object) -> dict:
     # Default True: connect upload flow to existing forecasting feature pipeline.
     generate_forecast_features = body.get("generate_forecast_features", True)
     dataset_region = str(body.get("dataset_region", "other")).lower().strip()
+    target = body.get("target")
+    time_column = body.get("time_column")
+    column_mapping = body.get("column_mapping")
     if imputation not in ALLOWED_IMPUTATION or scaler not in ALLOWED_SCALERS or outlier_method not in ALLOWED_OUTLIER_METHODS:
         raise DatasetError("Invalid preprocessing parameters", errors={"preprocessing": ["Unsupported imputation, scaler, or outlier method."]})
     if not isinstance(generate_lags, bool) or not isinstance(lag_intervals, list) or not all(isinstance(value, int) and value > 0 for value in lag_intervals):
@@ -56,6 +59,9 @@ def _options(payload: object) -> dict:
         "outlier_method": outlier_method,
         "generate_forecast_features": generate_forecast_features,
         "dataset_region": dataset_region,
+        "target": str(target).strip() if target else None,
+        "time_column": str(time_column).strip() if time_column else None,
+        "column_mapping": column_mapping if isinstance(column_mapping, dict) else None,
     }
 
 
@@ -102,9 +108,44 @@ def preprocess_dataset(dataset: Dataset, payload: object) -> tuple[DatasetPrepro
     output_path = output_dir / f"proc_{preprocessing_id}.parquet"
     features_dir_path: Path | None = None
 
+    from ml_engine.preprocessing.feature_discovery import discover_features_and_resolve_schema
+
     try:
         frame = _read_dataset(raw_path, _extension(dataset.filename))
-        processed, features, _removed_rows = preprocess_frame(frame, dataset.domain, region=options["dataset_region"])
+        schema_res = discover_features_and_resolve_schema(
+            frame,
+            domain=dataset.domain,
+            explicit_target=options["target"],
+            explicit_time_col=options["time_column"],
+            explicit_mapping=options["column_mapping"],
+        )
+
+        if not schema_res.is_valid:
+            raise DatasetError(
+                "Dataset preprocessing failed: " + " ".join(schema_res.validation_issues),
+                400,
+                {"schema": schema_res.validation_issues},
+            )
+
+        if schema_res.is_ambiguous_target and not options["target"]:
+            raise DatasetError(
+                schema_res.explanation,
+                400,
+                {
+                    "schema": [schema_res.explanation],
+                    "ambiguous_targets": schema_res.ambiguous_targets,
+                    "target_candidates": schema_res.target_candidates,
+                    "requires_target_selection": True,
+                },
+            )
+
+        processed, features, _removed_rows = preprocess_frame(
+            frame,
+            dataset.domain,
+            region=options["dataset_region"],
+            target=schema_res.target_column,
+            time_column=schema_res.time_column,
+        )
         # Region travels with the existing feature artifact.  It is a declared
         # dataset attribute, not inferred from the source or silently assumed.
         processed["calendar_region"] = options["dataset_region"]
@@ -126,8 +167,19 @@ def preprocess_dataset(dataset: Dataset, payload: object) -> tuple[DatasetPrepro
         "train_rows": 0,
         "validation_rows": 0,
         "test_rows": 0,
+        "target": schema_res.target_column,
+        "canonical_target": schema_res.canonical_target,
+        "time_column": schema_res.time_column,
+        "column_mapping": schema_res.canonical_mapping,
     }
-    lineage: dict = {"lags": [], "features_ready": False}
+    lineage: dict = {
+        "lags": [],
+        "features_ready": False,
+        "target": schema_res.target_column,
+        "canonical_target": schema_res.canonical_target,
+        "time_column": schema_res.time_column,
+        "column_mapping": schema_res.canonical_mapping,
+    }
 
     if options["generate_forecast_features"]:
         try:
@@ -150,12 +202,20 @@ def preprocess_dataset(dataset: Dataset, payload: object) -> tuple[DatasetPrepro
                 "validation_rows": materialized["validation_rows"],
                 "test_rows": materialized["test_rows"],
                 "feature_report": materialized["report"],
+                "target": schema_res.target_column,
+                "canonical_target": schema_res.canonical_target,
+                "time_column": schema_res.time_column,
+                "column_mapping": schema_res.canonical_mapping,
             }
             lineage = {
                 "lags": list(materialized["feature_names"]),
                 "features_ready": True,
                 "features_dir": relative_features,
                 "features_id": materialized["features_id"],
+                "target": schema_res.target_column,
+                "canonical_target": schema_res.canonical_target,
+                "time_column": schema_res.time_column,
+                "column_mapping": schema_res.canonical_mapping,
             }
         except (FeatureEngineeringError, TimeSeriesSplitError, ValueError, OSError) as exc:
             if features_dir_path is not None and _is_managed_features(features_dir_path):

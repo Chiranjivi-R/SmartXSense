@@ -758,23 +758,24 @@ def aggregate_duplicate_timestamps(
 
 def profile_dataset(df: pd.DataFrame, domain: str = "retail", requested_target: str | None = None) -> dict[str, Any]:
     """Inspect dataset and compute intelligence, schema breakdown, suitability, and data quality metadata."""
+    from .feature_discovery import discover_features_and_resolve_schema
+
     n_rows = len(df)
     n_cols = len(df.columns)
     column_names = [str(c) for c in df.columns]
 
-    time_col, time_candidates, time_conf = detect_time_column(df)
-    target_col, target_candidates, target_conf = detect_target_column(df, domain=domain)
-    if requested_target and requested_target in column_names:
-        target_col = requested_target
-        if requested_target not in target_candidates:
-            target_candidates.insert(0, requested_target)
+    schema_res = discover_features_and_resolve_schema(df, domain=domain, explicit_target=requested_target)
+
+    time_col = schema_res.time_column
+    time_candidates = [c["name"] for c in schema_res.time_candidates]
+    target_col = schema_res.target_column
+    target_candidates = [c["name"] for c in schema_res.target_candidates]
 
     # Missing value cleaning & report
     cleaned_df, missing_report = clean_and_impute_missing_values(df, time_col=time_col, target_col=target_col, domain=domain)
 
     suitability = analyze_forecasting_suitability(cleaned_df, domain=domain, requested_target=requested_target)
     classifications = classify_columns(df, time_column=time_col, target_column=target_col)
-
 
     exact_dup_count = int(df.duplicated().sum())
     dup_timestamp_count = suitability.get("duplicate_timestamps", 0)
@@ -784,6 +785,8 @@ def profile_dataset(df: pd.DataFrame, domain: str = "retail", requested_target: 
 
     if not suitability["is_suitable"]:
         explanation = f"Dataset may not be fully suitable for {domain.capitalize()} forecasting. Reason: {' '.join(suitability['reasons'])}"
+    elif schema_res.is_ambiguous_target and not requested_target:
+        explanation = schema_res.explanation
     elif len(suitability["warnings"]) > 0:
         explanation = f"Dataset is valid for forecasting with warnings. Note: {' '.join(suitability['warnings'])}"
     else:
@@ -802,6 +805,12 @@ def profile_dataset(df: pd.DataFrame, domain: str = "retail", requested_target: 
         "time_candidates": time_candidates,
         "target_candidates": target_candidates,
         "selected_target": target_col,
+        "canonical_target": schema_res.canonical_target,
+        "is_ambiguous_target": schema_res.is_ambiguous_target,
+        "ambiguous_targets": schema_res.ambiguous_targets,
+        "column_roles": schema_res.column_roles,
+        "canonical_mapping": schema_res.canonical_mapping,
+        "reverse_mapping": schema_res.reverse_mapping,
         "unique_timestamps": unique_timestamps,
         "semantic_matches": suitability["semantic_matches"],
         "numeric_columns": classifications["numeric_columns"],
@@ -816,7 +825,6 @@ def profile_dataset(df: pd.DataFrame, domain: str = "retail", requested_target: 
         "missing_report": missing_report,
         "missing_values_handled": missing_report["missing_values_handled"],
         "duplicate_rows": exact_dup_count,
-
         "duplicate_rows_removed": exact_dup_count,
         "duplicate_timestamps_count": dup_timestamp_count,
         "cleaned_rows": cleaned_rows,
