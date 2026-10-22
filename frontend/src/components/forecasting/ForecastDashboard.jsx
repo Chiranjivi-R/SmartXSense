@@ -1930,41 +1930,6 @@ export default function ForecastDashboard({ initialDomain = 'retail', userRole =
               <h3 style={{ fontSize: 18, fontWeight: 800, color: COLORS.text.primary, margin: 0, fontFamily: "'Space Grotesk', sans-serif" }}>
                 AI Explanation
               </h3>
-              <span
-                style={{
-                  background: forecastData.llm_explanation.provider === 'groq'
-                    ? `${COLORS.primary}22`
-                    : forecastData.llm_explanation.provider === 'ollama'
-                    ? `${COLORS.warning}22`
-                    : `${COLORS.text.muted}22`,
-                  color: forecastData.llm_explanation.provider === 'groq'
-                    ? COLORS.primary
-                    : forecastData.llm_explanation.provider === 'ollama'
-                    ? COLORS.warning
-                    : COLORS.text.secondary,
-                  border: `1px solid ${
-                    forecastData.llm_explanation.provider === 'groq'
-                      ? COLORS.primary
-                      : forecastData.llm_explanation.provider === 'ollama'
-                      ? COLORS.warning
-                      : COLORS.text.muted
-                  }44`,
-                  borderRadius: 8,
-                  padding: '4px 10px',
-                  fontSize: 12,
-                  fontWeight: 700,
-                  fontFamily: "'Space Mono', monospace",
-                }}
-              >
-                {forecastData.llm_explanation.provider === 'groq'
-                  ? 'AI Explanation · Groq'
-                  : forecastData.llm_explanation.provider === 'ollama'
-                  ? 'AI Explanation · Ollama fallback'
-                  : 'AI Explanation · Local deterministic fallback'}
-              </span>
-            </div>
-            <div style={{ fontSize: 12, color: COLORS.text.muted }}>
-              Model: <strong style={{ color: COLORS.text.primary }}>{forecastData.llm_explanation.model || 'Local Rule Generator'}</strong>
             </div>
           </div>
 

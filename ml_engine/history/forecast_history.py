@@ -162,6 +162,7 @@ def build_history_record(
     test_evaluation: dict[str, Any] | None = None,
     forecast_data: dict[str, Any] | None = None,
     explainability: dict[str, Any] | None = None,
+    dataset_intelligence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a comprehensive forecast history and report record (never stores raw 'predictions' key)."""
     if forecast_type not in {"test_evaluation", "future"}:
@@ -205,6 +206,8 @@ def build_history_record(
         record["forecast_data"] = forecast_data
     if explainability:
         record["explainability"] = explainability
+    if dataset_intelligence:
+        record["dataset_intelligence"] = dataset_intelligence
     return record
 
 
@@ -378,6 +381,15 @@ def safe_record_from_forecast_result(
                     "timestamp": str(p.get("timestamp")),
                     "predicted": p_val,
                 }
+                if p.get("lower_bound") is not None:
+                    pt["lower_bound"] = float(p["lower_bound"])
+                elif p.get("lower") is not None:
+                    pt["lower_bound"] = float(p["lower"])
+                if p.get("upper_bound") is not None:
+                    pt["upper_bound"] = float(p["upper_bound"])
+                elif p.get("upper") is not None:
+                    pt["upper_bound"] = float(p["upper"])
+
                 if forecast_type == "test_evaluation":
                     pt["actual"] = a_val
                     pt["residual"] = r_val
@@ -398,11 +410,74 @@ def safe_record_from_forecast_result(
             "points": points,
         }
 
-        # 6. Explainability
+        # 6. Dataset Intelligence & Data Quality
+        ds_intel = result.get("dataset_intelligence") or ds_ctx.get("dataset_intelligence")
+        if not isinstance(ds_intel, dict):
+            clean_sum = ds_ctx.get("cleaning_summary") or {}
+            suit_data = ds_ctx.get("suitability") or {}
+            orig_rows = ds_ctx.get("raw_rows") or clean_sum.get("raw_row_count") or ds_ctx.get("rows_used")
+            cleaned_rows = ds_ctx.get("cleaned_rows") or clean_sum.get("final_cleaned_rows")
+            tr_rows = ds_ctx.get("train_rows")
+            val_rows = ds_ctx.get("validation_rows")
+            te_rows = ds_ctx.get("test_rows")
+            horizon_steps = result.get("horizon") if forecast_type == "future" else len(points)
+
+            ds_intel = {
+                "dataset_name": dataset_info.get("dataset_name"),
+                "dataset_id": dataset_info.get("dataset_id"),
+                "original_row_count": orig_rows,
+                "original_column_count": ds_ctx.get("column_count"),
+                "cleaned_row_count": cleaned_rows,
+                "training_observations": tr_rows,
+                "validation_observations": val_rows,
+                "test_observations": te_rows,
+                "forecast_horizon": horizon_steps,
+                "detected_time_column": ds_ctx.get("time_column") or "timestamp",
+                "detected_target_column": result.get("target"),
+                "canonical_target": result.get("canonical_target") or result.get("target"),
+                "unique_timestamps": ds_ctx.get("unique_timestamps") or suit_data.get("unique_timestamps"),
+                "duplicate_rows_removed": clean_sum.get("exact_duplicates_removed") or ds_ctx.get("duplicate_rows_removed"),
+                "duplicate_timestamps_handled": bool(clean_sum.get("duplicate_timestamps_count") or ds_ctx.get("duplicate_timestamps_count")),
+                "duplicate_timestamps_count": clean_sum.get("duplicate_timestamps_count") or ds_ctx.get("duplicate_timestamps_count"),
+                "missing_values_handled": clean_sum.get("missing_values_handled") or ds_ctx.get("missing_values_handled"),
+                "excluded_features": clean_sum.get("excluded_features") or ds_ctx.get("excluded_features") or [],
+                "excluded_reasons": clean_sum.get("excluded_reasons") or ds_ctx.get("excluded_reasons") or {},
+                "excluded_features_count": clean_sum.get("excluded_features_count") or ds_ctx.get("excluded_features_count"),
+                "final_forecasting_features_count": ds_ctx.get("final_forecasting_features_count"),
+                "domain_fit_score": ds_ctx.get("confidence") or suit_data.get("confidence"),
+                "domain_fit_label": ds_ctx.get("confidence_label") or suit_data.get("confidence_label"),
+                "suitability_status": suit_data.get("classification") or ("SUITABLE" if suit_data.get("is_suitable") else None),
+                "suitability_label": suit_data.get("status_label"),
+                "suitability_warnings": suit_data.get("warnings") or [],
+                "suitability_reasons": suit_data.get("reasons") or [],
+                "explanation": suit_data.get("explanation") or result.get("dataset_explanation"),
+            }
+
+        # 7. Explainability
         feat_imp = result.get("feature_importance") or result.get("feature_importances")
         llm_exp = result.get("llm_explanation")
+        shap_data = result.get("shap_explanation") or result.get("shap_features")
+        lime_data = result.get("lime_explanation")
+
+        val_rmse = None
+        if isinstance(val_bench, dict) and val_bench.get("ranking"):
+            for candidate in val_bench["ranking"]:
+                if candidate.get("model") == raw_m or candidate.get("rank") == 1:
+                    val_rmse = (candidate.get("validation_metrics") or candidate.get("metrics") or {}).get("rmse")
+                    if val_rmse is not None:
+                        break
+        if val_rmse is None and isinstance(result.get("validation_metrics"), dict):
+            val_rmse = result["validation_metrics"].get("rmse")
+
         explainability = {
+            "selected_model": raw_m,
+            "selection_reason": result.get("selection_reason") or model_info.get("selection_method"),
+            "selection_criterion": model_info.get("selection_criterion", "Lowest Validation RMSE"),
+            "validation_rmse": val_rmse,
             "feature_importance": feat_imp if isinstance(feat_imp, (dict, list)) else None,
+            "shap_features": shap_data if isinstance(shap_data, (dict, list)) else None,
+            "shap_explanation": result.get("shap_explanation"),
+            "lime_explanation": lime_data if isinstance(lime_data, (dict, list)) else None,
             "ai_explanation": llm_exp if isinstance(llm_exp, (dict, str)) else None,
         }
 
@@ -424,6 +499,7 @@ def safe_record_from_forecast_result(
             test_evaluation=test_evaluation,
             forecast_data=forecast_data,
             explainability=explainability,
+            dataset_intelligence=ds_intel,
         )
         summary = record_forecast_run(record, history_root=history_root)
         return summary

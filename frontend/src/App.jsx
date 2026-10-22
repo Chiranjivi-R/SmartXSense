@@ -8,7 +8,7 @@ import ExplainabilityPage from "./components/xai/ExplainabilityPage";
 import ModelsCatalogPage from "./components/models/ModelsCatalogPage";
 import ReportsPage from "./components/reports/ReportsPage";
 import SystemSettingsPage from "./components/settings/SystemSettingsPage";
-import { fetchAuthenticatedUser, login } from "./services/mlApi";
+import { fetchAuthenticatedUser, login, refreshAccessToken } from "./services/mlApi";
 
 // ─── Color Palette ────────────────────────────────────────────────────────────
 const COLORS = {
@@ -135,6 +135,26 @@ const TopBar = ({ page, showNotifs, setShowNotifs, user }) => {
         display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, fontWeight: 700,
         color: "#fff", cursor: "pointer",
       }}>A</div>
+      <button
+        onClick={() => {
+          window.localStorage.removeItem('smartxsense_access_token');
+          window.localStorage.removeItem('smartxsense_refresh_token');
+          window.dispatchEvent(new CustomEvent('smartxsense:session-expired'));
+        }}
+        title="Sign out"
+        style={{
+          background: "transparent",
+          border: `1px solid ${COLORS.bg.border}`,
+          borderRadius: 8,
+          padding: "6px 12px",
+          color: COLORS.text.secondary,
+          cursor: "pointer",
+          fontSize: 12,
+          fontWeight: 600,
+        }}
+      >
+        Sign out
+      </button>
     </div>
   );
 };
@@ -355,11 +375,49 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!accessToken) return;
-    fetchAuthenticatedUser(accessToken).then(setUser).catch(() => {
+    const handleExpired = () => {
       window.localStorage.removeItem('smartxsense_access_token');
+      window.localStorage.removeItem('smartxsense_refresh_token');
       setAccessToken(null);
-    });
+      setUser(null);
+      setLoginError('Your session has expired. Please sign in again.');
+    };
+
+    const handleRefreshed = (e) => {
+      if (e.detail?.accessToken) {
+        setAccessToken(e.detail.accessToken);
+      }
+    };
+
+    window.addEventListener('smartxsense:session-expired', handleExpired);
+    window.addEventListener('smartxsense:token-refreshed', handleRefreshed);
+    return () => {
+      window.removeEventListener('smartxsense:session-expired', handleExpired);
+      window.removeEventListener('smartxsense:token-refreshed', handleRefreshed);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!accessToken) return;
+    fetchAuthenticatedUser(accessToken)
+      .then(setUser)
+      .catch(async () => {
+        const refreshed = await refreshAccessToken();
+        if (refreshed) {
+          setAccessToken(refreshed);
+          try {
+            const u = await fetchAuthenticatedUser(refreshed);
+            setUser(u);
+            return;
+          } catch {
+            // fall through to clear state
+          }
+        }
+        window.localStorage.removeItem('smartxsense_access_token');
+        window.localStorage.removeItem('smartxsense_refresh_token');
+        setAccessToken(null);
+        setUser(null);
+      });
   }, [accessToken]);
 
   const handleLogin = async (email, password) => {
@@ -367,6 +425,9 @@ export default function App() {
     try {
       const session = await login({ email, password });
       window.localStorage.setItem('smartxsense_access_token', session.access_token);
+      if (session.refresh_token) {
+        window.localStorage.setItem('smartxsense_refresh_token', session.refresh_token);
+      }
       setAccessToken(session.access_token);
       setUser(session.user);
     } catch (error) {

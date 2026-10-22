@@ -127,6 +127,57 @@ def _attach_history(
         except Exception:
             context_frame = None
     result["summary_facts"] = derive_forecast_facts(result, context_frame=context_frame)
+
+    if "dataset_intelligence" not in result:
+        try:
+            from ml_engine.preprocessing.intelligence import profile_dataset
+            train_p = features_dir / "train.parquet"
+            val_p = features_dir / "validation.parquet"
+            test_p = features_dir / "test.parquet"
+            if train_p.exists():
+                train_df = pd.read_parquet(train_p)
+                val_obs = len(pd.read_parquet(val_p)) if val_p.exists() else 0
+                test_obs = len(pd.read_parquet(test_p)) if test_p.exists() else 0
+                tr_obs = len(train_df)
+                total_obs = tr_obs + val_obs + test_obs
+                dom = str(result.get("domain") or "retail").lower().strip()
+                tgt = result.get("target")
+                prof = profile_dataset(train_df, domain=dom, requested_target=tgt)
+
+                ds_ctx = result.get("dataset_context") or {}
+                result["dataset_intelligence"] = {
+                    "dataset_name": ds_ctx.get("dataset_name") or f"{dom.capitalize()} Dataset",
+                    "dataset_id": ds_ctx.get("dataset_id"),
+                    "original_row_count": total_obs,
+                    "original_column_count": prof.get("column_count"),
+                    "cleaned_row_count": total_obs,
+                    "training_observations": tr_obs,
+                    "validation_observations": val_obs,
+                    "test_observations": test_obs,
+                    "forecast_horizon": result.get("horizon") if forecast_type == "future" else len(result.get("predictions") or []),
+                    "detected_time_column": prof.get("time_column") or "timestamp",
+                    "detected_target_column": prof.get("selected_target") or tgt,
+                    "canonical_target": prof.get("canonical_target") or tgt,
+                    "unique_timestamps": prof.get("unique_timestamps"),
+                    "duplicate_rows_removed": prof.get("duplicate_rows_removed", 0),
+                    "duplicate_timestamps_handled": bool(prof.get("duplicate_timestamps_count", 0)),
+                    "duplicate_timestamps_count": prof.get("duplicate_timestamps_count", 0),
+                    "missing_values_handled": prof.get("missing_values_handled", 0),
+                    "excluded_features": prof.get("ignored_columns") or [],
+                    "excluded_reasons": prof.get("ignored_reasons") or {},
+                    "excluded_features_count": prof.get("excluded_features_count", 0),
+                    "final_forecasting_features_count": prof.get("final_forecasting_features_count"),
+                    "domain_fit_score": prof.get("confidence"),
+                    "domain_fit_label": prof.get("confidence_label"),
+                    "suitability_status": prof.get("suitability", {}).get("classification") or ("SUITABLE" if prof.get("suitable") else "UNSUITABLE"),
+                    "suitability_label": prof.get("suitability", {}).get("status_label") or ("✓ Fully Suitable" if prof.get("suitable") else "⚠️ Unsuitable"),
+                    "suitability_warnings": prof.get("suitability", {}).get("warnings", []),
+                    "suitability_reasons": prof.get("suitability", {}).get("reasons", []),
+                    "explanation": prof.get("explanation"),
+                }
+        except Exception:
+            pass
+
     summary = safe_record_from_forecast_result(
         result=result,
         forecast_type=forecast_type,
@@ -248,6 +299,8 @@ def _attach_llm_explanation(
         }
 
         res["llm_explanation"] = generate_explanation(context)
+        res["shap_features"] = shap_features
+        res["selection_reason"] = selection_reason
         llm_time_ms = round((time.perf_counter() - t_llm_start) * 1000, 2)
         res["pipeline_diagnostics"] = {
             "shap_calculation_ms": shap_time_ms,
@@ -255,6 +308,8 @@ def _attach_llm_explanation(
         }
     except Exception as err:
         logger.warning(f"Failed to generate LLM explanation: {err}")
+        res["shap_features"] = shap_features if "shap_features" in locals() and shap_features else []
+        res["selection_reason"] = selection_reason
         res["llm_explanation"] = {
             "provider": "deterministic",
             "model": None,
@@ -881,13 +936,14 @@ def forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
                 "selection_metric": "rmse",
                 "selection_split": "validation",
             }
+        res = _attach_llm_explanation(res, payload, dataset_ctx, selection_reason)
         res = _attach_history(
             res,
             forecast_type="test_evaluation",
             features_dir=features_dir,
             selection_method=selection_method,
         )
-        return _attach_llm_explanation(res, payload, dataset_ctx, selection_reason)
+        return res
 
     except TrainerError as err:
         raise MLError(f"Forecasting pipeline error: {err}", code=400) from err
@@ -1373,13 +1429,14 @@ def future_forecast_service(payload: dict[str, Any]) -> dict[str, Any]:
                 "selection_metric": "rmse",
                 "selection_split": "validation",
             }
+        result = _attach_llm_explanation(result, payload, dataset_ctx, "Future Horizon Projection")
         result = _attach_history(
             result,
             forecast_type="future",
             features_dir=features_dir,
             selection_method=selection_method,
         )
-        return _attach_llm_explanation(result, payload, dataset_ctx, "Future Horizon Projection")
+        return result
 
     except FutureForecastError as err:
         raise MLError(str(err), code=400) from err

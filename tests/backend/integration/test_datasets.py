@@ -484,3 +484,68 @@ def test_duplicate_dataset_upload_returns_existing_record(client):
 
     # Exact content hash matching must reuse existing record without duplicates
     assert id1 == id2
+
+
+def test_datasets_endpoint_authentication_matrix(client):
+    """Test the full authentication matrix for /api/v1/datasets.
+
+    Verifies:
+    1. OPTIONS preflight succeeds with 200 without requiring auth headers.
+    2. Unauthenticated GET requests succeed with 200 and return domain demo datasets.
+    3. Authenticated GET requests with valid JWT succeed with 200 and include user datasets.
+    4. GET requests with expired JWT return 401 with 'Authorization token has expired'.
+    5. GET requests with malformed/invalid JWT return 401 with 'Missing or invalid authorization token'.
+    6. Protected endpoints (/upload, /<dataset_id>) return 401 when called without valid JWT.
+    """
+    test_client, app = client
+
+    # 1. OPTIONS preflight check (CORS)
+    options_res = test_client.open(
+        "/api/v1/datasets?domain=electricity",
+        method="OPTIONS",
+        headers={"Origin": "http://localhost:5173", "Access-Control-Request-Method": "GET"},
+    )
+    assert options_res.status_code == 200
+
+    # 2. Unauthenticated GET request (no Authorization header) returns demo datasets
+    unauth_res = test_client.get("/api/v1/datasets?domain=electricity")
+    assert unauth_res.status_code == 200
+    unauth_data = unauth_res.get_json()["data"]["datasets"]
+    assert any(d["dataset_id"] == "demo_electricity" for d in unauth_data)
+
+    # 3. Authenticated GET request with valid JWT returns demo + user datasets
+    headers = auth_header(test_client, "auth_matrix@example.com")
+    upload_res = upload(test_client, headers, ELECTRICITY_CSV, "user_elec.csv", "electricity")
+    assert upload_res.status_code == 201
+    user_ds_id = upload_res.get_json()["data"]["dataset_id"]
+
+    auth_res = test_client.get("/api/v1/datasets?domain=electricity", headers=headers)
+    assert auth_res.status_code == 200
+    auth_data = auth_res.get_json()["data"]["datasets"]
+    assert any(d["dataset_id"] == user_ds_id for d in auth_data)
+    assert any(d["dataset_id"] == "demo_electricity" for d in auth_data)
+
+    # 4. GET request with expired JWT returns 401
+    from flask_jwt_extended import create_access_token
+    with app.app_context():
+        expired_token = create_access_token(identity="expired_user", expires_delta=timedelta(seconds=-10))
+
+    expired_res = test_client.get(
+        "/api/v1/datasets?domain=electricity",
+        headers={"Authorization": f"Bearer {expired_token}"},
+    )
+    assert expired_res.status_code == 401
+    assert "expired" in expired_res.get_json()["message"].lower()
+
+    # 5. GET request with malformed JWT returns 401
+    bad_res = test_client.get(
+        "/api/v1/datasets?domain=electricity",
+        headers={"Authorization": "Bearer not-a-valid-jwt-token"},
+    )
+    assert bad_res.status_code == 401
+    assert "invalid" in bad_res.get_json()["message"].lower()
+
+    # 6. Protected endpoints strictly enforce authentication
+    assert test_client.post("/api/v1/datasets/upload").status_code == 401
+    assert test_client.get(f"/api/v1/datasets/{user_ds_id}").status_code == 401
+    assert test_client.delete(f"/api/v1/datasets/{user_ds_id}").status_code == 401

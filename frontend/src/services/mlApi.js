@@ -45,6 +45,52 @@ async function parseJsonResponse(response) {
 }
 
 
+let isRefreshing = false;
+let refreshPromise = null;
+
+export async function refreshAccessToken() {
+  const refreshToken = typeof window !== 'undefined' ? window.localStorage.getItem('smartxsense_refresh_token') : null;
+  if (!refreshToken) return null;
+
+  if (isRefreshing && refreshPromise) {
+    return refreshPromise;
+  }
+
+  isRefreshing = true;
+  refreshPromise = (async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/v1/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+      if (!response.ok) {
+        throw new Error('Refresh failed');
+      }
+      const data = await response.json();
+      const newAccessToken = data?.data?.access_token;
+      if (newAccessToken && typeof window !== 'undefined') {
+        window.localStorage.setItem('smartxsense_access_token', newAccessToken);
+        window.dispatchEvent(new CustomEvent('smartxsense:token-refreshed', { detail: { accessToken: newAccessToken } }));
+        return newAccessToken;
+      }
+      throw new Error('No access token in refresh response');
+    } catch {
+      if (typeof window !== 'undefined') {
+        window.localStorage.removeItem('smartxsense_access_token');
+        window.localStorage.removeItem('smartxsense_refresh_token');
+        window.dispatchEvent(new CustomEvent('smartxsense:session-expired'));
+      }
+      return null;
+    } finally {
+      isRefreshing = false;
+      refreshPromise = null;
+    }
+  })();
+
+  return refreshPromise;
+}
+
 export async function fetchAuthenticatedUser(accessToken) {
   if (!accessToken) return null;
   const response = await fetch(`${API_BASE_URL}/api/v1/auth/me`, {
@@ -65,13 +111,25 @@ export async function login({ email, password }) {
 export async function fetchDatasets({ domain, accessToken } = {}) {
   const params = new URLSearchParams();
   if (domain) params.set('domain', domain);
+  const token = accessToken || (typeof window !== 'undefined' ? window.localStorage.getItem('smartxsense_access_token') : null);
   const headers = {};
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  if (token) headers.Authorization = `Bearer ${token}`;
   const query = params.toString();
-  const response = await fetch(
-    `${API_BASE_URL}/api/v1/datasets${query ? `?${query}` : ''}`,
-    { headers },
-  );
+  const url = `${API_BASE_URL}/api/v1/datasets${query ? `?${query}` : ''}`;
+
+  let response = await fetch(url, { headers });
+
+  if (response.status === 401 && token) {
+    // If access token expired or is rejected, attempt automatic token refresh
+    const refreshedToken = await refreshAccessToken();
+    if (refreshedToken) {
+      headers.Authorization = `Bearer ${refreshedToken}`;
+      response = await fetch(url, { headers });
+    } else if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('smartxsense:session-expired'));
+    }
+  }
+
   return parseJsonResponse(response);
 }
 
